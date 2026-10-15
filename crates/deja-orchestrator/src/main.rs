@@ -35,7 +35,7 @@ use axum::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
-    routing::{delete, get, post},
+    routing::{delete, get, post, put, MethodRouter},
     Router,
 };
 use deja_orchestrator::executor::{ExecutorKind, InClusterConfig, K8sExecutorConfig};
@@ -63,6 +63,13 @@ struct AppState {
     auth: Arc<deja_orchestrator::auth::AuthState>,
     /// Verdict restates in flight, one per pull request.
     restates: Arc<Restates>,
+    /// Deployment tracking, from the configuration's `[cd]` block. `None`
+    /// when no block is declared: the endpoints say so and write nothing.
+    cd: Option<Arc<deja_orchestrator::cd::CdConfig>>,
+    /// One process-wide lock serializes baseline re-points with file-side
+    /// RunEvent read-modify-writes, preventing either snapshot from overwriting
+    /// the other's changes. Store-only events do not need the file lock.
+    repoints: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Which executor drives runs, resolved ONCE at startup. K8s carries the
@@ -231,6 +238,25 @@ async fn main() {
             }
         });
     }
+    // The same document as [auth], read once: the environment list is
+    // deployment shape, not a setting that moves while a page is open.
+    let cd = match deja_orchestrator::settings::load() {
+        Ok(s) => deja_orchestrator::cd::CdConfig::from_settings(&s).map(Arc::new),
+        Err(e) => {
+            // Already refused above if it mattered for sign-in; here it only
+            // means deployment tracking is off.
+            eprintln!("deja-orchestrator: [cd] not read ({e}); deployment tracking off");
+            None
+        }
+    };
+    match &cd {
+        Some(c) => eprintln!(
+            "deja-orchestrator: deployment tracking on for {} across {}",
+            c.systems.join(", "),
+            c.environments.join(" → ")
+        ),
+        None => eprintln!("deja-orchestrator: no [cd] block; deployment tracking off"),
+    }
     let state = AppState {
         root: root.clone(),
         store,
@@ -238,6 +264,8 @@ async fn main() {
         executor,
         auth,
         restates: Arc::default(),
+        cd,
+        repoints: Arc::default(),
     };
 
     // Restart-durable reconciler (#34 V3/V7). The per-launch watcher in
@@ -301,6 +329,8 @@ fn app_router(state: AppState) -> Router {
     let create_run = post(v1_create_run).route_layer(middleware::from_fn(require_human_auth));
     // Killing a run is a human action like creating one: same auth, and audited.
     let kill_run_route = post(v1_kill_run).route_layer(middleware::from_fn(require_human_auth));
+    let repoint_baseline =
+        put(v1_repoint_baseline).route_layer(middleware::from_fn(require_human_auth));
     // Acknowledging a divergence is a human action, twice over: one person
     // proposes, another confirms. Same auth as creating a run, and audited.
     // ...and the one place a person has to be signed in once sign-in is on:
@@ -316,6 +346,20 @@ fn app_router(state: AppState) -> Router {
         state.mutation_auth.clone(),
         require_service_auth,
     ));
+    // Deployment facts come from the pipeline (Jenkins) only, under the same
+    // service token: a version it built, a deployment it made, what Argo
+    // reports. Deployments is in beta: reading them takes the same token or
+    // a signed-in maintainer (require_cd_reader), and the pause switch is a
+    // signed-in maintainer's alone.
+    let service = middleware::from_fn_with_state(state.mutation_auth.clone(), require_service_auth);
+    let reader = middleware::from_fn_with_state(state.clone(), require_cd_reader);
+    let cd_read = |h: MethodRouter<AppState>| h.route_layer(reader.clone());
+    let post_cd_version = post(v1_cd_post_version).route_layer(service.clone());
+    let post_cd_deployment = post(v1_cd_post_deployment).route_layer(service.clone());
+    let post_cd_observed = post(v1_cd_post_observed).route_layer(service);
+    let cd_pause = cd_read(get(v1_cd_pause)).merge(post(v1_cd_set_pause).route_layer(
+        middleware::from_fn_with_state(state.clone(), require_session),
+    ));
 
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
@@ -329,6 +373,7 @@ fn app_router(state: AppState) -> Router {
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}/events", ingest_run_event)
         .route("/runs/{run_id}/kill", kill_run_route)
+        .route("/runs/{run_id}/baseline", repoint_baseline)
         .route("/runs/{run_id}", get(v1_get_run))
         .route("/runs/{run_id}/stages", get(v1_run_stages))
         .route("/runs/{run_id}/logs", get(v1_run_logs))
@@ -349,7 +394,25 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/stream", get(run_stream))
         .route("/artifacts/{id}/raw", get(v1_artifact_raw))
         .route("/audit", get(v1_audit))
-        .route("/auth/me", get(v1_auth_me));
+        .route("/auth/me", get(v1_auth_me))
+        .route("/cd/config", cd_read(get(v1_cd_config)))
+        .route("/cd/pause", cd_pause)
+        .route(
+            "/cd/versions",
+            cd_read(get(v1_cd_versions)).merge(post_cd_version),
+        )
+        .route("/cd/versions/{version}", cd_read(get(v1_cd_version)))
+        .route("/cd/deployments", post_cd_deployment)
+        .route("/cd/environments", cd_read(get(v1_cd_environments)))
+        .route("/cd/environments/{env}/observed", post_cd_observed)
+        .route(
+            "/cd/environments/{env}/deployments",
+            cd_read(get(v1_cd_environment_deployments)),
+        )
+        .route(
+            "/cd/pull-requests/{owner}/{repo}/{number}",
+            cd_read(get(v1_cd_pull_request)),
+        );
 
     Router::new()
         .nest("/api/v1", api_v1)
@@ -507,6 +570,73 @@ async fn require_session(
         };
     }
     error_resp(401, "sign in to do this")
+}
+
+/// Deployments is in beta, for maintainers: every read under `/cd` takes
+/// the pipeline's bearer token (the Jenkins jobs read what they act on), or
+/// a signed-in person holding `maintainer`. With sign-in not configured
+/// there is no maintainer to recognise, so only the token reads.
+async fn require_cd_reader(
+    State(st): State<AppState>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if let Some(supplied) = bearer_token(req.headers()) {
+        return match st
+            .mutation_auth
+            .service_token
+            .as_deref()
+            .filter(|expected| service_token_matches(expected, supplied))
+        {
+            Some(_) => {
+                req.extensions_mut()
+                    .insert(AuthenticatedActor(SERVICE_ACTOR.to_owned()));
+                req.extensions_mut().insert(ActorSubject(None));
+                next.run(req).await
+            }
+            None => error_resp(401, "invalid bearer token"),
+        };
+    }
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return error_resp(
+            401,
+            "Deployments is in beta for maintainers, and sign-in is not configured on this deployment",
+        );
+    }
+    let Some(session) = session_from_headers(&st, req.headers()) else {
+        return error_resp(401, "Deployments is in beta for maintainers: sign in");
+    };
+    if !cfg.domain_allowed(&session.email) {
+        return error_resp(401, "this account is no longer allowed to sign in");
+    }
+    if !cfg.has_role(&session.email, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return error_resp(403, "Deployments is in beta for maintainers only");
+    }
+    req.extensions_mut()
+        .insert(AuthenticatedActor(session.email));
+    req.extensions_mut()
+        .insert(ActorSubject(Some(session.sub).filter(|s| !s.is_empty())));
+    next.run(req).await
+}
+
+/// Why a pause or resume is refused, or None. A person's act: a signed-in
+/// maintainer, never the pipeline's token, so every flip names someone.
+fn pause_refusal(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Option<&'static str> {
+    if !cfg.enabled {
+        return Some("pausing needs sign-in, which is not configured on this deployment");
+    }
+    if actor == SERVICE_ACTOR || actor_sub.filter(|s| !s.is_empty()).is_none() {
+        return Some("pausing needs a signed-in person");
+    }
+    if !cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return Some("only a maintainer may pause or resume the pipeline");
+    }
+    None
 }
 
 fn session_from_headers(
@@ -983,6 +1113,20 @@ async fn v1_ingest_run_event(
 
     // File-side mirror: the run record must exist (the orchestrator created it
     // before launching the Job) — an unknown id is a 404, not an upsert.
+    // Serialize file mutations with re-points from before reading the record:
+    // otherwise a stale snapshot could erase the re-point's baseline.
+    let file_mutation = matches!(
+        &ev,
+        RunEvent::Stage { .. }
+            | RunEvent::State { .. }
+            | RunEvent::Finish { .. }
+            | RunEvent::Recording { .. }
+    );
+    let _file_mutation_guard = if file_mutation {
+        Some(st.repoints.lock().await)
+    } else {
+        None
+    };
     let run_path = st.root.run_path(&run_id);
     let mut run: Run = match deja_orchestrator::read_json(&run_path) {
         Ok(run) => run,
@@ -1064,6 +1208,7 @@ async fn v1_ingest_run_event(
             return error_resp(500, &format!("persist run: {e}"));
         }
     }
+    drop(_file_mutation_guard);
 
     if let Some(store) = &st.store {
         if let Err(e) = apply_run_event(store, &run_id, &ev).await {
@@ -1880,6 +2025,138 @@ fn live_json(live: &Run) -> serde_json::Value {
         "failure_reason": live.failure_reason,
         "candidate_image": live.candidate_image,
     })
+}
+
+/// `PUT /api/v1/runs/{run_id}/baseline` — re-point a run at another baseline.
+///
+/// A run names the baseline it is measured against when it is created
+/// (`delta_against`). The pipeline that created it may replay the baseline
+/// again afterwards — the tape was resealed between the two runs and the
+/// delta refused the pair — and nothing could tell deja. The run kept naming
+/// the first baseline, so its row stayed refused and the report opened the
+/// refused comparison, while the pipeline had already measured it against the
+/// second. The re-point says so. The delta is settled again against the new
+/// baseline, off this request, exactly as it would be on either run's finish.
+///
+/// Only a finished run can be re-pointed. The lifecycle holds the record in
+/// memory while the run drives and writes it back at every transition, so a
+/// re-point mid-run would be written over by the next one and the file and
+/// the row would name different baselines. The pipeline re-points after the
+/// candidate's finish, which is the one time it is safe.
+async fn v1_repoint_baseline(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    run_id: RunId,
+    body: axum::body::Bytes,
+) -> Response {
+    #[derive(serde::Deserialize)]
+    struct Repoint {
+        delta_against: String,
+    }
+    let Repoint { delta_against } = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_resp(400, &format!("parse body: {e}")),
+    };
+    let against = match delta_against.parse::<RunId>() {
+        Ok(id) => id,
+        Err(e) => return error_resp(400, &format!("delta_against: {e}")),
+    };
+    if against == run_id {
+        return error_resp(400, "delta_against: a run is not its own baseline");
+    }
+    // Everything from the read to the write, or the restore, under one lock:
+    // two re-points of one run must not interleave.
+    let _serialised = st.repoints.lock().await;
+
+    // The live record, as the ingest path writes it: a run the store has not
+    // seen (or no store at all) is still re-pointed where its delta is read.
+    let live = match confined(st.root.run_path(&run_id), &st.root.root.join("runs")) {
+        Some(path) => match deja_orchestrator::read_json::<Run>(&path) {
+            Ok(run) => Some((path, run)),
+            Err(e) => return error_resp(500, &format!("read run: {e}")),
+        },
+        None => None,
+    };
+    let row = match &st.store {
+        Some(store) => match store.get_run(&run_id).await {
+            Ok(row) => row,
+            Err(e) => return error_resp(500, &format!("get run: {e}")),
+        },
+        None => None,
+    };
+    // The record is authoritative for the state, as it is for the baseline.
+    let state = match (&live, &row) {
+        (Some((_, run)), _) => format!("{:?}", run.status).to_lowercase(),
+        (None, Some(row)) => row.state.clone(),
+        (None, None) => return error_resp(404, "run not found"),
+    };
+    if !matches!(state.as_str(), "completed" | "failed") {
+        return error_resp(
+            409,
+            &format!("run is {state}; a baseline can be re-pointed once the run has finished"),
+        );
+    }
+    let baseline_known = confined(st.root.run_path(&against), &st.root.root.join("runs")).is_some()
+        || match &st.store {
+            Some(store) => match store.get_run(&against).await {
+                Ok(row) => row.is_some(),
+                Err(e) => return error_resp(500, &format!("get baseline run: {e}")),
+            },
+            None => false,
+        };
+    if !baseline_known {
+        return error_resp(404, "baseline run not found");
+    }
+
+    let previous = live
+        .as_ref()
+        .and_then(|(_, run)| run.spec.delta_against.clone())
+        .or_else(|| {
+            row.as_ref()
+                .and_then(|row| row.params.get("delta_against"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        });
+    // The file first, then the row; a row that will not take the change puts
+    // the file back, so a refused re-point changes nothing.
+    if let Some((path, run)) = &live {
+        let mut repointed = run.clone();
+        repointed.spec.delta_against = Some(against.to_string());
+        if let Err(e) = deja_orchestrator::write_json(path, &repointed) {
+            return error_resp(500, &format!("persist run: {e}"));
+        }
+    }
+    if let Some(store) = &st.store {
+        if let Err(e) = store.set_run_delta_against(&run_id, &against).await {
+            if let Some((path, run)) = &live {
+                if let Err(restore) = deja_orchestrator::write_json(path, run) {
+                    return error_resp(
+                        500,
+                        &format!(
+                            "re-point run: {e}; and the record could not be put back: {restore}"
+                        ),
+                    );
+                }
+            }
+            return error_resp(500, &format!("re-point run: {e}"));
+        }
+        audit_or_say(
+            store,
+            &actor.0,
+            "run.repoint_baseline",
+            "run",
+            &run_id,
+            &serde_json::json!({ "from": previous, "to": against.as_str() }),
+        )
+        .await;
+    }
+    // Settled against the new baseline, or left pending until it finishes.
+    tokio::spawn(settle_deltas_for(st.clone(), run_id.to_string()));
+    json_ok(serde_json::json!({
+        "run_id": run_id.as_str(),
+        "delta_against": against.as_str(),
+        "previous": previous,
+    }))
 }
 
 /// `GET /api/v1/runs/{id}` — store row + live file-store snapshot merged: the
@@ -3088,7 +3365,7 @@ async fn delta_for_run(
             // The row is settled from the cache too: a column that was reset,
             // or never written because the store was away, catches up on the
             // next view rather than waiting for a recomputation.
-            record_delta_verdict(st, y_id, Ok(&doc)).await;
+            record_delta_verdict(st, y_id, m_id, Ok(&doc)).await;
             return Ok(doc);
         }
     }
@@ -3109,23 +3386,33 @@ async fn delta_for_run(
         }
         Err(why) => Err(why),
     };
-    record_delta_verdict(st, y_id, computed.as_ref()).await;
+    record_delta_verdict(st, y_id, m_id, computed.as_ref()).await;
     computed
 }
 
 /// The run row's delta verdict, from a computed delta or the reason there is
-/// none. Idempotent; the newest answer wins.
+/// none. Idempotent; the newest answer wins — for the baseline it was computed
+/// against. A verdict against another run than the row names (a comparison
+/// the report asked for by hand, or a settlement the run was re-pointed out
+/// from under) is not the row's verdict, and lands nowhere.
 async fn record_delta_verdict(
     st: &AppState,
     y_id: &str,
+    m_id: &str,
     computed: Result<&serde_json::Value, &Unavailable>,
 ) {
     if let Some(store) = &st.store {
-        if let Err(e) = store
-            .set_delta_verdict(y_id, delta_verdict_word(computed))
+        match store
+            .set_delta_verdict(y_id, m_id, delta_verdict_word(computed))
             .await
         {
-            eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}");
+            Ok(true) => {}
+            Ok(false) => eprintln!(
+                "deja-orchestrator: delta verdict for {y_id} against {m_id} not recorded: the run names another baseline"
+            ),
+            Err(e) => {
+                eprintln!("deja-orchestrator: delta verdict store write failed for {y_id}: {e}")
+            }
         }
     }
 }
@@ -3463,11 +3750,12 @@ async fn audit_or_say(
     store: &deja_store::Store,
     actor: &str,
     action: &str,
+    object_type: &str,
     target: &str,
     details: &serde_json::Value,
 ) {
     if let Err(e) = store
-        .audit(actor, action, "pull_request", target, details)
+        .audit(actor, action, object_type, target, details)
         .await
     {
         eprintln!(
@@ -3627,6 +3915,7 @@ async fn v1_propose_acknowledgements(
         &store,
         &actor.0,
         "acknowledgement.propose",
+        "pull_request",
         &format!("{}#{}", gh.repo, gh.pr_number),
         &serde_json::json!({ "run": &*id, "ids": ids, "note": note }),
     )
@@ -3676,6 +3965,7 @@ async fn v1_confirm_acknowledgement(
         &store,
         &actor.0,
         "acknowledgement.confirm",
+        "pull_request",
         &format!("{}#{}", row.repo, row.pr_number),
         &serde_json::json!({ "id": ack_id, "proposed_by": row.proposed_by }),
     )
@@ -3729,6 +4019,7 @@ async fn v1_withdraw_acknowledgement(
         &store,
         &actor.0,
         "acknowledgement.withdraw",
+        "pull_request",
         &format!("{}#{}", row.repo, row.pr_number),
         &serde_json::json!({ "id": ack_id }),
     )
@@ -4088,6 +4379,607 @@ fn error_resp(status: u16, msg: &str) -> Response {
         serde_json::json!({ "error": msg }).to_string(),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Continuous deployment: what runs where. The decision is
+// deja_orchestrator::cd; this is its HTTP and its store calls.
+// ---------------------------------------------------------------------------
+
+/// The `[cd]` block, or a 404 saying deployment tracking is off.
+#[allow(clippy::result_large_err)] // the Err is an axum Response; cold path
+fn require_cd(st: &AppState) -> Result<Arc<deja_orchestrator::cd::CdConfig>, Response> {
+    st.cd.clone().ok_or_else(|| {
+        error_resp(
+            404,
+            "deployment tracking is off: no [cd] block in the configuration",
+        )
+    })
+}
+
+/// `?system=` or the first tracked system; a name the block does not list
+/// is refused, so a typo in a job cannot open a system of its own.
+#[allow(clippy::result_large_err)]
+fn cd_system(
+    cd: &deja_orchestrator::cd::CdConfig,
+    q: &std::collections::HashMap<String, String>,
+) -> Result<String, Response> {
+    match q
+        .get("system")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) if cd.knows_system(s) => Ok(s.to_owned()),
+        Some(s) => Err(error_resp(
+            400,
+            &format!(
+                "unknown system {s:?}; [cd] tracks {}",
+                cd.systems.join(", ")
+            ),
+        )),
+        None => Ok(cd.systems[0].clone()),
+    }
+}
+
+fn cd_limit(q: &std::collections::HashMap<String, String>, default: i64) -> i64 {
+    q.get("limit")
+        .and_then(|l| l.parse::<i64>().ok())
+        .filter(|l| *l > 0)
+        .unwrap_or(default)
+        .min(1000)
+}
+
+const CD_DEPLOYMENT_STATES: [&str; 6] = [
+    "requested",
+    "committed",
+    "syncing",
+    "live",
+    "failed",
+    "rolled_back",
+];
+
+async fn cd_audit(
+    store: &deja_store::Store,
+    actor: &str,
+    action: &str,
+    object_type: &str,
+    object_id: &str,
+    details: &serde_json::Value,
+) {
+    if let Err(e) = store
+        .audit(actor, action, object_type, object_id, details)
+        .await
+    {
+        eprintln!(
+            "deja-orchestrator: audit of {action} on {object_id} by {actor} was not written: {e}"
+        );
+    }
+}
+
+/// `GET /api/v1/cd/config`: whether tracking is on and what it tracks.
+/// Never 404: the viewer decides whether to show the tab.
+async fn v1_cd_config(State(st): State<AppState>) -> Response {
+    let Some(cd) = &st.cd else {
+        return json_ok(serde_json::json!({ "enabled": false }));
+    };
+    // Each system's pause switch, so the pages can say so without a second
+    // call. A system with no row is running.
+    let mut paused = serde_json::Map::new();
+    if let Some(store) = &st.store {
+        for system in &cd.systems {
+            match store.cd_control_get(system).await {
+                Ok(Some(row)) if row.paused => {
+                    paused.insert(
+                        system.clone(),
+                        serde_json::to_value(&row).unwrap_or_default(),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => return error_resp(500, &format!("pause switch: {e}")),
+            }
+        }
+    }
+    json_ok(serde_json::json!({
+        "enabled": true,
+        "beta": true,
+        "systems": cd.systems,
+        "environments": cd.environments,
+        "promotable": cd.promotable,
+        "paused": paused,
+    }))
+}
+
+/// `GET /api/v1/cd/pause?system=`: the pause switch as it stands. What the
+/// jobs read before they act; any answer but this one reads as paused there.
+async fn v1_cd_pause(State(st): State<AppState>, axum::extract::Query(q): Query) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.cd_control_get(&system).await {
+        Ok(Some(row)) => json_ok_ser(&row),
+        Ok(None) => json_ok(serde_json::json!({ "system": system, "paused": false })),
+        Err(e) => error_resp(500, &format!("pause switch: {e}")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SetPause {
+    system: String,
+    paused: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// `POST /api/v1/cd/pause` `{system, paused, reason}`: a signed-in
+/// maintainer pauses or resumes the pipeline. Pausing needs a reason.
+async fn v1_cd_set_pause(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Some(why) = pause_refusal(&st.auth.config(), &actor.0, subject.0.as_deref()) {
+        return error_resp(403, why);
+    }
+    let b: SetPause = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&b.system) {
+        return error_resp(400, &format!("unknown system {:?}", b.system));
+    }
+    let reason = b.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    if b.paused && reason.is_none() {
+        return error_resp(400, "say why: pausing needs a reason");
+    }
+    let row = match store
+        .cd_control_set(&b.system, b.paused, reason, &actor.0, subject.0.as_deref())
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("pause switch: {e}")),
+    };
+    cd_audit(
+        &store,
+        &actor.0,
+        if b.paused { "cd.pause" } else { "cd.resume" },
+        "system",
+        &b.system,
+        &serde_json::json!({ "reason": reason }),
+    )
+    .await;
+    json_ok_ser(&row)
+}
+
+/// `POST /api/v1/cd/versions`: the pipeline posts a version it built, with
+/// the pull requests it carries. Idempotent.
+async fn v1_cd_post_version(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut v: deja_store::NewCdVersion = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&v.system) {
+        return error_resp(400, &format!("unknown system {:?}", v.system));
+    }
+    if v.version.trim().is_empty() {
+        return error_resp(400, "version is required");
+    }
+    if v.kind != "merge" && v.kind != "release" {
+        return error_resp(400, "kind must be merge or release");
+    }
+    v.prs.retain(|p| !p.repo.trim().is_empty());
+    if let Err(e) = store.cd_version_upsert(&v).await {
+        return error_resp(500, &format!("version: {e}"));
+    }
+    cd_audit(
+        &store,
+        &actor.0,
+        "cd.version",
+        "version",
+        &format!("{}/{}", v.system, v.version),
+        &serde_json::json!({ "kind": v.kind, "commit_sha": v.commit_sha, "prs": v.prs.len() }),
+    )
+    .await;
+    json_ok(serde_json::json!({ "ok": true }))
+}
+
+/// `POST /api/v1/cd/deployments`: a job records what it asked an
+/// environment to run and how that went. The version must be known.
+async fn v1_cd_post_deployment(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut d: deja_store::NewCdDeployment = match serde_json::from_slice(&body) {
+        Ok(d) => d,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&d.system) {
+        return error_resp(400, &format!("unknown system {:?}", d.system));
+    }
+    if !cd.knows_environment(&d.environment) {
+        return error_resp(
+            400,
+            &format!(
+                "unknown environment {:?}; [cd] has {}",
+                d.environment,
+                cd.environments.join(", ")
+            ),
+        );
+    }
+    if !CD_DEPLOYMENT_STATES.contains(&d.state.as_str()) {
+        return error_resp(
+            400,
+            &format!("state must be one of {}", CD_DEPLOYMENT_STATES.join(", ")),
+        );
+    }
+    if d.requested_by.trim().is_empty() {
+        d.requested_by = actor.0.clone();
+    }
+    if d.detail.is_null() {
+        d.detail = serde_json::json!({});
+    }
+    match store.cd_version_get(&d.system, &d.version).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_resp(
+                409,
+                &format!(
+                    "unknown version {:?}: post it to /cd/versions first",
+                    d.version
+                ),
+            )
+        }
+        Err(e) => return error_resp(500, &format!("version: {e}")),
+    }
+    let row = match store.cd_deployment_append(&d).await {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("deployment: {e}")),
+    };
+    cd_audit(&store, &actor.0, "cd.deployment", "environment", &format!("{}/{}", d.system, d.environment),
+        &serde_json::json!({ "version": d.version, "state": d.state, "requested_by": d.requested_by, "jenkins_build": d.jenkins_build })).await;
+    json_ok_ser(&row)
+}
+
+/// `POST /api/v1/cd/environments/{env}/observed`: what Argo reports. A row
+/// is appended only when it says something the newest row does not.
+async fn v1_cd_post_observed(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(env): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    use deja_orchestrator::cd::{kind_of_version_name, transition, Latest, Observation};
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let obs: Observation = match serde_json::from_slice(&body) {
+        Ok(o) => o,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&obs.system) {
+        return error_resp(400, &format!("unknown system {:?}", obs.system));
+    }
+    if !cd.knows_environment(&env) {
+        return error_resp(400, &format!("unknown environment {env:?}"));
+    }
+    if obs.desired_version.trim().is_empty() {
+        return error_resp(400, "desired_version is required");
+    }
+    let latest = match store.cd_latest_per_environment(&obs.system).await {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|r| r.environment == env)
+            .map(|r| Latest {
+                version: r.version,
+                state: r.state,
+            }),
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    // The decision needs to know whether the synced version was live here
+    // before; one query, asked ahead so the decision stays a pure function.
+    let synced = obs.synced_version.clone().unwrap_or_default();
+    let was_live = if synced.is_empty() {
+        false
+    } else {
+        match store.cd_was_live(&obs.system, &env, &synced).await {
+            Ok(b) => b,
+            Err(e) => return error_resp(500, &format!("deployments: {e}")),
+        }
+    };
+    let last_confirmed_version = match store
+        .cd_latest_live_for_environment(&obs.system, &env)
+        .await
+    {
+        Ok(row) => row.map(|r| r.version),
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    let requester = match store
+        .cd_requested_by(&obs.system, &env, &obs.desired_version)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    let asked = requester.is_some();
+    let Some(t) = transition(
+        latest.as_ref(),
+        &obs,
+        |v| v == obs.desired_version && asked,
+        |v| v == synced && was_live,
+        last_confirmed_version.as_deref(),
+    ) else {
+        return json_ok(serde_json::json!({ "appended": null }));
+    };
+    if let Err(e) = store
+        .cd_version_ensure(&obs.system, &t.version, kind_of_version_name(&t.version))
+        .await
+    {
+        return error_resp(500, &format!("version: {e}"));
+    }
+    let row = match store
+        .cd_deployment_append(&deja_store::NewCdDeployment {
+            system: obs.system.clone(),
+            environment: env.clone(),
+            version: t.version.clone(),
+            state: t.state.clone(),
+            // The row is the observation's, so `requested_by` says so; who
+            // asked for the version, when someone did, rides on it.
+            requested_by: "observed".to_owned(),
+            requested_by_sub: requester.as_ref().and_then(|r| r.requested_by_sub.clone()),
+            request_id: None,
+            jenkins_build: requester.as_ref().and_then(|r| r.jenkins_build.clone()),
+            detail: serde_json::json!({
+                "out_of_band": t.out_of_band,
+                "asked_by": requester.as_ref().map(|r| r.requested_by.clone()),
+                "sync": obs.sync, "health": obs.health,
+                "desired_version": obs.desired_version, "synced_version": obs.synced_version,
+                "chart": obs.chart, "image_tag": obs.image_tag, "observed_at": obs.observed_at,
+            }),
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("deployment: {e}")),
+    };
+    cd_audit(&store, &actor.0, "cd.observed", "environment", &format!("{}/{env}", obs.system),
+        &serde_json::json!({ "version": t.version, "state": t.state, "out_of_band": t.out_of_band })).await;
+    json_ok(serde_json::json!({ "appended": row }))
+}
+
+/// `GET /api/v1/cd/environments?system=`: every tracked environment with its
+/// newest row and what it last ran for certain, in pipeline order.
+async fn v1_cd_environments(
+    State(st): State<AppState>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let (latest, live) = match (
+        store.cd_latest_per_environment(&system).await,
+        store.cd_latest_live_per_environment(&system).await,
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    let mut versions = std::collections::BTreeMap::new();
+    for row in latest.iter().chain(live.iter()) {
+        if !versions.contains_key(&row.version) {
+            match store.cd_version_get(&system, &row.version).await {
+                Ok(v) => {
+                    versions.insert(row.version.clone(), v);
+                }
+                Err(e) => return error_resp(500, &format!("version: {e}")),
+            }
+        }
+    }
+    let environments: Vec<serde_json::Value> = cd
+        .environments
+        .iter()
+        .map(|env| {
+            let l = latest.iter().find(|r| &r.environment == env);
+            let v = live.iter().find(|r| &r.environment == env);
+            serde_json::json!({
+                "environment": env,
+                "latest": l,
+                "live": v,
+                "latest_version": l.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+                "live_version": v.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+            })
+        })
+        .collect();
+    json_ok(serde_json::json!({ "system": system, "environments": environments }))
+}
+
+/// `GET /api/v1/cd/environments/{env}/deployments?system=&limit=`: history.
+async fn v1_cd_environment_deployments(
+    State(st): State<AppState>,
+    Path(env): Path<String>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if !cd.knows_environment(&env) {
+        return error_resp(404, &format!("unknown environment {env:?}"));
+    }
+    match store
+        .cd_deployments_for_environment(&system, &env, cd_limit(&q, 200))
+        .await
+    {
+        Ok(rows) => json_ok_ser(&rows),
+        Err(e) => error_resp(500, &format!("deployments: {e}")),
+    }
+}
+
+/// `GET /api/v1/cd/versions?system=&limit=`: versions newest first, each with
+/// where it is on every environment it has touched.
+async fn v1_cd_versions(State(st): State<AppState>, axum::extract::Query(q): Query) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let versions = match store.cd_versions_list(&system, cd_limit(&q, 100)).await {
+        Ok(v) => v,
+        Err(e) => return error_resp(500, &format!("versions: {e}")),
+    };
+    let places = match store.cd_latest_per_environment_version(&system).await {
+        Ok(p) => p,
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    let out: Vec<serde_json::Value> = versions
+        .into_iter()
+        .map(|v| {
+            let where_: Vec<&deja_store::CdDeploymentRow> =
+                places.iter().filter(|p| p.version == v.version).collect();
+            serde_json::json!({ "version": v, "where": where_ })
+        })
+        .collect();
+    json_ok(serde_json::json!({ "system": system, "versions": out }))
+}
+
+/// `GET /api/v1/cd/versions/{version}?system=`: one version and its history.
+async fn v1_cd_version(
+    State(st): State<AppState>,
+    Path(version): Path<String>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let v = match store.cd_version_get(&system, &version).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error_resp(404, "no such version"),
+        Err(e) => return error_resp(500, &format!("version: {e}")),
+    };
+    match store
+        .cd_deployments_of_version(&system, &version, 200)
+        .await
+    {
+        Ok(rows) => json_ok(serde_json::json!({ "version": v, "deployments": rows })),
+        Err(e) => error_resp(500, &format!("deployments: {e}")),
+    }
+}
+
+/// `GET /api/v1/cd/pull-requests/{owner}/{repo}/{number}`: the versions
+/// carrying one pull request and where each is.
+async fn v1_cd_pull_request(
+    State(st): State<AppState>,
+    Path((owner, repo, number)): Path<(String, String, i64)>,
+) -> Response {
+    if require_cd(&st).is_err() {
+        return error_resp(
+            404,
+            "deployment tracking is off: no [cd] block in the configuration",
+        );
+    }
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let full = format!("{owner}/{repo}");
+    let versions = match store.cd_versions_of_pull_request(&full, number).await {
+        Ok(v) => v,
+        Err(e) => return error_resp(500, &format!("versions: {e}")),
+    };
+    let mut out = Vec::with_capacity(versions.len());
+    for v in versions {
+        let places = match store
+            .cd_deployments_of_version(&v.system, &v.version, 50)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => return error_resp(500, &format!("deployments: {e}")),
+        };
+        // Newest row per environment: where this version is now.
+        let mut seen = std::collections::BTreeSet::new();
+        let where_: Vec<&deja_store::CdDeploymentRow> = places
+            .iter()
+            .filter(|p| seen.insert(p.environment.clone()))
+            .collect();
+        out.push(serde_json::json!({ "version": v, "where": where_ }));
+    }
+    json_ok(
+        serde_json::json!({ "repo": full.to_ascii_lowercase(), "pr_number": number, "versions": out }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4703,6 +5595,8 @@ mod tests {
             executor: Arc::new(ExecutorSelection::Compose),
             auth: deja_orchestrator::auth::AuthState::disabled(),
             restates: Arc::default(),
+            cd: None,
+            repoints: Arc::default(),
         }
     }
 
@@ -4793,6 +5687,214 @@ mod tests {
             .body(Body::from(body.to_string()))
             .unwrap();
         app_router(state).oneshot(req).await.unwrap().status()
+    }
+
+    async fn put_baseline_full(
+        state: AppState,
+        run_id: &str,
+        body: serde_json::Value,
+        actor: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/v1/runs/{run_id}/baseline"))
+            .header("content-type", "application/json");
+        if let Some(actor) = actor {
+            req = req.header("X-Deja-Actor", actor);
+        }
+        let req = req.body(Body::from(body.to_string())).unwrap();
+        let response = app_router(state).oneshot(req).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    async fn put_baseline(
+        state: AppState,
+        run_id: &str,
+        body: serde_json::Value,
+        actor: Option<&str>,
+    ) -> StatusCode {
+        put_baseline_full(state, run_id, body, actor).await.0
+    }
+
+    fn finished_run(state: &AppState, id: &str, against: Option<&str>) {
+        let mut run = pending_run(id);
+        run.status = deja_orchestrator::RunStatus::Completed;
+        run.spec.delta_against = against.map(str::to_owned);
+        deja_orchestrator::write_json(&state.root.run_path(id), &run).unwrap();
+    }
+
+    fn baseline_of(state: &AppState, id: &str) -> Option<String> {
+        let run: Run = deja_orchestrator::read_json(&state.root.run_path(id)).unwrap();
+        run.spec.delta_against
+    }
+
+    /// Two re-points of one run do not interleave: a re-point waits for the
+    /// one in flight, and reads the record that one wrote.
+    #[tokio::test]
+    async fn overlapping_repoints_are_serialised() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        finished_run(&state, "run-y", Some("run-m1"));
+        for id in ["run-m1", "run-m2", "run-m3"] {
+            finished_run(&state, id, None);
+        }
+        let against = |id: &str| serde_json::json!({ "delta_against": id });
+
+        // A re-point in flight: the next one waits on it, and the record is
+        // untouched while it waits.
+        let in_flight = state.repoints.clone().lock_owned().await;
+        let waiting = tokio::spawn(put_baseline_full(
+            state.clone(),
+            "run-y",
+            against("run-m2"),
+            Some("ci"),
+        ));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "a re-point does not run past one in flight"
+        );
+        assert_eq!(baseline_of(&state, "run-y").as_deref(), Some("run-m1"));
+        drop(in_flight);
+        let (status, body) = waiting.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["previous"], "run-m1");
+        assert_eq!(baseline_of(&state, "run-y").as_deref(), Some("run-m2"));
+
+        // Two at once, neither to the baseline the record names now: the
+        // earlier one reads the record as it was, the later one reads what the
+        // earlier one wrote, and the record ends as the later one left it.
+        let (first, second) = tokio::join!(
+            put_baseline_full(state.clone(), "run-y", against("run-m3"), Some("ci")),
+            put_baseline_full(state.clone(), "run-y", against("run-m1"), Some("ci")),
+        );
+        assert_eq!((first.0, second.0), (StatusCode::OK, StatusCode::OK));
+        let last = baseline_of(&state, "run-y").unwrap();
+        let (earlier, later) = if first.1["previous"] == "run-m2" {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert_eq!(
+            earlier.1["previous"], "run-m2",
+            "the earlier one read the record as it was"
+        );
+        assert_eq!(
+            later.1["previous"], earlier.1["delta_against"],
+            "the later one read what the earlier one wrote"
+        );
+        assert_eq!(serde_json::json!(last), later.1["delta_against"]);
+    }
+
+    /// A trailing recording event must preserve a baseline written by a
+    /// concurrent re-point. The held lock makes ingest wait before it snapshots
+    /// the completed run; without the wait, the request can write stale state.
+    #[tokio::test]
+    async fn trailing_recording_event_preserves_concurrent_repoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        finished_run(&state, "run-y", Some("run-m1"));
+        finished_run(&state, "run-m2", None);
+
+        let in_flight = state.repoints.clone().lock_owned().await;
+        let recording = tokio::spawn(post_event(
+            state.clone(),
+            "run-y",
+            serde_json::json!({ "event": "recording", "recording_id": "rec-late" }),
+        ));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !recording.is_finished(),
+            "file-mutating ingest waits for an in-flight re-point"
+        );
+        let repoint = tokio::spawn(put_baseline(
+            state.clone(),
+            "run-y",
+            serde_json::json!({ "delta_against": "run-m2" }),
+            Some("ci"),
+        ));
+        drop(in_flight);
+
+        assert_eq!(recording.await.unwrap(), StatusCode::ACCEPTED);
+        assert_eq!(repoint.await.unwrap(), StatusCode::OK);
+        let run: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(run.spec.delta_against.as_deref(), Some("run-m2"));
+        assert_eq!(run.recording_id.as_deref(), Some("rec-late"));
+    }
+
+    /// A run re-pointed at another baseline names that baseline from then on,
+    /// where its delta is read from. Each refusal is the kind the pipeline
+    /// would otherwise discover later: no actor, no such run, a baseline that
+    /// is not a run id, a run named as its own baseline.
+    #[tokio::test]
+    async fn a_run_can_be_repointed_at_another_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let mut run = pending_run("run-y");
+        run.status = deja_orchestrator::RunStatus::Completed;
+        run.spec.delta_against = Some("run-m1".to_owned());
+        deja_orchestrator::write_json(&state.root.run_path("run-y"), &run).unwrap();
+        deja_orchestrator::write_json(&state.root.run_path("run-m2"), &pending_run("run-m2"))
+            .unwrap();
+        deja_orchestrator::write_json(&state.root.run_path("run-live"), &pending_run("run-live"))
+            .unwrap();
+        let against = |id: &str| serde_json::json!({ "delta_against": id });
+
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-m2"), None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-missing", against("run-m2"), Some("ci")).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("../run-m2"), Some("ci")).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-y"), Some("ci")).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-nowhere"), Some("ci")).await,
+            StatusCode::NOT_FOUND,
+            "a baseline that does not exist is refused here, not at the settle"
+        );
+        assert_eq!(
+            put_baseline(state.clone(), "run-live", against("run-m2"), Some("ci")).await,
+            StatusCode::CONFLICT,
+            "a run still driving would write the old baseline back over a re-point"
+        );
+        let untouched: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(
+            untouched.spec.delta_against.as_deref(),
+            Some("run-m1"),
+            "a refused re-point changes nothing"
+        );
+
+        assert_eq!(
+            put_baseline(state.clone(), "run-y", against("run-m2"), Some("ci")).await,
+            StatusCode::OK
+        );
+        let run: Run = deja_orchestrator::read_json(&state.root.run_path("run-y")).unwrap();
+        assert_eq!(run.spec.delta_against.as_deref(), Some("run-m2"));
+        assert_eq!(
+            run_params_for(&state, "run-y")
+                .await
+                .and_then(|p| p.delta_against)
+                .as_deref(),
+            Some("run-m2"),
+            "the delta reads the baseline from the same record"
+        );
     }
 
     #[tokio::test]
@@ -6038,6 +7140,8 @@ mod sign_in {
             executor: Arc::new(ExecutorSelection::Compose),
             auth,
             restates: Arc::default(),
+            cd: None,
+            repoints: Arc::default(),
         }
     }
 
@@ -6093,6 +7197,140 @@ mod sign_in {
             .await
             .unwrap();
         (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn cd_reader_router(st: AppState) -> Router {
+        let reader = middleware::from_fn_with_state(st.clone(), require_cd_reader);
+        Router::new()
+            .route("/cd-read", get(whoami).route_layer(reader))
+            .with_state(st)
+    }
+
+    fn get_cd_read() -> axum::http::request::Builder {
+        Request::builder().method(Method::GET).uri("/cd-read")
+    }
+
+    #[tokio::test]
+    async fn deployments_reads_are_for_maintainers_and_the_pipeline() {
+        let (auth, signer) = enabled(&["ravi@juspay.in"]);
+        let st = state(auth, Some("tok"));
+        // Anonymous: sign in.
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read().body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "{body}");
+        assert!(body.contains("beta"), "{body}");
+        // A typed name is nobody.
+        let (code, _) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header("x-deja-actor", "ravi@juspay.in")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        // Signed in, not a maintainer.
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+        // A maintainer reads, as themselves.
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((code, body.as_str()), (StatusCode::OK, "ravi@juspay.in"));
+        // The pipeline's token reads; a wrong one does not.
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((code, body.as_str()), (StatusCode::OK, SERVICE_ACTOR));
+        let (code, _) = call(
+            cd_reader_router(st),
+            get_cd_read()
+                .header(header::AUTHORIZATION, "Bearer nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+    }
+    #[tokio::test]
+    async fn absent_service_token_rejects_bearer_but_allows_maintainer_cookie() {
+        let (auth, signer) = enabled(&["ravi@juspay.in"]);
+        let st = state(auth, None);
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::AUTHORIZATION, "Bearer attacker-chosen")
+                .header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED, "{body}");
+
+        let (code, body) = call(
+            cd_reader_router(st),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((code, body.as_str()), (StatusCode::OK, "ravi@juspay.in"));
+    }
+
+    #[tokio::test]
+    async fn without_sign_in_only_the_pipeline_reads_deployments() {
+        let st = state(AuthState::disabled(), Some("tok"));
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header("x-deja-actor", "ravi")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("sign-in is not configured"), "{body}");
+        let (code, _) = call(
+            cd_reader_router(st),
+            get_cd_read()
+                .header(header::AUTHORIZATION, "Bearer tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    #[test]
+    fn only_a_signed_in_maintainer_pauses() {
+        let (auth, _) = enabled(&["ravi@juspay.in"]);
+        let cfg = auth.config();
+        assert_eq!(pause_refusal(&cfg, "ravi@juspay.in", Some("s-ravi")), None);
+        assert!(pause_refusal(&cfg, "asha@juspay.in", Some("s-asha")).is_some());
+        assert!(pause_refusal(&cfg, SERVICE_ACTOR, None).is_some());
+        assert!(pause_refusal(&cfg, "ravi@juspay.in", None).is_some());
+        assert!(pause_refusal(&AuthState::disabled().config(), "ravi", Some("s")).is_some());
     }
 
     fn post_gated() -> axum::http::request::Builder {

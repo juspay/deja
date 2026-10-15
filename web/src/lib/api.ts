@@ -41,8 +41,12 @@ export type RunParams = {
   /** Why the run exists when it is not a candidate under test: `baseline`. */
   purpose?: string;
   /** What the candidate is, in the creator's words: a PR number and title,
-   *  or the main commit a baseline stands for. Displayed, never parsed. */
+   *  or the main commit a baseline stands for. Displayed, never parsed —
+   *  except for the merge-queue prefix, see `lib/scope.ts`. */
   label?: string;
+  /** The pull request a PR or merge-queue run stands for. Absent on
+   *  baselines, nightly and manual runs. */
+  github?: GithubRef;
 };
 
 /** The request a row carries, or null when it predates the record.
@@ -996,3 +1000,117 @@ export function deltaFamily(b: DeltaBucket): DeltaFamily {
   if (b === "clean" || b === "changed") return b;
   return b.split("_")[0] as DeltaFamily;
 }
+
+// ===========================================================================
+// DEPLOYMENTS — `/api/v1/cd/*`, appended so nothing above moves.
+//
+// What runs where, as the CD pipeline posts it and the reconcile job observes
+// it. Reads need no actor; the writes are the pipeline's (service token) and
+// have no client here. `cd.config` is the one route that answers 200 with
+// `enabled: false` when the orchestrator has no `[cd]` block; every other
+// `/cd/*` read answers 404 then, and an orchestrator older than this build
+// answers HTML (see `request`). The pages treat all three as "off".
+// ===========================================================================
+
+/** A system's pause switch, when it is paused. */
+export type CdControl = {
+  system: string;
+  paused: boolean;
+  reason: string | null;
+  changed_by: string;
+  changed_at: string;
+};
+
+export type CdConfig =
+  | { enabled: false }
+  | {
+      enabled: true;
+      beta?: boolean;
+      systems: string[];
+      environments: string[];
+      promotable: string[];
+      /** The paused systems only; a system absent here is running. */
+      paused?: Record<string, CdControl>;
+    };
+
+export type CdVersionPr = {
+  repo: string;
+  pr_number: number;
+  title: string | null;
+  author: string | null;
+  merged_at: string | null;
+};
+
+/** One thing a system can run: a merge (`<sha10>`, one pull request) or a
+ *  release (CalVer, tagged on a merge named by `released_from`). */
+export type CdVersionRow = {
+  system: string;
+  version: string;
+  kind: string;
+  commit_sha: string | null;
+  image_tag: string | null;
+  chart: string | null;
+  released_from: string | null;
+  merged_at: string | null;
+  created_at: string;
+  prs: CdVersionPr[];
+};
+
+/** One row of an environment's append-only deployment log. */
+export type CdDeploymentRow = {
+  id: number;
+  system: string;
+  environment: string;
+  version: string;
+  state: string;
+  requested_by: string;
+  request_id: number | null;
+  jenkins_build: string | null;
+  detail: Record<string, unknown>;
+  at: string;
+};
+
+/** The newest row a version has on one environment. */
+export type CdVersionWhere = CdDeploymentRow;
+
+export type CdEnvironment = {
+  environment: string;
+  /** The newest row of any state: what is happening. */
+  latest: CdDeploymentRow | null;
+  /** The newest `live`/`rolled_back` row: what runs. */
+  live: CdDeploymentRow | null;
+  latest_version: CdVersionRow | null;
+  live_version: CdVersionRow | null;
+};
+
+const sys = (system: string) => `system=${encodeURIComponent(system)}`;
+
+export const cdApi = {
+  config: () => request<CdConfig>("/api/v1/cd/config"),
+  /** Pause or resume a system's pipeline: a signed-in maintainer only. */
+  setPause: (system: string, paused: boolean, reason: string) =>
+    request<CdControl>("/api/v1/cd/pause", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ system, paused, reason }),
+    }),
+  environments: (system: string) =>
+    request<{ system: string; environments: CdEnvironment[] }>(`/api/v1/cd/environments?${sys(system)}`),
+  environmentDeployments: (system: string, environment: string, limit = 200) =>
+    request<CdDeploymentRow[]>(
+      `/api/v1/cd/environments/${encodeURIComponent(environment)}/deployments?${sys(system)}&limit=${limit}`,
+    ),
+  versions: (system: string, limit = 200) =>
+    request<{ system: string; versions: { version: CdVersionRow; where: CdVersionWhere[] }[] }>(
+      `/api/v1/cd/versions?${sys(system)}&limit=${limit}`,
+    ),
+  version: (system: string, version: string) =>
+    request<{ version: CdVersionRow; deployments: CdDeploymentRow[] }>(
+      `/api/v1/cd/versions/${encodeURIComponent(version)}?${sys(system)}`,
+    ),
+  pullRequest: (owner: string, repo: string, number: number) =>
+    request<{ repo: string; pr_number: number; versions: { version: CdVersionRow; where: CdVersionWhere[] }[] }>(
+      `/api/v1/cd/pull-requests/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/${number}`,
+    ),
+};

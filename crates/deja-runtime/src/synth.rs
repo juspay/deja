@@ -19,7 +19,11 @@
 //!    results, and a synthesized value flows into DOWNSTREAM args. If a
 //!    synthesized uuid could equal a recorded one, the next Substitute lookup
 //!    keyed on it would HIT — a false resync on fabricated data, silently. So
-//!    every helper draws from a marked subspace.
+//!    the helpers whose values are IDENTIFIERS draw from a marked subspace:
+//!    [`uuid_v8`] from a version no live generator emits, [`id`] behind
+//!    [`SYNTH_PREFIX`]. The rest return bare values — an integer, bytes, a string
+//!    over the caller's alphabet, a timestamp — which have no room for a marker,
+//!    so keep them to seams nothing is keyed on.
 //! 5. **Attributable** — the seam stamps
 //!    [`SubstituteOutcome::Synthesized`](crate::SubstituteOutcome::Synthesized)
 //!    on the observation; nothing here has to do that.
@@ -93,6 +97,16 @@ pub fn u64(miss: &SubstituteMiss) -> ::std::primitive::u64 {
 /// never inspects — the PSS salt seam is the standing example. Never for a value
 /// whose secrecy matters: everything here is derivable by anyone holding the
 /// query.
+///
+/// Two draws of different `N` at ONE miss SHARE A PREFIX: `bytes::<12>` is the
+/// first twelve bytes of `bytes::<32>`, because extending a draw deliberately
+/// never rewrites what it already produced. That is the right trade where `N` is
+/// one site's fixed width, and the wrong one where two widths meet in a single
+/// arm — for that, reach for
+/// [`SubstituteMiss::bytes_vec`](SubstituteMiss::bytes_vec), whose length is part
+/// of its domain. Treat the pairing as live rather than hypothetical: a host arm
+/// already draws two shapes at one miss, and a seam that wraps a key under a
+/// nonce needs exactly the two widths this does not separate.
 pub fn bytes<const N: usize>(miss: &SubstituteMiss) -> [u8; N] {
     let mut out = [0u8; N];
     // One digest per 8-byte block, each under its own domain, so extending the
@@ -175,6 +189,160 @@ pub fn monotonic(miss: &SubstituteMiss, base_ns: i64, step_ns: i64) -> i64 {
     base_ns.saturating_add(i64::from(miss.occurrence).saturating_mul(step_ns))
 }
 
+/// How far a synthesized clock advances between two misses at one call site:
+/// one millisecond, in nanoseconds.
+///
+/// [`monotonic`] is unit-agnostic, so this fixes the unit for a caller that
+/// wants a clock rather than a policy. Deliberately small: a step long enough to
+/// rival a real span's duration would let a derived reading be mistaken for a
+/// measured one.
+pub const CLOCK_STEP_NS: i64 = 1_000_000;
+
+/// The shaped draws, as inherent methods.
+///
+/// Inherent rather than an extension trait because a miss arm is written inside
+/// an attribute, far from anything that could give a free function a home.
+/// Hanging the shapes off the miss is what keeps them findable: a reader holding
+/// a `SubstituteMiss` can ask what it will answer with, rather than having to
+/// know that a module of shapes exists and which path reaches it.
+///
+/// **An inherent method here silently wins over a host trait method of the same
+/// name.** Not an ambiguity error and not a warning — the host's `impl` stays
+/// valid, is simply never selected, and the call site compiles unchanged while
+/// what it fabricates changes. A host that already carries its own `over` or
+/// `epoch_nanos` on the miss must therefore delete that trait in the SAME change
+/// that bumps its pin to a revision carrying these. Bump first and every arm
+/// that reached the host's version starts drawing from deja's, with no error, no
+/// warning, and nothing but a golden-value test to report it.
+///
+/// Each draw hashes the miss under its OWN domain, including every parameter that
+/// changes the result. That is what the free helpers above do too, and the reason
+/// is the same: two draws at one miss must not be two projections of one stream.
+/// Hand a caller a 12-byte value that is the first twelve bytes of its 256-byte
+/// value and both are the right size, the right encoding, and derived — and they
+/// are correlated in a way nothing downstream can see.
+impl SubstituteMiss {
+    /// `length` characters drawn from `alphabet`, derived from this miss.
+    ///
+    /// For a generator whose caller constrains the SHAPE: an id over an alphabet
+    /// that forbids `-`, a digits-only string, a nanoid a connector puts on the
+    /// wire. [`id`] is the better answer wherever the shape is free, because it
+    /// carries a visible marker and this cannot — but where a service validates
+    /// the shape, a value it rejects is worse than a stop, since the rejection is
+    /// attributed to the candidate.
+    ///
+    /// The alphabet stays the CALLER's and is not a convenience constant here:
+    /// one host draws from a 64-symbol nanoid alphabet and another from a
+    /// 62-symbol one, and a fixed alphabet would quietly put a symbol on the wire
+    /// that the caller forbids.
+    ///
+    /// `length` and the alphabet's SYMBOLS are both in the domain, so two draws
+    /// differing in either are independent. Without `length`, a shorter draw
+    /// would be a PREFIX of a longer one at the same miss. Without the symbols —
+    /// their size alone is not enough — two different 16-symbol alphabets would
+    /// be one stream rendered twice, each value a symbol-for-symbol remapping of
+    /// the other, which is a correlation a reader of either value cannot see.
+    ///
+    /// Two different things return an empty string: `length` of zero, which is a
+    /// caller asking for nothing, and an empty `alphabet`, which is a caller
+    /// error. They are not distinguished in the return, because every known
+    /// caller passes a CONSTANT alphabet and so cannot reach the second; a caller
+    /// that can has a bug at the call site, not a value to interpret. The empty
+    /// alphabet answers rather than panicking because this runs on the miss path,
+    /// where a panic ends the correlation the arm exists to keep alive.
+    pub fn over(&self, alphabet: &[char], length: usize) -> String {
+        // No symbols, no draw.
+        let Some(&first) = alphabet.first() else {
+            return String::new();
+        };
+        let Ok(span) = u64::try_from(alphabet.len()) else {
+            return String::new();
+        };
+        // The alphabet goes in by its SYMBOLS, not its size. `length` carries no
+        // `/`, so the two fields cannot run together whatever the symbols are.
+        let alphabet_image: String = alphabet.iter().collect();
+        let seed = digest(self, &format!("over/{length}/{alphabet_image}"));
+        positions(seed, length)
+            .map(|word| {
+                // `word % span` is below `alphabet.len()`, so neither fallback is
+                // reachable; they are here so no position can be dropped.
+                let pick = usize::try_from(word % span).unwrap_or(0);
+                alphabet.get(pick).copied().unwrap_or(first)
+            })
+            .collect()
+    }
+
+    /// `length` deterministic bytes, for a caller that picks the length at
+    /// runtime.
+    ///
+    /// [`bytes`] is the const-generic form and the one to prefer where the width
+    /// is known at compile time. This exists because a host's
+    /// `generate_random_bytes(n)` and its AES nonce take their width from a value.
+    ///
+    /// `length` is part of the domain, which is the difference that matters: a
+    /// 12-byte draw is NOT the first twelve bytes of a 256-byte draw at the same
+    /// miss. An arm answering a JWE seam synthesizes both a GCM nonce and a
+    /// wrapped key; drawn off one stream the nonce would be a prefix of the key —
+    /// correctly sized, correctly encoded, deterministic, and silently correlated.
+    /// [`bytes`] does not make this separation and says so.
+    ///
+    /// Two draws of the SAME length at one miss are the same value. That is
+    /// determinism, not a defect, and it is the limit of what a miss can tell
+    /// apart: an arm that needs two independent byte strings should take ONE draw
+    /// of the combined length and split it, because positions within a draw are
+    /// independent of each other.
+    pub fn bytes_vec(&self, length: usize) -> Vec<u8> {
+        let seed = digest(self, &format!("bytes_vec/{length}"));
+        // `to_le_bytes()[0]` rather than a mask and a conversion: total, and no
+        // position can be dropped on the way out.
+        positions(seed, length)
+            .map(|word| word.to_le_bytes()[0])
+            .collect()
+    }
+
+    /// Nanoseconds since the Unix epoch for this miss, advancing with the
+    /// occurrence at this call site.
+    ///
+    /// [`monotonic`] with a base of ZERO and a step of [`CLOCK_STEP_NS`]. Zero
+    /// rather than a correlation's time origin: no such origin is available at a
+    /// miss, and inventing one would reintroduce exactly the ambient dependency a
+    /// Substitute seam exists to remove. It also makes the reading obviously
+    /// synthetic to a human, which is a feature rather than a cost.
+    ///
+    /// Not a draw, so it carries no domain separator and needs none — it is a
+    /// function of the occurrence alone. Read [`monotonic`]'s guarantee before
+    /// ordering anything by it: it orders one call site against itself and nothing
+    /// else.
+    pub fn epoch_nanos(&self) -> i64 {
+        monotonic(self, 0, CLOCK_STEP_NS)
+    }
+}
+
+/// One word per position, from a seed that already carries the draw's domain.
+///
+/// Mixing the position in rather than walking one state means two positions never
+/// correlate, while the whole draw still costs one digest of the miss rather than
+/// one per byte. The counter is a `u64` from the start so no conversion can fail
+/// and drop a position: the length is part of the promise.
+fn positions(seed: u64, length: usize) -> impl Iterator<Item = u64> {
+    (0..length).scan(0u64, move |position, _| {
+        let word = mix(seed, *position);
+        *position = position.wrapping_add(1);
+        Some(word)
+    })
+}
+
+/// Expand a seed into the word for one position.
+fn mix(seed: u64, position: u64) -> u64 {
+    // splitmix64's finalizer. Chosen for having no fixed points worth worrying
+    // about at this size, not for any cryptographic property: everything here is
+    // derivable by anyone holding the query, which is the point.
+    let mut state = seed ^ position.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    state = (state ^ (state >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    state = (state ^ (state >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    state ^ (state >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +351,25 @@ mod tests {
     fn miss(args: serde_json::Value) -> SubstituteMiss {
         SubstituteMiss::new("imc", "Cache", "get_val", args)
     }
+
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+    const DIGITS: [char; 10] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+
+    /// A second 16-symbol alphabet, disjoint from [`HEX`], so a shared stream
+    /// shows up as a remapping rather than hiding behind a shared symbol.
+    const SIXTEEN_LETTERS: [char; 16] = [
+        'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    ];
+
+    /// A host alphabet, so the pin covers a span that is not a power of two.
+    const ALPHANUMERIC: [char; 62] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h',
+        'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
+        'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+    ];
 
     /// Property 1. Nothing else here means anything without it.
     #[test]
@@ -193,6 +380,9 @@ mod tests {
         assert_eq!(id(&a), id(&b));
         assert_eq!(u64(&a), u64(&b));
         assert_eq!(bytes::<16>(&a), bytes::<16>(&b));
+        assert_eq!(a.over(&HEX, 12), b.over(&HEX, 12));
+        assert_eq!(a.bytes_vec(12), b.bytes_vec(12));
+        assert_eq!(a.epoch_nanos(), b.epoch_nanos());
     }
 
     /// Property 2, and the test that makes property 1 non-vacuous: a helper that
@@ -220,6 +410,8 @@ mod tests {
             assert_ne!(u64(&base), u64(other), "{label} must change the value");
             assert_ne!(uuid_v8(&base), uuid_v8(other), "{label}");
             assert_ne!(id(&base), id(other), "{label}");
+            assert_ne!(base.over(&HEX, 12), other.over(&HEX, 12), "{label}");
+            assert_ne!(base.bytes_vec(12), other.bytes_vec(12), "{label}");
         }
     }
 
@@ -298,6 +490,186 @@ mod tests {
         assert!(
             !id(&m).ends_with(&format!("{as_u64:016x}")),
             "`id` must not be the `u64` draw in hex"
+        );
+
+        // The shaped draws, against each other and against the primitives they
+        // are NOT allowed to be a view of.
+        let eight_bytes = m.bytes_vec(8);
+        assert_ne!(
+            eight_bytes[..],
+            as_u64.to_le_bytes()[..],
+            "`bytes_vec` must not be the `u64` draw"
+        );
+        assert_ne!(
+            eight_bytes[..],
+            first_eight[..],
+            "`bytes_vec` and `bytes` must not be the same draw"
+        );
+        // 16 characters over a 16-symbol alphabet is exactly the width of the
+        // `u64` in hex, which is what a draw that merely rendered the `u64` would
+        // return.
+        assert_ne!(
+            m.over(&HEX, 16),
+            format!("{as_u64:016x}"),
+            "`over` must not be the `u64` draw spelled in the alphabet"
+        );
+    }
+
+    /// The mutation this whole arrangement exists to kill: `over` and
+    /// `bytes_vec` must not be two projections of ONE stream.
+    ///
+    /// Seeded from a shared `u64` and mixed per position with no separator — the
+    /// shape both hosts shipped — a draw over a 16-symbol alphabet is EXACTLY the
+    /// low nibble of the byte draw, character for character. Both values are the
+    /// right size, in the right alphabet, and deterministic, so nothing else in
+    /// this file notices; an arm using both would be fabricating a correlation
+    /// between two values that have nothing to do with each other.
+    #[test]
+    fn a_character_draw_is_not_a_view_of_a_byte_draw() {
+        let m = miss(json!({"key": "k1"}));
+        let characters = m.over(&HEX, 32);
+        let low_nibbles: String = m
+            .bytes_vec(32)
+            .iter()
+            .map(|byte| HEX[usize::from(byte & 0x0f)])
+            .collect();
+        assert_ne!(
+            characters, low_nibbles,
+            "`over` is a projection of `bytes_vec`: {characters}"
+        );
+    }
+
+    /// A shorter draw must not be a PREFIX of a longer one at one miss.
+    ///
+    /// This is the property whose absence would have shipped a correlated IV: an
+    /// arm answering a JWE seam draws a 12-byte GCM nonce and a 256-byte wrapped
+    /// key from one miss, and off a single position-indexed stream the nonce is
+    /// the key's first twelve bytes. Correctly sized, correctly encoded,
+    /// deterministic, and silently correlated.
+    ///
+    /// Note the deliberate asymmetry with [`bytes`], which DOES extend: there the
+    /// width is one site's fixed property, and both halves are documented.
+    #[test]
+    fn a_shorter_shaped_draw_is_not_a_prefix_of_a_longer_one() {
+        let m = miss(json!({"key": "k1"}));
+
+        let nonce = m.bytes_vec(12);
+        let wrapped = m.bytes_vec(256);
+        assert_ne!(
+            nonce[..],
+            wrapped[..12],
+            "a 12-byte draw is the head of a 256-byte draw at one miss"
+        );
+
+        let short = m.over(&HEX, 8);
+        let long = m.over(&HEX, 40);
+        assert!(
+            !long.starts_with(&short),
+            "an 8-character draw is the head of a 40-character draw: {short} / {long}"
+        );
+    }
+
+    /// Two draws over DIFFERENT alphabets must be independent, and the alphabet's
+    /// SIZE is not what separates them.
+    ///
+    /// Two 16-symbol alphabets are the case that matters, because it is the one a
+    /// size-only domain cannot tell apart: off a shared stream each value is a
+    /// symbol-for-symbol remapping of the other, position by position, and a
+    /// reader of either cannot see it. This test is written as that remapping, so
+    /// the thing it refutes is the thing the weaker design produces — a test
+    /// comparing a 16-symbol draw with a 10-symbol one proves nothing, because
+    /// `w % 16` and `w % 10` disagree even on one stream.
+    #[test]
+    fn two_alphabets_of_one_size_at_one_miss_are_not_one_stream() {
+        let m = miss(json!({"key": "k1"}));
+        let hex = m.over(&HEX, 16);
+        let letters = m.over(&SIXTEEN_LETTERS, 16);
+        let remapped: String = hex
+            .chars()
+            .filter_map(|c| HEX.iter().position(|h| *h == c))
+            .filter_map(|at| SIXTEEN_LETTERS.get(at).copied())
+            .collect();
+        assert_eq!(
+            remapped.chars().count(),
+            16,
+            "the remapping must be total, or this test cannot refute anything"
+        );
+        assert_ne!(
+            letters, remapped,
+            "the letter draw is the hex draw remapped: {letters}"
+        );
+    }
+
+    /// The reason these exist rather than [`id`]: the value has to satisfy the
+    /// alphabet and the length its caller promised, or the host rejects it and
+    /// the rejection is attributed to the candidate.
+    #[test]
+    fn a_shaped_draw_honours_the_alphabet_and_the_length() {
+        for length in [1_usize, 8, 32, 64] {
+            let m = miss(json!({"n": length}));
+            let value = m.over(&DIGITS, length);
+            assert_eq!(
+                value.chars().count(),
+                length,
+                "length is part of the promise"
+            );
+            assert!(
+                value.chars().all(|c| DIGITS.contains(&c)),
+                "a numeric generator must not return {value}"
+            );
+            assert_eq!(
+                m.bytes_vec(length).len(),
+                length,
+                "length is part of the promise"
+            );
+        }
+    }
+
+    /// An empty alphabet is a caller error, and the miss path is the wrong place
+    /// to panic: that would end the correlation the arm exists to keep alive.
+    #[test]
+    fn an_empty_alphabet_yields_an_empty_string_rather_than_a_panic() {
+        assert_eq!(miss(json!({})).over(&[], 8), "");
+        assert_eq!(miss(json!({})).bytes_vec(0), Vec::<u8>::new());
+    }
+
+    /// Positions must differ from each other, not merely be drawn from the
+    /// alphabet.
+    ///
+    /// Written because every other assertion here passes when the position is
+    /// ignored: `"0000000000000000"` is deterministic, in-alphabet, the right
+    /// length and prefix-stable, so the suite stays green while the value carries
+    /// four bits. A downstream uniqueness assumption would then be violated by a
+    /// value that looks well-formed.
+    #[test]
+    fn the_positions_of_a_shaped_draw_do_not_collapse() {
+        let m = miss(json!({}));
+        let value = m.over(&HEX, 32);
+        let distinct: std::collections::BTreeSet<char> = value.chars().collect();
+        assert!(
+            distinct.len() > 4,
+            "32 characters over a 16-symbol alphabet collapsed to {}: {value}",
+            distinct.len()
+        );
+        let drawn: std::collections::BTreeSet<u8> = m.bytes_vec(32).into_iter().collect();
+        assert!(drawn.len() > 8, "32 bytes collapsed to {}", drawn.len());
+    }
+
+    /// The clock answers at the epoch and advances by one millisecond per call at
+    /// the site, which is [`monotonic`]'s guarantee with the unit fixed.
+    #[test]
+    fn epoch_nanos_starts_at_the_epoch_and_advances_by_a_millisecond() {
+        let at = |n: u32| {
+            miss(json!({"key": "k1"}))
+                .with_call_context(n, None)
+                .epoch_nanos()
+        };
+        assert_eq!(at(0), 0, "the first reading at a site is the epoch itself");
+        assert_eq!(at(1), CLOCK_STEP_NS);
+        assert_eq!(at(3), 3 * CLOCK_STEP_NS);
+        assert!(
+            at(0) < at(1) && at(1) < at(2),
+            "successive readings advance"
         );
     }
 
@@ -397,5 +769,53 @@ mod tests {
         let m = miss(json!({})).with_call_context(u32::MAX, None);
         assert_eq!(monotonic(&m, i64::MAX, i64::MAX), i64::MAX);
         assert!(monotonic(&m, 0, i64::MAX) > 0, "must not wrap negative");
+    }
+
+    /// Every synthesized value, pinned to the byte for one fully specified miss.
+    ///
+    /// Determinism within one build is not the property that matters here. Two
+    /// hosts pin this crate and replay tapes recorded under an earlier pin, and a
+    /// candidate is compared against a baseline that may have run under a
+    /// different one. A change to the digest, to a domain string, or to the
+    /// mixing would move EVERY synthesized value at once, and nothing else in
+    /// this file would notice: the properties above (determinism,
+    /// distinguishability, separation, shape) all hold just as well for a
+    /// different set of values. So the values themselves are the assertion.
+    ///
+    /// The four free helpers are pinned alongside the new draws deliberately.
+    /// Adding a separated draw must not move an existing output — a moved output
+    /// is a tape that no longer matches on the host side — and these lines are
+    /// what makes that claim checkable rather than asserted in a commit message.
+    ///
+    /// If this fails: do not update the literals to make it pass. Either the
+    /// change is unintended, or it is a deliberate break that both hosts have to
+    /// be told about before it lands.
+    #[test]
+    fn every_synthesized_value_is_pinned_to_the_byte() {
+        // Occurrence and correlation set explicitly: a pin taken at the defaults
+        // would not notice a change that only reaches the digest through them.
+        let m = miss(json!({"key": "k1"})).with_call_context(2, Some("corr-7".to_string()));
+
+        assert_eq!(u64(&m), 0x8dbb_2fba_051e_bde8);
+        assert_eq!(
+            bytes::<16>(&m),
+            [29, 46, 167, 45, 90, 153, 73, 90, 130, 209, 188, 245, 207, 236, 94, 135]
+        );
+        assert_eq!(uuid_v8(&m), "2a40bb8a-771b-839e-a3d9-60e501260e60");
+        assert_eq!(id(&m), "deja-synth-8978031a428d5802");
+
+        assert_eq!(m.over(&HEX, 12), "c064c70af7a2");
+        assert_eq!(m.over(&ALPHANUMERIC, 20), "qC8M1WWrx28yT5fiWY9R");
+        assert_eq!(
+            m.bytes_vec(12),
+            [108, 235, 76, 1, 230, 235, 105, 173, 38, 99, 127, 200]
+        );
+        // A second width at the same miss, pinned next to the first so the
+        // separation is visible in the literals: these two draws share nothing,
+        // where one position-indexed stream would have made the shorter the head
+        // of the longer.
+        assert_eq!(m.bytes_vec(5), [84, 173, 42, 128, 211]);
+
+        assert_eq!(m.epoch_nanos(), 2_000_000);
     }
 }
