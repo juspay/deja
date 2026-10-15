@@ -39,18 +39,22 @@ docker push 223655089699.dkr.ecr.ap-south-1.amazonaws.com/hyperswitch-replay-orc
 ## Scheduled recording sealer
 
 The chart's independent sealer CronJob runs `deja-compactor pass` every 30
-minutes (`Forbid`, 1,500-second deadline); this is separate from
-any hourly router Rollout restart and runs the same chart-selected image. It visits
-each declared system. Date-partitioned sessions produce one recording per UTC
-request-start day: ingress (`request_sequence` 0) assigns the whole request,
-including a late tail in another partition, to its start day. A day with no
-selected records gets a non-replayable empty manifest. Added or removed
-landing objects replan the affected day, allowing late tails to replace its seal.
-If sequence zero is missing, the earliest observed partition retains the
-request; `lines_without_ingress` names those incomplete lines within `lines_in`.
+minutes (`Forbid`, 1,500-second deadline), separate from any router restart.
+It scans each declared system's S3 landing and indexes object fingerprints,
+request ingress days, and source dependencies in the same Postgres database as
+the orchestrator (`DEJA_DB_URL` is required). A long-lived pod contributes to
+multiple UTC request-start-day views without rotating its session ID. The S3
+`dt=` prefix locates raw objects; it does not decide request day. A cross-midnight
+tail belongs to the request's ingress day, even if it arrives several partitions
+later. Missing ingress refuses an exact day seal instead of assigning a guessed
+date. Indexed day manifests have immutable database revisions and a transactional
+current head; old whole-session `sessions/v1` manifests remain readable.
+Same-count object replacement invalidates the affected source snapshot. Raw
+source deletion marks the session incomplete and refuses a partial reseal; old
+pinned day revisions remain readable until their immutable S3 parts expire.
 
-Local smoke against disposable MinIO plus API: initial D7/D8 pass sealed both;
-a later D9 tail for D7 caused reseal (seal ID
+Earlier draft smoke (before the Postgres index) against disposable MinIO plus API:
+initial D7/D8 pass sealed both; a later D9 tail for D7 caused reseal (seal ID
 `7a52560118d34354` → `8a404437ea48ee45`, events 1 → 2), D9 published a
 terminal empty marker, and the next pass planned zero. In another session, a
 late D7 ingress replaced D8's orphan-tail seal with an empty manifest (no parts)
@@ -63,17 +67,61 @@ Separately, a terminal empty manifest in a named system's prefixed bucket
 returned HTTP 200 from `/recordings/{id}/correlations` with `status=empty`,
 zero correlations; the same ID in the wrong system returned HTTP 404.
 
+Indexed local smoke against disposable MinIO and Postgres (not a deployment):
+one unchanged Hyperswitch pod yielded D7/D8 seals and a no-change pass planned
+zero; a D9 object carrying a late D8 tail resealed D8 while Prism's separate
+bucket remained unchanged. Replacing one D8 object under the same key/count
+changed the seal. An ingress timestamp on D8 stored under physical `dt=D9`
+produced the D8 view. Actual HTTP `/available?group=…` returned only that
+group's member; grouped replay ingested its pinned immutable seal, then the
+synthetic fixture failed lookup rendering for missing `trait_name` (no full
+replay claim). Deleting a previously indexed raw object marked that session
+incomplete, removed its current group, and retained a separately admitted
+Prism run's historical seal through `/runs/{id}/recording-snapshot`.
+Additional local checks: two concurrent passes over one new Prism day produced
+one immutable database revision; a stale source listing was rejected after
+another worker indexed an object; and removing the final raw object tombstoned
+its current view while retaining the historical seal. An indexed day and a
+legacy whole-session member in the same saved `revision-MMDD` group replayed
+once each, while a legacy-only group still ingested its S3 seal with Postgres
+unavailable. A prefixed Prism bucket sealed and ingested from its own root.
+The UI was rendered in Chromium; without a sandbox Kubernetes context it
+correctly displayed the recommendation as unavailable rather than guessing
+an active deployment. No live rollout/rollback was exercised.
+
+Follow-up local HTTP smoke with disposable Postgres and tmpfs-backed MinIO:
+`/recordings/{id}/correlations` returned the current indexed day's seal-specific
+sidecar (HTTP 200, `status=sealed`, one correlation). After the source was marked
+incomplete, the same request returned `status=unsealed` despite an old S3
+manifest and sidecar remaining; a separate legacy-only day still returned its
+S3 correlation index as sealed. The real-Postgres regression also confirms
+that an orphan-only source object blocks day publication and hides existing
+current heads until another object supplies its ingress. No Kubernetes
+recommendation or full stage-two replay was exercised by this smoke.
+
 An oversized recording is a named refusal in the pass ledger, not necessarily
 a failed Job; the current refusal path can exit successfully. Alert on ledger
 refusals/incomplete or missing pass output, not Job success alone.
 
-Before any rollout, gate on bounded streaming/indexed selection instead of
-re-reading every session partition per day (currently O(D²)), per-day rather
-than whole-session decoded-byte budgeting (a 512 MiB aggregate ceiling can
-reject daily seals), producer routing by request start day, and conditional
-(CAS) manifest publication to prevent an older concurrent scan replacing a
-newer seal. These are unresolved design/implementation gates, not shipped
-behavior. No deploy is authorized by this note.
+Before rollout: this branch carries only PR #281's schema migrations
+`0010_cd.sql` and `0011_cd_controls.sql` ahead of `0012_view_index.sql` so
+Postgres applies them in order. This worktree does not import #281's CD API/UI;
+integrating its code from main requires keeping the applied `0010`/`0011`
+migration identities unchanged. Do not deploy the indexed sealer to a database
+that has already applied different migrations under either number. The CD
+deployment log has no verified live writer/observer in inspected infra, so
+automatic recommendation reads configured Kubernetes serving pods and fails
+closed on an ambiguous or unknown revision. ART's strict recommendation consumer must
+deploy only after the API, database index/backfill, workload descriptors/RBAC,
+and an eligible sealed day are present. No rollout is authorized by this note.
+
+The index avoids full-session decoding once per day. Compressed source-object
+reads stop after the configured byte ceiling, but materialization still retains
+the selected day's decoded objects, lines, and collated events in memory. Verify
+actual peak memory against the configured 4 GiB decoded allowance / 16 GiB pod
+limit and alert on failed/refused day rows and missing pass summaries. Source
+cleanup is a terminal incomplete state until backfill; it must never
+masquerade as a smaller current tape.
 
 Read-only verification against the checked-out infra chart (no cluster access):
 

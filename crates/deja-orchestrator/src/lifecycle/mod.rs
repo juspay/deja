@@ -753,7 +753,7 @@ fn drive_record(
         total,
         "compacting + pulling session from S3",
     );
-    pull_recording(root, ctx, &recording_id, run.spec.system())?;
+    pull_recording(root, ctx, &recording_id, run.spec.system(), None)?;
 
     // Register what this run produced. Execution-graph nodes ride the tape
     // itself as `DejaRecord::GraphNode` lines, so the events artifact is the
@@ -997,8 +997,24 @@ fn stage_resolve_recording(
                     return Err(error);
                 }
             }
-            if !crate::scope::TapeSlot::is_materialized(root, &recording_id) {
-                pull_recording(root, ctx, &recording_id, run.spec.system())?;
+            let snapshot = run
+                .spec
+                .workload
+                .get("deja_recording_group_snapshot")
+                .cloned()
+                .map(serde_json::from_value::<crate::RecordingGroupSnapshot>)
+                .transpose()
+                .map_err(|e| format!("decode recording group snapshot: {e}"))?;
+            // The pin travels in the serialized RunSpec, including the Job
+            // payload, and always bypasses a pre-existing local group tape.
+            if snapshot.is_some() || !crate::scope::TapeSlot::is_materialized(root, &recording_id) {
+                pull_recording(
+                    root,
+                    ctx,
+                    &recording_id,
+                    run.spec.system(),
+                    snapshot.as_ref(),
+                )?;
             }
             recording_id
         }
@@ -6343,12 +6359,66 @@ fn unsealed_source(cfg: &crate::s3::S3Config, located: &str) -> crate::S3Source 
         endpoint: (!cfg.endpoint.trim().is_empty()).then(|| cfg.endpoint.clone()),
     }
 }
+fn fetch_pinned_manifests(
+    run_id: &str,
+    snapshot: &crate::RecordingGroupSnapshot,
+) -> Result<Option<Vec<(String, deja_compactor::SessionManifest)>>, String> {
+    if !snapshot
+        .members
+        .iter()
+        .any(|member| member.generation.is_some() && !member.terminal_empty)
+    {
+        return Ok(None);
+    }
+    if snapshot.members.iter().any(|member| {
+        member.day.is_some()
+            && !member.terminal_empty
+            && (member.generation.is_none()
+                || member.dependency_token.is_none()
+                || member.seal_id.is_none())
+    }) {
+        return Err("pinned day member is missing its immutable generation identity".into());
+    }
+    let base = std::env::var("DEJA_ORCHESTRATOR_URL")
+        .map_err(|_| "DEJA_ORCHESTRATOR_URL is required to retrieve pinned manifests".to_owned())?;
+    let url = format!(
+        "{}/api/v1/runs/{run_id}/recording-snapshot",
+        base.trim_end_matches('/')
+    );
+    let token = std::env::var("DEJA_API_SERVICE_TOKEN").map_err(|_| {
+        "DEJA_API_SERVICE_TOKEN is required to retrieve pinned manifests".to_owned()
+    })?;
+    let actor = format!("system:runner:{run_id}");
+    let response = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .get(&url)
+        .set("authorization", &format!("Bearer {token}"))
+        .set("x-deja-actor", &actor)
+        .call()
+        .map_err(|error| format!("fetch pinned manifests: {error}"))?;
+    let manifests: Vec<(String, deja_compactor::SessionManifest)> = response
+        .into_json()
+        .map_err(|error| format!("decode pinned manifests: {error}"))?;
+    let expected: Vec<_> = snapshot
+        .members
+        .iter()
+        .filter(|member| member.generation.is_some() && !member.terminal_empty)
+        .map(|member| member.recording_id.as_str())
+        .collect();
+    let actual: Vec<_> = manifests.iter().map(|(id, _)| id.as_str()).collect();
+    if expected != actual {
+        return Err("orchestrator returned a different pinned manifest member set".into());
+    }
+    Ok(Some(manifests))
+}
 
 fn pull_recording(
     root: &HarnessRoot,
     ctx: &StoreCtx,
     recording_id: &str,
     system: &str,
+    snapshot: Option<&crate::RecordingGroupSnapshot>,
 ) -> Result<(), String> {
     // Resolved through the registry, like every other reader of a recording. It
     // used to be the deployment's default bucket, so a run whose recording lives
@@ -6358,6 +6428,35 @@ fn pull_recording(
     let (location, landing_root) = crate::system::recording_scope(system)?;
     let mut cfg = crate::s3::S3Config::from_env();
     location.apply(&mut cfg);
+    if let Some(snapshot) = snapshot {
+        if snapshot.recording_group != recording_id
+            || (!is_group(recording_id)
+                && deja_compactor::day::split_recording_id(recording_id)
+                    .day
+                    .is_none())
+        {
+            return Err("recording snapshot does not match the requested group or day".into());
+        }
+        if snapshot.system != system
+            || snapshot.bucket != cfg.bucket
+            || snapshot.prefix != cfg.prefix
+            || snapshot.endpoint != cfg.endpoint
+            || snapshot.region != cfg.region
+            || snapshot.landing_root != cfg.bucket_key(&landing_root)
+        {
+            return Err(format!(
+                "recording source changed since admission (pinned s3://{}/{}, current s3://{}/{})",
+                snapshot.bucket,
+                snapshot.landing_root,
+                cfg.bucket,
+                cfg.bucket_key(&landing_root)
+            ));
+        }
+    }
+    let pinned_manifests = snapshot
+        .map(|snapshot| fetch_pinned_manifests(ctx.run_id(), snapshot))
+        .transpose()?
+        .flatten();
     // WHICH KIND OF NAME IS THIS — asked FIRST, before anything tries to find a
     // session by it.
     //
@@ -6381,7 +6480,10 @@ fn pull_recording(
     // by the session id carried in each envelope. That matters beyond finding
     // it: a session spanning two dates is addressed from the shared parent, so
     // the prefix holds other sessions too, and only content can separate them.
-    if !is_group_name && deja_compactor::read_manifest(&cfg, recording_id)?.is_none() {
+    if pinned_manifests.is_none()
+        && !is_group_name
+        && deja_compactor::read_manifest(&cfg, recording_id)?.is_none()
+    {
         // A day of a session is chosen by when each request began, which only
         // the sealer computes; the prefix scan below would read the session
         // whole. Refused by name rather than replayed as something else.
@@ -6428,15 +6530,32 @@ fn pull_recording(
         // Not a group: the caller named one pod's slice, not a day. Left alone.
         false => vec![recording_id.to_owned()],
         true => {
-            let found = deja_compactor::list_landed_recordings(&cfg, &landing_root)?;
-            let mut ids: Vec<String> = found
-                .into_iter()
-                .filter(|r| {
-                    crate::group_of(&crate::parse_recording_id(&r.session_id)).as_deref()
-                        == Some(recording_id)
-                })
-                .map(|r| r.session_id)
-                .collect();
+            let mut ids: Vec<String> = if let Some(snapshot) = snapshot {
+                for member in &snapshot.members {
+                    if member.terminal_empty {
+                        empty_members.push(member.recording_id.clone());
+                    } else if member.seal_id.is_none() {
+                        excluded.push(member.recording_id.clone());
+                    }
+                }
+                snapshot
+                    .members
+                    .iter()
+                    .filter(|member| member.seal_id.is_some())
+                    .map(|member| member.recording_id.clone())
+                    .collect()
+            } else {
+                deja_compactor::list_landed_recordings(&cfg, &landing_root)?
+                    .into_iter()
+                    .filter(|r| {
+                        crate::group_matches(
+                            &crate::parse_recording_id(&r.session_id),
+                            recording_id,
+                        )
+                    })
+                    .map(|r| r.session_id)
+                    .collect()
+            };
             // Stable order so two runs of the same group produce the same tape,
             // and so a diff between them is about the recording rather than
             // about which order the listing happened to return.
@@ -6471,11 +6590,49 @@ fn pull_recording(
             // itself, not any one member) reads as every member unreadable, so
             // it falls through the same per-member rule below rather than
             // aborting the pull outright.
-            let members_before = ids.len();
-            let manifests = deja_compactor::read_manifests(&cfg, &ids)
-                .unwrap_or_else(|e| ids.iter().map(|_| Err(e.clone())).collect());
+            let members_before = ids.len() + excluded.len() + empty_members.len();
+            let manifests: Vec<Result<Option<deja_compactor::SessionManifest>, String>> =
+                if let Some(pinned) = &pinned_manifests {
+                    ids.iter()
+                        .map(|id| {
+                            if let Some((_, manifest)) =
+                                pinned.iter().find(|(pinned_id, _)| pinned_id == id)
+                            {
+                                Ok(Some(manifest.clone()))
+                            } else if snapshot.is_some_and(|snapshot| {
+                                snapshot.members.iter().any(|member| {
+                                    member.recording_id == *id
+                                        && member.day.is_none()
+                                        && member.seal_id.is_some()
+                                })
+                            }) {
+                                deja_compactor::read_manifest(&cfg, id)
+                            } else {
+                                Err(format!("pinned manifest missing for {id}"))
+                            }
+                        })
+                        .collect()
+                } else {
+                    deja_compactor::read_manifests(&cfg, &ids)
+                        .unwrap_or_else(|e| ids.iter().map(|_| Err(e.clone())).collect())
+                };
             let mut kept = Vec::with_capacity(ids.len());
             for (id, manifest) in ids.into_iter().zip(manifests) {
+                if let Some(snapshot) = snapshot {
+                    let expected = snapshot
+                        .members
+                        .iter()
+                        .find(|member| member.recording_id == id)
+                        .and_then(|member| member.seal_id.as_deref());
+                    let actual = manifest
+                        .as_ref()
+                        .ok()
+                        .and_then(Option::as_ref)
+                        .map(|manifest| manifest.seal_id.as_str());
+                    if expected != actual {
+                        return Err(format!("recording {id} changed seal since admission"));
+                    }
+                }
                 match manifest {
                     Ok(Some(manifest)) if is_empty_terminal_manifest(&manifest.status) => {
                         empty_members.push(id)
@@ -6483,8 +6640,7 @@ fn pull_recording(
                     Ok(Some(_)) => kept.push(id),
                     Ok(None) => excluded.push(id),
                     // A store that cannot answer is not evidence of an unsealed
-                    // member. Keep it and let the pull produce the real error,
-                    // rather than silently shrinking the day over a transient.
+                    // member. Keep it and let the pull produce the real error.
                     Err(_) => kept.push(id),
                 }
             }
@@ -6540,7 +6696,64 @@ fn pull_recording(
 
     let dest = crate::scope::TapeSlot::for_write(root, recording_id);
     let refs: Vec<&str> = members.iter().map(String::as_str).collect();
-    let (mut report, manifests) = crate::s3::pull_recordings(&cfg, &refs, &dest)?;
+    let (mut report, manifests) = if let Some(pinned) = &pinned_manifests {
+        let exact: Vec<_> = members
+            .iter()
+            .map(|id| {
+                if let Some((_, manifest)) = pinned.iter().find(|(pinned_id, _)| pinned_id == id) {
+                    return Ok((id.clone(), manifest.clone()));
+                }
+                let Some(admitted_seal) = snapshot
+                    .and_then(|snapshot| {
+                        snapshot
+                            .members
+                            .iter()
+                            .find(|member| member.recording_id == *id && member.day.is_none())
+                    })
+                    .and_then(|member| member.seal_id.as_deref())
+                else {
+                    return Err(format!("pinned manifest missing for {id}"));
+                };
+                let manifest = deja_compactor::read_manifest(&cfg, id)?
+                    .ok_or_else(|| format!("legacy pinned manifest missing for {id}"))?;
+                if manifest.seal_id != admitted_seal {
+                    return Err(format!(
+                        "legacy recording {id} changed seal since admission"
+                    ));
+                }
+                Ok((id.clone(), manifest))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        crate::s3::pull_recordings_from_manifests(&cfg, &exact, &dest)?
+    } else {
+        crate::s3::pull_recordings(&cfg, &refs, &dest)?
+    };
+    if let Some(snapshot) = snapshot {
+        let expected: Vec<_> = snapshot
+            .members
+            .iter()
+            .filter_map(|member| {
+                member
+                    .seal_id
+                    .as_deref()
+                    .map(|seal| (&member.recording_id, seal))
+            })
+            .collect();
+        let matches_snapshot = members.len() == expected.len()
+            && members.iter().zip(&expected).zip(&manifests).all(
+                |((recording_id, (expected_id, expected_seal)), manifest)| {
+                    recording_id == *expected_id
+                        && manifest.session_id == **expected_id
+                        && manifest.seal_id == *expected_seal
+                },
+            );
+        if !matches_snapshot {
+            let _ = std::fs::remove_file(&dest);
+            return Err(
+                "recording group changed while it was being pulled; no tape was retained".into(),
+            );
+        }
+    }
     // Beside `members`, which names what the pull DID draw from. Without this
     // the artifact describes a partial run as a whole one, and the exclusion
     // survives only as prose in a log.

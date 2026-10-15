@@ -924,39 +924,16 @@ pub fn parse_recording_id(recording_id: &str) -> RecordingIdentity {
 /// The deployment-and-day a recording belongs to, or `None` when its id does not
 /// name BOTH a revision and a start date.
 ///
-/// Both, and the distinction is live rather than theoretical. A row's
-/// `identity.revision` can come from the MANIFEST when the id does not carry
-/// one (`revision_source: "manifest"`), so a boot-derived recording can report
-/// a revision and still have no group — `run-1789076520165195354` does exactly
-/// that today, with revision `28d8299` and 59 correlations. The manifest
-/// supplies the revision; nothing supplies the day, because the id has no start
-/// date and the recording's own `latest_date` is the day it last WROTE, which
-/// for a session straddling midnight is not the day it belongs to.
-///
-/// Grouping it by the wrong day would put a recording in a selection whose
-/// scope nobody named, which is worse than leaving it ungroupable: the pipeline
-/// already excludes these on the main-deployment test, so nothing is lost by
-/// declining to guess.
-///
-/// `<revision>-<MMDD>`, derived rather than stored. The id ALREADY carries the
-/// minute a recording started, so the day is a prefix of something every
-/// recording has had all along — no new id shape, nothing to mint, and every
-/// recording ever sealed is groupable the moment this ships.
-///
-/// This is the unit a replay actually wants. A pod's recording is an arbitrary
-/// slice: pods are replaced every thirty minutes, so "the traffic this
-/// deployment served that day" is spread across dozens of them — 82 on the day
-/// this was measured — and picking one is picking a fraction for no reason a
-/// caller could state.
+/// A day-qualified recording uses its request-ingress UTC day; a whole legacy
+/// session uses its start day. The explicit day group includes the year so a
+/// December day can never collide with the following December.
 pub fn group_of(identity: &RecordingIdentity) -> Option<String> {
     match identity {
-        // One day of a session belongs to that day. A whole session belongs
-        // to the day it began, which its id carries.
         RecordingIdentity::Described {
             revision,
             day: Some(day),
             ..
-        } => Some(format!("{revision}-{}{}", &day[5..7], &day[8..10])),
+        } => Some(format!("{revision}-{}", day.replace('-', ""))),
         RecordingIdentity::Described {
             revision,
             recorded_at,
@@ -1149,6 +1126,45 @@ pub fn delta_cache_of(ledger: &std::path::Path) -> PathBuf {
 }
 pub fn change_coverage_cache_of(observed: &std::path::Path) -> PathBuf {
     observed.with_extension("change-coverage.json")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingGroupSnapshot {
+    pub recording_group: String,
+    pub system: String,
+    pub bucket: String,
+    pub endpoint: String,
+    pub prefix: String,
+    pub region: Option<String>,
+    pub landing_root: String,
+    pub members: Vec<RecordingGroupMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingGroupMember {
+    pub recording_id: String,
+    pub day: Option<String>,
+    pub generation: Option<i64>,
+    pub dependency_token: Option<String>,
+    pub seal_id: Option<String>,
+    /// Terminal day marker: complete but no replayable tape.
+    #[serde(default)]
+    pub terminal_empty: bool,
+}
+
+/// spelling so existing manually-saved group selections continue to resolve.
+pub fn group_matches(identity: &RecordingIdentity, group: &str) -> bool {
+    if group_of(identity).as_deref() == Some(group) {
+        return true;
+    }
+    match identity {
+        RecordingIdentity::Described {
+            revision,
+            day: Some(day),
+            ..
+        } => group == format!("{revision}-{}{}", &day[5..7], &day[8..10]),
+        _ => false,
+    }
 }
 
 impl HarnessRoot {
@@ -1773,7 +1789,7 @@ mod run_identity_tests {
                 day: Some("2026-10-08".into()),
             }
         );
-        assert_eq!(group_of(&one_day).as_deref(), Some("2091a49-1008"));
+        assert_eq!(group_of(&one_day).as_deref(), Some("2091a49-20261008"));
 
         // A day suffix does not make an id described that is not.
         assert_eq!(
@@ -1782,6 +1798,14 @@ mod run_identity_tests {
                 booted_at_nanos: "1785331134782268537".into()
             }
         );
+        let year_boundary = parse_recording_id("rec-2091a49-12312359-xx.2026-12-31");
+        let next_year = parse_recording_id("rec-2091a49-01010001-yy.2027-01-01");
+        assert_eq!(
+            group_of(&year_boundary).as_deref(),
+            Some("2091a49-20261231")
+        );
+        assert_eq!(group_of(&next_year).as_deref(), Some("2091a49-20270101"));
+        assert_ne!(group_of(&year_boundary), group_of(&next_year));
     }
 
     #[test]

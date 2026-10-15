@@ -147,6 +147,93 @@ fn place(line: &str) -> Option<Placed> {
     })
 }
 
+/// Membership information derived from one durable object.
+pub(crate) struct ObjectMembership {
+    pub(crate) requests: Vec<deja_store::RequestDayMembership>,
+    pub(crate) correlation_ids: Vec<String>,
+    pub(crate) object_days: Vec<String>,
+    pub(crate) unresolved_correlations: Vec<String>,
+}
+
+/// Derive durable object memberships from actual envelopes, not their
+/// aggregator partition paths. Correlation ids are stored on every contributing
+/// object; only sequence-zero ingress records carry a day assignment. An object
+/// with an unresolved correlated record must be refused by the caller.
+pub(crate) fn index_objects(objects: &[(&str, &[u8])]) -> Vec<ObjectMembership> {
+    let mut request_days = BTreeMap::<String, String>::new();
+    for (_, chunk) in objects {
+        for line in chunk.split(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(line);
+            if let Some(p) = place(&line) {
+                if p.request_sequence == Some(0) {
+                    if let (Some(correlation), Some(timestamp)) = (p.correlation_id, p.started_ns) {
+                        request_days.insert(correlation, utc_date(timestamp));
+                    }
+                }
+            }
+        }
+    }
+    objects
+        .iter()
+        .map(|(_, chunk)| {
+            let mut requests = BTreeMap::<String, String>::new();
+            let mut correlations = BTreeSet::new();
+            let mut unresolved = BTreeSet::new();
+            let mut object_days = BTreeSet::new();
+            for line in chunk.split(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(line);
+                let Some(p) = place(&line) else { continue };
+                if let Some(correlation) = p.correlation_id {
+                    correlations.insert(correlation.clone());
+                    if let Some(day) = request_days.get(&correlation) {
+                        requests.insert(correlation, day.clone());
+                    } else {
+                        unresolved.insert(correlation);
+                    }
+                } else if let Some(timestamp) = p.started_ns {
+                    object_days.insert(utc_date(timestamp));
+                }
+            }
+            ObjectMembership {
+                requests: requests
+                    .into_iter()
+                    .map(|(correlation_id, day)| deja_store::RequestDayMembership {
+                        correlation_id,
+                        day,
+                    })
+                    .collect(),
+                correlation_ids: correlations.into_iter().collect(),
+                object_days: object_days.into_iter().collect(),
+                unresolved_correlations: unresolved.into_iter().collect(),
+            }
+        })
+        .collect()
+}
+#[cfg(test)]
+mod indexing_tests {
+    use super::*;
+
+    #[test]
+    fn orphan_correlations_are_explicitly_reported_by_object_index() {
+        let valid = format!(
+            r#"{{"schema_version":2,"instance_id":"i1","event":{{"correlation_id":"valid","request_sequence":0,"timestamp_ns":{}}}}}"#,
+            1_791_417_598_000_000_000u64
+        );
+        let orphan =
+            br#"{"schema_version":2,"instance_id":"i1","event":{"correlation_id":"orphan","request_sequence":1}}"#;
+        let objects = [
+            ("2026-10-07", valid.as_bytes()),
+            ("2026-10-08", orphan.as_slice()),
+        ];
+        let indexed = index_objects(&objects);
+        assert!(indexed[0].unresolved_correlations.is_empty());
+        assert_eq!(
+            indexed[1].unresolved_correlations,
+            vec!["orphan".to_owned()]
+        );
+    }
+}
+
 /// The lines of ONE day, out of objects read across the partitions that can
 /// hold it.
 pub(crate) struct DaySelection {
@@ -155,10 +242,15 @@ pub(crate) struct DaySelection {
     /// Lines read that belong to another day — sealed there, not lost.
     pub other_day_lines: usize,
     /// Retained lines of requests whose sequence-zero ingress was not found.
-    /// This is a subset of `kept`, not a separate part of the read-line total.
     pub lines_without_ingress: usize,
-    /// Boundary-event sequences set aside for another day, per instance, so
-    /// the coverage scan does not report them as holes in this one.
+    /// At least one correlated record has no sequence-zero ingress, and cannot
+    /// be assigned to an exact logical day.
+    pub has_unresolved_ingress: bool,
+    /// Correlations without ingress in these source objects. Their objects may
+    /// be absent from every indexed day dependency, so callers must refuse to
+    /// publish any day until these are resolved.
+    pub unresolved_correlations: BTreeSet<String>,
+    /// Boundary-event sequences set aside for another day, per instance.
     pub elsewhere: BTreeMap<String, BTreeSet<u64>>,
 }
 
@@ -177,10 +269,19 @@ pub(crate) struct DaySelection {
 pub(crate) fn select_day(
     objects: &[(&str, &[u8])],
     day: &str,
-    days: &BTreeSet<String>,
+    _days: &BTreeSet<String>,
 ) -> DaySelection {
-    let listed =
-        |date: String| -> String { days.range(date.clone()..).next().cloned().unwrap_or(date) };
+    select_day_with_request_days(objects, day, &BTreeMap::new())
+}
+
+/// Resolve a day's object lines using the durable ingress index. An S3 object
+/// can mix tails from previous days with today's ingresses; fetching only its
+/// indexed day dependencies does not necessarily fetch the earlier ingress.
+pub(crate) fn select_day_with_request_days(
+    objects: &[(&str, &[u8])],
+    day: &str,
+    known_request_days: &BTreeMap<String, String>,
+) -> DaySelection {
     #[derive(Default)]
     struct Request {
         ingress_ns: Option<u64>,
@@ -210,18 +311,30 @@ pub(crate) fn select_day(
     // timestamp cannot be recovered. Preserve the request on its earliest
     // observed partition in that case; the manifest still counts its lines as
     // lacking ingress, so this is not represented as a complete request.
-    let request_day: BTreeMap<String, (Option<String>, bool)> = requests
+    let mut request_day: BTreeMap<String, (Option<String>, bool)> = requests
         .into_iter()
         .filter_map(|(c, r)| match (r.ingress_ns, r.dated) {
-            (Some(ns), _) => Some((c, (Some(listed(utc_date(ns))), false))),
+            (Some(ns), _) => Some((c, (Some(utc_date(ns)), false))),
             (None, true) => Some((c, (r.earliest_partition, true))),
             (None, false) => None,
         })
         .collect();
+    let conflicting_ingress = known_request_days.iter().any(|(correlation, indexed_day)| {
+        request_day
+            .get(correlation)
+            .is_some_and(|(local_day, missing)| {
+                !missing && local_day.as_deref() != Some(indexed_day.as_str())
+            })
+    });
+    for (correlation, indexed_day) in known_request_days {
+        request_day.insert(correlation.clone(), (Some(indexed_day.clone()), false));
+    }
 
     let mut kept = Vec::with_capacity(objects.len());
     let mut other_day_lines = 0usize;
     let mut lines_without_ingress = 0usize;
+    let mut has_unresolved_ingress = conflicting_ingress;
+    let mut unresolved_correlations = BTreeSet::new();
     let mut elsewhere: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     for (partition, chunk) in objects {
         let mut mine = Vec::new();
@@ -237,16 +350,31 @@ pub(crate) fn select_day(
                 .as_ref()
                 .and_then(|p| p.correlation_id.as_ref())
                 .and_then(|c| request_day.get(c).cloned());
+            let unresolved_correlation = placed
+                .as_ref()
+                .and_then(|p| p.correlation_id.as_ref())
+                .filter(|correlation| !request_day.contains_key(*correlation));
+            let unresolved_ingress = unresolved_correlation.is_some();
+            if let Some(correlation) = unresolved_correlation {
+                unresolved_correlations.insert(correlation.clone());
+            }
             let missing_ingress = by_request
                 .as_ref()
                 .is_some_and(|(_, missing_ingress)| *missing_ingress);
+            if missing_ingress {
+                if let Some(correlation) = placed.as_ref().and_then(|p| p.correlation_id.as_ref()) {
+                    unresolved_correlations.insert(correlation.clone());
+                }
+            }
+            has_unresolved_ingress |= unresolved_ingress || missing_ingress;
             let line_day = match by_request {
                 Some((d, _)) => d,
+                None if unresolved_ingress => None,
                 None => Some(
                     placed
                         .as_ref()
                         .and_then(|p| p.started_ns)
-                        .map(|ns| listed(utc_date(ns)))
+                        .map(utc_date)
                         .unwrap_or_else(|| (*partition).to_owned()),
                 ),
             };
@@ -255,6 +383,9 @@ pub(crate) fn select_day(
                     lines_without_ingress += 1;
                 }
                 mine.push(line);
+                continue;
+            }
+            if unresolved_ingress {
                 continue;
             }
             other_day_lines += 1;
@@ -268,6 +399,8 @@ pub(crate) fn select_day(
         kept,
         other_day_lines,
         lines_without_ingress,
+        has_unresolved_ingress,
+        unresolved_correlations,
         elsewhere,
     }
 }
@@ -451,26 +584,64 @@ mod tests {
     }
 
     #[test]
-    fn a_day_with_no_partition_is_sealed_with_the_next_one() {
-        // The session's only traffic on 10-07 was at 23:59:58, and it flushed
-        // into the 10-08 partition, so there is no 10-07 recording to hold it.
+    fn orphan_correlated_object_is_reported_alongside_valid_day() {
+        let valid = object(&[event(1, Some(("valid", 0)), BEFORE_MIDNIGHT)]);
+        let orphan = object(&[event(2, Some(("orphan", 1)), AFTER_MIDNIGHT)]);
+        let objects = [
+            ("2026-10-07", valid.as_slice()),
+            ("2026-10-08", orphan.as_slice()),
+        ];
+        let indexed = BTreeMap::from([("valid".to_owned(), "2026-10-07".to_owned())]);
+
+        let selected = select_day_with_request_days(&objects, "2026-10-07", &indexed);
+
+        assert_eq!(selected.kept[0].len(), 1);
+        assert!(selected.has_unresolved_ingress);
+        assert_eq!(
+            selected.unresolved_correlations,
+            BTreeSet::from(["orphan".to_owned()])
+        );
+    }
+
+    #[test]
+    fn ingress_day_is_independent_of_the_physical_partition() {
         let partition = object(&[
             event(1, Some(("c1", 0)), BEFORE_MIDNIGHT),
             event(2, None, BEFORE_MIDNIGHT),
         ]);
         let listed = days(&["2026-10-06", "2026-10-08"]);
-        let selected = select_day(&[("2026-10-08", &partition)], "2026-10-08", &listed);
-        assert_eq!(selected.kept[0].len(), 2);
-        assert_eq!(selected.other_day_lines, 0);
+        let objects = [("2026-10-08", partition.as_slice())];
+        assert_eq!(select_day(&objects, "2026-10-07", &listed).kept[0].len(), 2);
+        assert_eq!(select_day(&objects, "2026-10-08", &listed).kept[0].len(), 0);
     }
 
     #[test]
-    fn a_line_with_no_timestamp_keeps_the_partition_it_landed_in() {
+    fn indexed_ingress_keeps_a_cross_day_tail_in_a_mixed_object() {
+        let mixed = object(&[
+            event(2, Some(("c1", 1)), AFTER_MIDNIGHT),
+            event(3, Some(("c2", 0)), AFTER_MIDNIGHT),
+        ]);
+        let objects = [("2026-10-08", mixed.as_slice())];
+        let indexed = BTreeMap::from([
+            ("c1".to_owned(), "2026-10-07".to_owned()),
+            ("c2".to_owned(), "2026-10-08".to_owned()),
+        ]);
+        let earlier = select_day_with_request_days(&objects, "2026-10-07", &indexed);
+        let later = select_day_with_request_days(&objects, "2026-10-08", &indexed);
+        assert_eq!(earlier.kept[0].len(), 1);
+        assert_eq!(later.kept[0].len(), 1);
+        assert!(!earlier.has_unresolved_ingress);
+        assert!(!later.has_unresolved_ingress);
+    }
+
+    #[test]
+    fn missing_request_day_is_not_invented_from_its_partition() {
         let bare = br#"{"schema_version":2,"instance_id":"i1","event":{"global_sequence":1,"correlation_id":"c9","boundary":"b"}}"#;
         let objects: Vec<(&str, &[u8])> = vec![("2026-10-08", bare)];
         let listed = days(&["2026-10-07", "2026-10-08"]);
-        assert_eq!(select_day(&objects, "2026-10-08", &listed).kept[0].len(), 1);
-        assert_eq!(select_day(&objects, "2026-10-07", &listed).kept[0].len(), 0);
+        let selected = select_day(&objects, "2026-10-08", &listed);
+        assert!(selected.has_unresolved_ingress);
+        assert!(selected.kept[0].is_empty());
     }
 
     #[test]

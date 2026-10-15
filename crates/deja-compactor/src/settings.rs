@@ -148,6 +148,10 @@ pub struct SystemDeclaration {
     /// means NO copy, never the default's environment.
     pub config_source_deployment: Option<String>,
     pub config_source_container: Option<String>,
+    /// Kubernetes workload used to identify active recording producers.
+    pub active_workload_namespace: Option<String>,
+    pub active_workload_kind: Option<String>,
+    pub active_workload_name: Option<String>,
 
     // ---- how its recordings are recognised and scored ----
     /// A substring of its pod names, for attributing a recording whose bucket

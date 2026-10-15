@@ -42,6 +42,7 @@
 //! this in-process from a plain worker thread, and the bin wraps the same
 //! entry points.
 
+use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -917,6 +918,97 @@ async fn get_decoded(
     Ok((decode_object(key.as_ref(), bytes)?, fetched))
 }
 
+/// Decode a source object under its per-object admission budget.
+async fn get_decoded_limited(
+    store: &DynStore,
+    key: &object_store::path::Path,
+    max_bytes: Option<u64>,
+) -> Result<(Vec<u8>, u64), String> {
+    get_decoded_limited_checked(store, key, max_bytes, None).await
+}
+
+/// Bind the bytes returned by GET to the metadata indexed from LIST. A
+/// replacement between listing and reading must not publish a view whose
+/// source fingerprint describes different bytes.
+async fn get_decoded_limited_checked(
+    store: &DynStore,
+    key: &object_store::path::Path,
+    max_bytes: Option<u64>,
+    expected: Option<&str>,
+) -> Result<(Vec<u8>, u64), String> {
+    let limit = max_bytes.unwrap_or(u64::MAX);
+    let object = store
+        .get(key)
+        .await
+        .map_err(|e| format!("s3 get {key}: {e}"))?;
+    if let Some(expected) = expected.filter(|fingerprint| !fingerprint.starts_with("content:")) {
+        let actual = object_meta_fingerprint(&object.meta)
+            .ok_or_else(|| format!("source object {key} lost its indexed identity"))?;
+        if actual != expected {
+            return Err(format!(
+                "source object {key} changed between listing and GET"
+            ));
+        }
+    }
+    if object.meta.size as u64 > limit {
+        return Err(format!("source object {key} exceeds {limit} fetched bytes"));
+    }
+    let bytes = object
+        .bytes()
+        .await
+        .map_err(|e| format!("s3 read {key}: {e}"))?;
+    let fetched = bytes.len() as u64;
+    if fetched > limit {
+        return Err(format!("source object {key} exceeds {limit} fetched bytes"));
+    }
+    let decoded = if key.as_ref().ends_with(".zst") {
+        let decoder =
+            zstd::stream::read::Decoder::new(&bytes[..]).map_err(|e| format!("zstd {key}: {e}"))?;
+        read_decoded_with_limit(decoder, limit, key)?
+    } else if key.as_ref().ends_with(".gz") || bytes.starts_with(&[0x1f, 0x8b]) {
+        read_decoded_with_limit(flate2::read::MultiGzDecoder::new(&bytes[..]), limit, key)?
+    } else {
+        Vec::from(bytes)
+    };
+    if let Some(expected) = expected.filter(|fingerprint| fingerprint.starts_with("content:")) {
+        let actual = format!("content:{:x}", Sha256::digest(&decoded));
+        if actual != expected {
+            return Err(format!(
+                "source object {key} changed between listing and GET"
+            ));
+        }
+    }
+    Ok((decoded, fetched))
+}
+
+fn object_meta_fingerprint(meta: &object_store::ObjectMeta) -> Option<String> {
+    (meta.e_tag.is_some() || meta.version.is_some()).then(|| {
+        format!(
+            "{}:{}:{}",
+            meta.e_tag.as_deref().unwrap_or(""),
+            meta.version.as_deref().unwrap_or(""),
+            meta.size
+        )
+    })
+}
+
+fn read_decoded_with_limit(
+    reader: impl std::io::Read,
+    limit: u64,
+    key: &object_store::path::Path,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| format!("decode source object {key}: {e}"))?;
+    if out.len() as u64 > limit {
+        return Err(format!("source object {key} exceeds {limit} decoded bytes"));
+    }
+    Ok(out)
+}
+
 /// Decode an object's compression by extension, with a magic-byte fallback:
 /// `.zst` = the deja session layout; `.gz`/gzip-magic = deployed Vector
 /// aggregators configured with `compression: gzip` (whose extension is a
@@ -1049,6 +1141,349 @@ pub fn list_objects(cfg: &S3Config, prefix: &str) -> Result<Vec<String>, String>
             .map(|p| p.as_ref().to_owned())
             .collect())
     })
+}
+/// Build the durable request/day index and materialize each changed day view.
+pub fn index_and_materialize_days(
+    cfg: &S3Config,
+    system: &str,
+    root: &str,
+    session_id: &str,
+    max_bytes: Option<u64>,
+) -> Result<usize, String> {
+    let db_url = std::env::var("DEJA_DB_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| "DEJA_DB_URL is required for durable day indexing".to_owned())?;
+    let store = cfg.build()?;
+    let rt = runtime()?;
+    let db = rt
+        .block_on(deja_store::Store::connect(&db_url))
+        .map_err(|e| format!("connect durable index: {e}"))?;
+    rt.block_on(materialize_indexed_days_scoped(
+        &store,
+        &cfg.bucket,
+        system,
+        root,
+        &cfg.bucket_key(root),
+        session_id,
+        max_bytes,
+        &db,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn index_landing_session(
+    store: &DynStore,
+    bucket: &str,
+    system: &str,
+    root: &str,
+    scope_root: &str,
+    session_id: &str,
+    max_bytes: Option<u64>,
+    db: &deja_store::Store,
+) -> Result<
+    (
+        deja_store::LandingScope,
+        Vec<deja_store::LandingDayGeneration>,
+        BTreeMap<String, String>,
+    ),
+    String,
+> {
+    let expected_generation = db
+        .active_landing_session_generations(system, bucket, scope_root)
+        .await
+        .map_err(|error| format!("read indexed generations before S3 LIST: {error}"))?
+        .get(session_id)
+        .copied();
+    let prefix = object_store::path::Path::from(root);
+    let metas: Vec<object_store::ObjectMeta> = store
+        .list(Some(&prefix))
+        .try_collect()
+        .await
+        .map_err(|e| format!("list landing {root}: {e}"))?;
+    index_landing_session_from_listing(
+        store,
+        bucket,
+        system,
+        scope_root,
+        session_id,
+        max_bytes,
+        db,
+        &metas,
+        expected_generation,
+    )
+    .await
+}
+
+/// The pass shares one source listing across sessions. Object paths are
+/// relative to the already-scoped ObjectStore, while `scope_root` names the
+/// bucket-relative root persisted in Postgres.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn index_landing_session_from_listing(
+    store: &DynStore,
+    bucket: &str,
+    system: &str,
+    scope_root: &str,
+    session_id: &str,
+    max_bytes: Option<u64>,
+    db: &deja_store::Store,
+    metas: &[object_store::ObjectMeta],
+    expected_generation: Option<i64>,
+) -> Result<
+    (
+        deja_store::LandingScope,
+        Vec<deja_store::LandingDayGeneration>,
+        BTreeMap<String, String>,
+    ),
+    String,
+> {
+    let scope = deja_store::LandingScope {
+        system: system.to_owned(),
+        bucket: bucket.to_owned(),
+        root: scope_root.to_owned(),
+        session_id: session_id.to_owned(),
+    };
+    let listed: Vec<_> = metas
+        .iter()
+        .filter(|meta| key_names_session(meta.location.as_ref(), session_id))
+        .collect();
+    let keys: Vec<_> = listed
+        .iter()
+        .map(|meta| meta.location.as_ref().to_owned())
+        .collect();
+    db.reconcile_landing_objects(&scope, &keys, expected_generation)
+        .await
+        .map_err(|error| format!("reconcile landing object index: {error}"))?;
+    let prior = db
+        .indexed_landing_objects(&scope)
+        .await
+        .map_err(|error| format!("load indexed landing objects: {error}"))?;
+    let mut fingerprints = BTreeMap::new();
+    for meta in listed {
+        let key = &meta.location;
+        let fallback_bytes = if meta.e_tag.is_none() && meta.version.is_none() {
+            Some(get_decoded_limited(store, key, max_bytes).await?.0)
+        } else {
+            None
+        };
+        let fingerprint = match fallback_bytes.as_ref() {
+            Some(bytes) => format!("content:{:x}", Sha256::digest(bytes)),
+            None => object_meta_fingerprint(meta).expect("source object had an ETag or version"),
+        };
+        if prior.get(key.as_ref()) != Some(&fingerprint) {
+            let bytes = match fallback_bytes {
+                Some(bytes) => bytes,
+                None => {
+                    get_decoded_limited_checked(store, key, max_bytes, Some(&fingerprint))
+                        .await?
+                        .0
+                }
+            };
+            let membership = day::index_objects(&[(key.as_ref(), bytes.as_slice())])
+                .into_iter()
+                .next()
+                .expect("one object");
+            db.index_landing_object(
+                &scope,
+                &deja_store::LandingObjectIndex {
+                    object_key: key.as_ref().to_owned(),
+                    fingerprint: fingerprint.clone(),
+                    correlation_ids: membership.correlation_ids,
+                    requests: membership.requests,
+                    object_days: membership.object_days,
+                },
+            )
+            .await
+            .map_err(|error| format!("index landing object {key}: {error}"))?;
+        }
+        fingerprints.insert(key.as_ref().to_owned(), fingerprint);
+    }
+    let days = db
+        .landing_days(&scope)
+        .await
+        .map_err(|error| format!("load indexed days: {error}"))?;
+    Ok((scope, days, fingerprints))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn materialize_indexed_days_scoped(
+    store: &DynStore,
+    bucket: &str,
+    system: &str,
+    root: &str,
+    scope_root: &str,
+    session_id: &str,
+    max_bytes: Option<u64>,
+    db: &deja_store::Store,
+) -> Result<usize, String> {
+    let (scope, days, fingerprints) = index_landing_session(
+        store, bucket, system, root, scope_root, session_id, max_bytes, db,
+    )
+    .await?;
+    let eligible = days.iter().map(|day| day.day.clone()).collect();
+    materialize_indexed_days_from_index(
+        store,
+        max_bytes,
+        db,
+        &scope,
+        &days,
+        &fingerprints,
+        &eligible,
+    )
+    .await
+    .map(|(published, _, _)| published)
+}
+
+pub(crate) async fn materialize_indexed_days_from_index(
+    store: &DynStore,
+    max_bytes: Option<u64>,
+    db: &deja_store::Store,
+    scope: &deja_store::LandingScope,
+    days: &[deja_store::LandingDayGeneration],
+    fingerprints: &BTreeMap<String, String>,
+    eligible_days: &BTreeSet<String>,
+) -> Result<(usize, u64, u64), String> {
+    let session_id = scope.session_id.as_str();
+    let mut count = 0;
+    let mut bytes_read = 0u64;
+    let mut bytes_fetched = 0u64;
+    let mut source_checked = false;
+    for item in days {
+        if !eligible_days.contains(&item.day) {
+            continue;
+        }
+        if !source_checked {
+            db.require_complete_landing_source(scope)
+                .await
+                .map_err(|error| format!("refuse day materialization: {error}"))?;
+            source_checked = true;
+        }
+        let head = db
+            .day_view_head(scope, &item.day)
+            .await
+            .map_err(|_| format!("read day head {} failed", item.day))?;
+        if head
+            .as_ref()
+            .is_some_and(|h| h.dependency_token == item.dependency_token)
+        {
+            continue;
+        }
+        let request_days = db
+            .indexed_request_days(scope, &item.object_keys)
+            .await
+            .map_err(|error| format!("read indexed request days: {error}"))?;
+        let mut chunks_by_key = BTreeMap::new();
+        let mut materialized_bytes = 0u64;
+        let mut fetched_for_day = 0u64;
+        for key in &item.object_keys {
+            let path = object_store::path::Path::from(key.as_str());
+            let expected = fingerprints.get(key).ok_or_else(|| {
+                format!(
+                    "day {} source object {key} was not in its indexed snapshot",
+                    item.day
+                )
+            })?;
+            let (bytes, fetched) =
+                get_decoded_limited_checked(store, &path, max_bytes, Some(expected)).await?;
+            materialized_bytes = materialized_bytes.saturating_add(bytes.len() as u64);
+            fetched_for_day = fetched_for_day.saturating_add(fetched);
+            if max_bytes.is_some_and(|limit| materialized_bytes > limit) {
+                return Err(format!(
+                    "day {} needs {materialized_bytes} decoded source bytes, exceeding the configured {max_bytes:?} byte limit",
+                    item.day
+                ));
+            }
+            chunks_by_key.insert(key.clone(), bytes);
+        }
+        let pairs = item
+            .object_keys
+            .iter()
+            .map(|key| {
+                let bytes = chunks_by_key
+                    .get(key)
+                    .expect("indexed source was fetched once");
+                (key_date(key).unwrap_or(&item.day), bytes.as_slice())
+            })
+            .collect::<Vec<_>>();
+        let selected = day::select_day_with_request_days(&pairs, &item.day, &request_days);
+        if !selected.unresolved_correlations.is_empty() {
+            return Err(format!(
+                "day {} has correlated records with no indexed ingress: {}",
+                item.day,
+                selected
+                    .unresolved_correlations
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if selected.has_unresolved_ingress {
+            return Err(format!(
+                "day {} has correlated records with no indexed ingress",
+                item.day
+            ));
+        }
+        let mut collated = collate_runs_excluding(
+            selected
+                .kept
+                .iter()
+                .map(|lines| lines.iter().map(|l| Cow::Borrowed(l.as_str()))),
+            &selected.elsewhere,
+        );
+        collated.other_day_lines = selected.other_day_lines;
+        collated.lines_without_ingress = selected.lines_without_ingress;
+        let source_objects = item.object_keys.len();
+        collated.day_dependency_objects = item
+            .object_keys
+            .iter()
+            .filter(|key| key_date(key) != Some(item.day.as_str()))
+            .count();
+        let name = day::day_recording_id(session_id, &item.day);
+        let manifest = if selected.kept.iter().all(Vec::is_empty) {
+            empty_day_manifest(
+                &name,
+                selected.other_day_lines,
+                selected.lines_without_ingress,
+                collated.day_dependency_objects,
+            )
+        } else {
+            write_indexed_seal(store, &name, collated, source_objects).await?
+        };
+        let objects = item
+            .object_keys
+            .iter()
+            .map(|object_key| {
+                let fingerprint = fingerprints
+                    .get(object_key)
+                    .expect("every indexed dependency was in the source listing")
+                    .clone();
+                deja_store::DayViewObject {
+                    object_key: object_key.clone(),
+                    fingerprint,
+                }
+            })
+            .collect::<Vec<_>>();
+        let json =
+            serde_json::to_value(&manifest).map_err(|e| format!("encode day manifest: {e}"))?;
+        if db
+            .publish_day_view(
+                scope,
+                &item.day,
+                item.generation,
+                &item.dependency_token,
+                &json,
+                &objects,
+            )
+            .await
+            .map_err(|error| format!("publish day view {}: {error}", item.day))?
+        {
+            count += 1;
+            bytes_read = bytes_read.saturating_add(materialized_bytes);
+            bytes_fetched = bytes_fetched.saturating_add(fetched_for_day);
+        }
+    }
+    Ok((count, bytes_read, bytes_fetched))
 }
 
 /// One recording as it exists in the landing area, discovered by listing.
@@ -1911,11 +2346,12 @@ pub fn compact_session(
     let rt = runtime()?;
     match rt.block_on(compact_session_inner(&store, session_id, root, None))? {
         Compaction::Sealed { manifest, .. } => Ok(*manifest),
-        // Unreachable: an absent budget refuses nothing. Returned rather than
-        // panicked because the caller is a sealer, and a process that aborts
-        // is the exact failure this module exists to stop producing.
+        // No budget or incomplete-source result can produce a replayable seal.
         Compaction::RefusedTooLarge { .. } => Err(format!(
-            "internal: unbudgeted compaction of {session_id} reported a size refusal"
+            "internal: unbudgeted compaction of {session_id} exceeded a budget"
+        )),
+        Compaction::RefusedSourceIncomplete { day, .. } => Err(format!(
+            "day {day} has correlated records with no ingress; no seal was written"
         )),
         Compaction::EmptyDay { manifest, .. } => Ok(*manifest),
     }
@@ -1995,6 +2431,19 @@ pub enum Compaction {
         /// about this recording, and reading it as this recording's size would
         /// overstate it by however much its neighbours weigh.
         shared_prefix: bool,
+    },
+    /// A day selection depends on source records whose ingress is missing.
+    ///
+    /// No parts, index, or manifest have been uploaded. The counters describe
+    /// the reconciled landing that was read, so the caller can report the
+    /// refusal without mistaking it for a successful empty or partial seal.
+    RefusedSourceIncomplete {
+        day: String,
+        lines_without_ingress: usize,
+        other_day_lines: usize,
+        source_objects: usize,
+        landing_bytes_read: u64,
+        landing_bytes_fetched: u64,
     },
     /// A terminal date partition with no lines assigned to its own day. Its
     /// empty manifest supersedes any earlier tape for this day.
@@ -2188,11 +2637,129 @@ fn envelope_session(line: &str) -> Option<String> {
         .session_id
 }
 
+async fn index_day_inputs(
+    store: &deja_store::Store,
+    system: &str,
+    bucket: &str,
+    root: &str,
+    session_id: &str,
+    keys: &[object_store::path::Path],
+    chunks: &[Vec<u8>],
+) -> Result<
+    (
+        deja_store::LandingScope,
+        Vec<deja_store::LandingDayGeneration>,
+    ),
+    String,
+> {
+    let scope = deja_store::LandingScope {
+        system: system.to_owned(),
+        bucket: bucket.to_owned(),
+        root: root.trim_matches('/').to_owned(),
+        session_id: session_id.to_owned(),
+    };
+    let objects: Vec<(&str, &[u8])> = keys
+        .iter()
+        .zip(chunks)
+        .map(|(key, bytes)| (key.as_ref(), bytes.as_slice()))
+        .collect();
+    let memberships = day::index_objects(&objects);
+    for ((key, bytes), membership) in objects.iter().zip(memberships) {
+        if !membership.unresolved_correlations.is_empty() {
+            return Err(format!(
+                "refusing to index landing object {key}: correlated records have no indexed ingress: {}",
+                membership.unresolved_correlations.join(", ")
+            ));
+        }
+        let fingerprint = format!("{:x}", Sha256::digest(bytes));
+        store
+            .index_landing_object(
+                &scope,
+                &deja_store::LandingObjectIndex {
+                    object_key: (*key).to_owned(),
+                    fingerprint,
+                    correlation_ids: membership.correlation_ids,
+                    requests: membership.requests,
+                    object_days: membership.object_days,
+                },
+            )
+            .await
+            .map_err(|e| format!("index landing object {key}: {e}"))?;
+    }
+    let days = store
+        .landing_days(&scope)
+        .await
+        .map_err(|e| format!("read indexed landing days: {e}"))?;
+    Ok((scope, days))
+}
+
+async fn publish_indexed_day_view(
+    store: &deja_store::Store,
+    scope: &deja_store::LandingScope,
+    day: &str,
+    manifest: &SessionManifest,
+    sources: &[object_store::path::Path],
+    chunks: &[Vec<u8>],
+    indexed: &[deja_store::LandingDayGeneration],
+) -> Result<(), String> {
+    let Some(generation) = indexed.iter().find(|g| g.day == day) else {
+        return Err(format!(
+            "day {day} is absent from the durable landing index"
+        ));
+    };
+    let fingerprints: BTreeMap<&str, String> = sources
+        .iter()
+        .zip(chunks)
+        .map(|(key, bytes)| (key.as_ref(), format!("{:x}", Sha256::digest(bytes))))
+        .collect();
+    let objects: Vec<deja_store::DayViewObject> = generation
+        .object_keys
+        .iter()
+        .map(|key| {
+            let fingerprint = fingerprints
+                .get(key.as_str())
+                .ok_or_else(|| format!("indexed dependency object {key} was not read"))?;
+            Ok(deja_store::DayViewObject {
+                object_key: key.clone(),
+                fingerprint: fingerprint.clone(),
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    let manifest = serde_json::to_value(manifest).map_err(|e| e.to_string())?;
+    let published = store
+        .publish_day_view(
+            scope,
+            day,
+            generation.generation,
+            &generation.dependency_token,
+            &manifest,
+            &objects,
+        )
+        .await
+        .map_err(|e| format!("publish day view: {e}"))?;
+    if !published {
+        return Err(format!(
+            "landing for day {day} changed while its immutable day view was being published"
+        ));
+    }
+    Ok(())
+}
+
 async fn compact_session_inner(
     store: &DynStore,
     session_id: &str,
     root: &str,
     max_landing_bytes: Option<u64>,
+) -> Result<Compaction, String> {
+    compact_session_inner_indexed(store, session_id, root, max_landing_bytes, None).await
+}
+
+pub(crate) async fn compact_session_inner_indexed(
+    store: &DynStore,
+    session_id: &str,
+    root: &str,
+    max_landing_bytes: Option<u64>,
+    index: Option<(&deja_store::Store, &str, &str)>,
 ) -> Result<Compaction, String> {
     let Some(location) = locate_landing(store, session_id, root).await? else {
         return Err(format!(
@@ -2259,6 +2826,11 @@ async fn compact_session_inner(
             });
         }
     }
+    let indexed = if let Some((db, system, bucket)) = index {
+        Some(index_day_inputs(db, system, bucket, root, session_id, &keys, &chunks).await?)
+    } else {
+        None
+    };
 
     if let Some(scope) = &location.day {
         // One day of a session. The lines are chosen by when each request
@@ -2275,16 +2847,48 @@ async fn compact_session_inner(
             .iter()
             .filter(|k| key_names_session(k.as_ref(), session_id) && !location.owns(k.as_ref()))
             .count();
+        // Missing ingress means the day cannot be assigned a complete source
+        // view. Refuse before writing any replacement parts/index/manifest;
+        // in particular, do not replace an earlier seal with this partial one.
+        if selected.has_unresolved_ingress {
+            return Ok(Compaction::RefusedSourceIncomplete {
+                day: scope.day.clone(),
+                lines_without_ingress: selected.lines_without_ingress,
+                other_day_lines: selected.other_day_lines,
+                source_objects: keys.len(),
+                landing_bytes_read: read_bytes,
+                landing_bytes_fetched: fetched_bytes,
+            });
+        }
         if selected.kept.iter().all(Vec::is_empty) {
-            let manifest = write_empty_day(
-                store,
+            let manifest = empty_day_manifest(
                 recording_id,
-                landing_objects,
                 selected.other_day_lines,
                 selected.lines_without_ingress,
                 day_dependency_objects,
-            )
-            .await?;
+            );
+            if let (Some((db, _, _)), Some((index_scope, generations))) = (index, &indexed) {
+                publish_indexed_day_view(
+                    db,
+                    index_scope,
+                    &scope.day,
+                    &manifest,
+                    &keys,
+                    &chunks,
+                    generations,
+                )
+                .await?;
+            } else {
+                write_empty_day(
+                    store,
+                    recording_id,
+                    landing_objects,
+                    selected.other_day_lines,
+                    selected.lines_without_ingress,
+                    day_dependency_objects,
+                )
+                .await?;
+            }
             return Ok(Compaction::EmptyDay {
                 manifest: Box::new(manifest),
                 other_day_lines: selected.other_day_lines,
@@ -2301,9 +2905,27 @@ async fn compact_session_inner(
         collated.other_day_lines = selected.other_day_lines;
         collated.lines_without_ingress = selected.lines_without_ingress;
         collated.day_dependency_objects = day_dependency_objects;
+        let merge = collated.merge.clone();
+        let manifest = if index.is_some() {
+            write_indexed_seal(store, recording_id, collated, landing_objects).await?
+        } else {
+            write_seal(store, recording_id, collated, landing_objects).await?
+        };
+        if let (Some((db, _, _)), Some((index_scope, generations))) = (index, &indexed) {
+            publish_indexed_day_view(
+                db,
+                index_scope,
+                &scope.day,
+                &manifest,
+                &keys,
+                &chunks,
+                generations,
+            )
+            .await?;
+        }
         return Ok(Compaction::Sealed {
-            merge: collated.merge.clone(),
-            manifest: Box::new(write_seal(store, recording_id, collated, landing_objects).await?),
+            merge,
+            manifest: Box::new(manifest),
             landing_bytes_read: read_bytes,
             landing_bytes_fetched: fetched_bytes,
             shared_prefix: false,
@@ -2378,15 +3000,13 @@ pub fn seal_session(
 /// Publish the terminal snapshot for a day whose current lines all belong
 /// elsewhere. Unlike a sealed tape, this marker is explicitly non-replayable;
 /// writing it last replaces any stale manifest for the day.
-async fn write_empty_day(
-    store: &DynStore,
+fn empty_day_manifest(
     session_id: &str,
-    landing_objects: usize,
     other_day_lines: usize,
     lines_without_ingress: usize,
     day_dependency_objects: usize,
-) -> Result<SessionManifest, String> {
-    let manifest = SessionManifest {
+) -> SessionManifest {
+    SessionManifest {
         manifest_version: 1,
         session_id: session_id.to_owned(),
         status: "empty".to_owned(),
@@ -2397,7 +3017,7 @@ async fn write_empty_day(
         code: Vec::new(),
         instances: Vec::new(),
         counts: Counts {
-            landing_objects,
+            landing_objects: 0,
             lines_in: 0,
             events: 0,
             duplicates_dropped: 0,
@@ -2408,42 +3028,67 @@ async fn write_empty_day(
             day_dependency_objects,
         },
         data_parts: Vec::new(),
-        created_unix_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-    };
+        created_unix_ms: 0,
+    }
+}
+async fn write_empty_day(
+    store: &DynStore,
+    session_id: &str,
+    landing_objects: usize,
+    other_day_lines: usize,
+    lines_without_ingress: usize,
+    day_dependency_objects: usize,
+) -> Result<SessionManifest, String> {
+    let mut manifest = empty_day_manifest(
+        session_id,
+        other_day_lines,
+        lines_without_ingress,
+        day_dependency_objects,
+    );
+    manifest.counts.landing_objects = landing_objects;
     let bytes =
         serde_json::to_vec_pretty(&manifest).map_err(|e| format!("manifest encode: {e}"))?;
     put(store, &layout::manifest_key(session_id), bytes).await?;
     Ok(manifest)
 }
-/// Write the sealed form: data parts, then the correlations index, then the
-/// manifest LAST.
-///
-/// The ordering is the whole safety property. Every object the manifest names
-/// is durable before the manifest exists, so an interrupted seal leaves a
-/// session that reads as unsealed and is rescanned, never a manifest promising
-/// parts that are not there. See the module header for why the part and index
-/// keys are content-addressed.
+
+async fn write_indexed_seal(
+    store: &DynStore,
+    session_id: &str,
+    collated: Collated,
+    landing_objects: usize,
+) -> Result<SessionManifest, String> {
+    write_seal_mode(store, session_id, collated, landing_objects, false).await
+}
+
 async fn write_seal(
     store: &DynStore,
     session_id: &str,
     collated: Collated,
     landing_objects: usize,
 ) -> Result<SessionManifest, String> {
-    // A seal claims this is the whole recording, and it is permanent in the
-    // sense that matters: every later run takes the manifest fast path and
-    // stops looking at the landing. An empty one cannot be told apart from a
-    // landing that was scanned too early or read through the wrong prefix, so
-    // it would turn a recoverable mistake into a recording that is empty
-    // forever. Leave the session unsealed and say why.
+    write_seal_mode(store, session_id, collated, landing_objects, true).await
+}
+
+async fn write_seal_mode(
+    store: &DynStore,
+    session_id: &str,
+    collated: Collated,
+    landing_objects: usize,
+    publish_manifest: bool,
+) -> Result<SessionManifest, String> {
     if collated.events.is_empty() {
         return Err(format!(
             "refusing to seal {session_id} as an empty recording: {} line(s) yielded no records",
             collated.lines_in
         ));
     }
+    // A seal claims this is the whole recording, and it is permanent in the
+    // sense that matters: every later run takes the manifest fast path and
+    // stops looking at the landing. An empty one cannot be told apart from a
+    // landing that was scanned too early or read through the wrong prefix, so
+    // it would turn a recoverable mistake into a recording that is empty
+    // forever. Leave the session unsealed and say why.
     let seal = seal_id(&collated.events);
 
     // Data parts: full envelope lines, rotated. One part is built, compressed
@@ -2514,14 +3159,20 @@ async fn write_seal(
             day_dependency_objects: collated.day_dependency_objects,
         },
         data_parts,
-        created_unix_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
+        created_unix_ms: if publish_manifest {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        } else {
+            0
+        },
     };
     let manifest_bytes =
         serde_json::to_vec_pretty(&manifest).map_err(|e| format!("manifest encode: {e}"))?;
-    put(store, &layout::manifest_key(session_id), manifest_bytes).await?;
+    if publish_manifest {
+        put(store, &layout::manifest_key(session_id), manifest_bytes).await?;
+    }
     Ok(manifest)
 }
 
@@ -3356,6 +4007,55 @@ mod tests {
             decode_object("plain.ndjson", bytes::Bytes::from_static(payload)).unwrap(),
             payload.to_vec()
         );
+    }
+
+    #[test]
+    fn compressed_source_is_refused_before_decoding_past_the_budget() {
+        use std::io::Write as _;
+        let payload = vec![b'x'; 4096];
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(&payload).expect("compress fixture");
+        let gzip = gzip.finish().expect("finish fixture");
+        let store = memory();
+        block(put(&store, "landing/v1/large.ndjson.gz", gzip)).expect("land compressed object");
+        let path = object_store::path::Path::from("landing/v1/large.ndjson.gz");
+        assert!(block(get_decoded_limited(&store, &path, Some(1024)))
+            .expect_err("decoded source exceeds budget")
+            .contains("decoded bytes"));
+        let (decoded, _) =
+            block(get_decoded_limited(&store, &path, Some(4096))).expect("at exact budget");
+        assert_eq!(decoded, payload);
+        let zstd = zstd_encode(&payload).expect("compress zstd fixture");
+        block(put(&store, "landing/v1/large.ndjson.zst", zstd)).expect("land zstd object");
+        let zstd_path = object_store::path::Path::from("landing/v1/large.ndjson.zst");
+        assert!(block(get_decoded_limited(&store, &zstd_path, Some(1024)))
+            .expect_err("zstd expanded source exceeds budget")
+            .contains("decoded bytes"));
+        assert_eq!(
+            block(get_decoded_limited(&store, &zstd_path, Some(4096)))
+                .expect("zstd at exact budget")
+                .0,
+            payload
+        );
+    }
+
+    #[test]
+    fn a_replaced_source_cannot_be_published_under_its_previous_fingerprint() {
+        let store = memory();
+        let key = object_store::path::Path::from("landing/v1/object.ndjson");
+        block(put(&store, key.as_ref(), b"first".to_vec())).expect("first source");
+        let first = block(store.head(&key)).expect("first source metadata");
+        let fingerprint = object_meta_fingerprint(&first)
+            .unwrap_or_else(|| format!("content:{:x}", Sha256::digest(b"first")));
+        block(put(&store, key.as_ref(), b"other".to_vec())).expect("same-count replacement");
+        assert!(block(get_decoded_limited_checked(
+            &store,
+            &key,
+            Some(1024),
+            Some(&fingerprint)
+        ))
+        .expect_err("a replaced object invalidates its indexed identity")
+        .contains("changed between listing and GET"));
     }
 
     fn envelope(inst: &str, gseq: u64, corr: Option<&str>, boundary: &str) -> String {
@@ -4709,6 +5409,107 @@ mod tests {
         assert_eq!(
             manifest.counts.landing_objects, 2,
             "s2's object is not part of s1's landing"
+        );
+    }
+
+    #[test]
+    fn incomplete_day_source_is_refused_before_replacing_a_seal() {
+        let store = memory();
+        let day = "2026-09-01";
+        let recording_id = day::day_recording_id("s1", day);
+        let old_manifest = SessionManifest {
+            manifest_version: 1,
+            session_id: recording_id.clone(),
+            status: "sealed".to_owned(),
+            seal_id: "prior".to_owned(),
+            capture_mode: "session".to_owned(),
+            envelope_schema_versions: vec![],
+            event_schema_versions: vec![],
+            code: vec![],
+            instances: vec![],
+            counts: Counts {
+                landing_objects: 0,
+                lines_in: 0,
+                events: 0,
+                duplicates_dropped: 0,
+                correlations: 0,
+                graph_nodes: 0,
+                other_day_lines: 0,
+                lines_without_ingress: 0,
+                day_dependency_objects: 0,
+            },
+            data_parts: vec![],
+            created_unix_ms: 0,
+        };
+        block(put(
+            &store,
+            &layout::manifest_key(&recording_id),
+            serde_json::to_vec(&old_manifest).unwrap(),
+        ))
+        .unwrap();
+        // Keep a valid ingress alongside the incomplete correlated tail. This
+        // makes the pre-upload refusal observable even when the day has data
+        // that would otherwise be sealed.
+        let mut ingress: serde_json::Value =
+            serde_json::from_str(&envelope_for("s1", "i1", 0, Some("c1"))).unwrap();
+        ingress["event"]["request_sequence"] = serde_json::json!(0);
+        ingress["event"]["timestamp_ns"] = serde_json::json!(1_788_220_800_000_000_000u64);
+        let ingress = ingress.to_string();
+        put_object_at(
+            &store,
+            &format!("{DEFAULT_RECORDING_ROOT}/dt={day}/session=s1/inst=i1/ingress.json"),
+            &[ingress],
+        );
+        let tail = r#"{"schema_version":1,"capture":{"mode":"session","session_id":"s1"},"event":{"instance_id":"i1","global_sequence":1,"correlation_id":"orphan","request_sequence":1,"started_at_unix_nanos":1798848000000000000,"boundary":"http_request","payload":{}}}"#.to_owned();
+        put_object_at(
+            &store,
+            &format!("{DEFAULT_RECORDING_ROOT}/dt={day}/session=s1/inst=i1/0.json"),
+            &[tail],
+        );
+
+        let outcome = block(compact_session_inner(
+            &store,
+            &recording_id,
+            DEFAULT_RECORDING_ROOT,
+            None,
+        ))
+        .unwrap();
+        match outcome {
+            Compaction::RefusedSourceIncomplete {
+                day: refused_day,
+                lines_without_ingress,
+                source_objects,
+                landing_bytes_read,
+                landing_bytes_fetched,
+                ..
+            } => {
+                assert_eq!(refused_day, day);
+                assert_eq!(lines_without_ingress, 1);
+                assert_eq!(source_objects, 2);
+                assert!(landing_bytes_read > 0);
+                assert!(landing_bytes_fetched > 0);
+            }
+            other => panic!("expected incomplete-source refusal, got {other:?}"),
+        }
+        let manifest = block(manifest_of(&store, &recording_id)).unwrap().unwrap();
+        assert_eq!(manifest.seal_id, "prior", "the old seal remains visible");
+        assert!(
+            block(list_keys(
+                &store,
+                &format!("{}/data/", layout::session_root(&recording_id))
+            ))
+            .unwrap()
+            .is_empty(),
+            "no data part was uploaded"
+        );
+        assert!(
+            block(list_keys(
+                &store,
+                &format!("{}/index/", layout::session_root(&recording_id))
+            ))
+            .unwrap()
+            .is_empty(),
+            "no index was uploaded"
         );
     }
 

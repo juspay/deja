@@ -110,13 +110,18 @@ pub struct SystemConfig {
     /// minted a recording when the source bucket does not say. `None` means no
     /// guess is possible, which must read as "unknown", never as "the default".
     pub instance_pattern: Option<String>,
-    /// The anchored prefix of its primary deployment's pod names. Keeps
-    /// recording SELECTION on the main pods and off custom ones, which run
-    /// their own code and whose tapes are not what a pull-request replay wants
-    /// to be compared against. `None` means undeclared, and a caller asking to
-    /// be restricted to main instances is refused naming this field rather than
-    /// served every pod's recordings.
+    /// Read-only workload identity used to discover currently serving pod names.
+    /// These values come from the system's structured declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workload_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workload_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_workload_name: Option<String>,
+
+    /// Anchored prefix of the primary workload's pod names, for filtering recordings.
     pub main_instance_prefix: Option<String>,
+
     /// Span-name prefixes this system's instrumentation contract declares as
     /// scored. Deja does not know these; the system does, so it declares them.
     pub scored_span_namespaces: Vec<String>,
@@ -323,6 +328,9 @@ pub fn system_config(name: &str) -> SystemConfig {
         candidate_image_repo: clean(d.candidate_image_repo)
             .map(|v| v.trim_end_matches('/').to_owned()),
         instance_pattern: clean(d.instance_pattern),
+        active_workload_namespace: clean(d.active_workload_namespace),
+        active_workload_kind: clean(d.active_workload_kind),
+        active_workload_name: clean(d.active_workload_name),
         main_instance_prefix: clean(d.main_instance_prefix),
         scored_span_namespaces: d.scored_span_namespaces.unwrap_or_default(),
         source_repo: clean(d.source_repo),

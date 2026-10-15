@@ -1122,6 +1122,52 @@ pub fn pull_recordings(
     if recording_ids.is_empty() {
         return Err("no recordings named for this pull".to_owned());
     }
+    let ids: Vec<String> = recording_ids.iter().map(|id| (*id).to_owned()).collect();
+    let manifests = deja_compactor::read_manifests(cfg, &ids)?;
+    let pinned = recording_ids
+        .iter()
+        .zip(manifests)
+        .map(|(id, result)| {
+            let manifest = result?.ok_or_else(|| {
+                format!(
+                    "{id} is part of this selection but is not sealed yet, and a replay \
+                     must not seal it — sealing writes the tape store, which a replay may not do \
+                     and is not permitted to. Wait for the sealer to reach it (it runs every 30 \
+                     minutes), or name a day whose recordings are all sealed."
+                )
+            })?;
+            Ok(((*id).to_owned(), manifest))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    pull_recordings_from_manifests(cfg, &pinned, dest)
+}
+
+/// Pull recordings from the supplied immutable manifest versions, without
+/// consulting the mutable per-session manifest pointers.
+pub fn pull_recordings_from_manifests(
+    cfg: &S3Config,
+    members: &[(String, deja_compactor::SessionManifest)],
+    dest: &Path,
+) -> Result<(IngestReport, Vec<deja_compactor::SessionManifest>), String> {
+    if members.is_empty() {
+        return Err("no recordings named for this pull".to_owned());
+    }
+    for (recording_id, manifest) in members {
+        if manifest.session_id != *recording_id {
+            return Err(format!(
+                "manifest session {} does not match recording {recording_id}",
+                manifest.session_id
+            ));
+        }
+        if manifest.status != "sealed" {
+            return Err(format!("{recording_id} manifest is not sealed"));
+        }
+        if manifest.status == "empty" || manifest.data_parts.is_empty() {
+            return Err(format!(
+                "{recording_id} is a terminal empty day with no replayable tape"
+            ));
+        }
+    }
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
@@ -1129,66 +1175,14 @@ pub fn pull_recordings(
     let mut out = std::io::BufWriter::new(
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?,
     );
-
-    let mut manifests: Vec<deja_compactor::SessionManifest> =
-        Vec::with_capacity(recording_ids.len());
+    let mut manifests: Vec<deja_compactor::SessionManifest> = Vec::with_capacity(members.len());
     let mut tally = PullTally::default();
-
-    for recording_id in recording_ids {
-        // A REPLAY READS THE TAPE STORE AND NEVER WRITES IT.
-        //
-        // This used to seal an unsealed member right here, by calling
-        // `compact_session` — which writes `sessions/v1/*`. The replay Job's
-        // role is deliberately least-privilege, so a group holding one unsealed
-        // member died with a 403 naming a member nobody had asked about. Five
-        // runs failed that way on one day.
-        //
-        // The permission is the visible half. The other is why this is not
-        // merely a permissions bug: with credentials that allowed it, a replay
-        // would SEAL a recording the sealer has not judged quiescent — a run
-        // altering the evidence it is judged against, and fixing a tape that
-        // may still be being written. Sealing belongs to the job that is
-        // allowed to write tapes and runs on its own schedule.
-        //
-        // The denial does not even fail fast: the object store retries with
-        // backoff, several multipart pieces at a time, so a read becomes a
-        // hang. One recording spent 3,589s there and never reached stage 2.
-        //
-        // The sibling `pull_recording_from_prefix` had promote-on-pull removed
-        // for exactly these reasons and says so at length. This arm did not, so
-        // one half of the puller obeyed a stated rule and the other did not.
-        //
-        // Refusing rather than reading the landing here is deliberate. Only the
-        // GROUP path reaches this function — a single unsealed recording is
-        // short-circuited to the prefix rescan before it gets here — and a
-        // group whose day is not fully sealed is a day that is not ready, which
-        // is what both the dashboard and the pipeline already require before
-        // they offer one. A partial day replayed as if whole would report a
-        // verdict over a denominator that moves.
-        let Some(manifest) = deja_compactor::read_manifest(cfg, recording_id)? else {
-            return Err(format!(
-                "{recording_id} is part of this selection but is not sealed yet, and a replay \
-                 must not seal it — sealing writes the tape store, which a replay may not do \
-                 and is not permitted to. Wait for the sealer to reach it (it runs every 30 \
-                 minutes), or name a day whose recordings are all sealed."
-            ));
-        };
-        if manifest.status == "empty" {
-            return Err(format!(
-                "{recording_id} is a terminal empty day with no replayable tape"
-            ));
-        }
-        // Scoped so the lines, the joined bytes and the parsed events are all
-        // released before the next member is read. Without this the peak is the
-        // sum again and the bound above is a comment rather than a property.
+    for (recording_id, manifest) in members {
         {
-            let lines = deja_compactor::read_session_lines(cfg, &manifest)?;
+            let lines = deja_compactor::read_session_lines(cfg, manifest)?;
             let chunk = lines.join("\n").into_bytes();
             drop(lines);
             let mut collated = collate(&[chunk]);
-            // Concatenation is sound for ORDER — see above — but not for
-            // IDENTITY: each member counts from zero, so the streams are placed
-            // end to end before a byte is written.
             tally.renumbering.apply(recording_id, &mut collated)?;
             for (_, _, _, line) in &collated.events {
                 out.write_all(line.as_bytes())
@@ -1197,12 +1191,11 @@ pub fn pull_recordings(
             }
             tally.absorb(&manifest.counts, collated);
         }
-        manifests.push(manifest);
+        manifests.push(manifest.clone());
     }
     out.flush().map_err(|e| format!("flush: {e}"))?;
-
     let report = tally.finish(
-        recording_ids.iter().map(|id| (*id).to_owned()).collect(),
+        members.iter().map(|(id, _)| id.clone()).collect(),
         &manifests,
     );
     report.report();

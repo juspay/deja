@@ -697,12 +697,18 @@ export type AvailableRecording = {
   group?: string | null;
 };
 
+export type RecommendationState = {
+  state: "ready" | "unavailable" | "ambiguous";
+  reason: string | null;
+};
+
 export type AvailableRecordingsPage = {
   recordings: AvailableRecording[];
-  /** Sessions in the bucket, before paging — compare against the page length. */
   total: number;
   offset: number;
   limit: number;
+  recommended_group: string | null;
+  recommendation_state: RecommendationState;
 };
 
 /**

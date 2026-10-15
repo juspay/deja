@@ -179,12 +179,12 @@ async fn main() {
         std::env::var("DEJA_DB_URL").unwrap_or_else(|_| deja_store::DEFAULT_DB_URL.to_string());
     let store = match Store::connect(&db_url).await {
         Ok(s) => {
-            eprintln!("deja-orchestrator: store connected + migrated ({db_url})");
+            eprintln!("deja-orchestrator: store connected + migrated");
             Some(Arc::new(s))
         }
         Err(err) => {
             eprintln!(
-                "deja-orchestrator: store unavailable ({db_url}): {err} — running file-only; \
+                "deja-orchestrator: store unavailable: {err} — running file-only; \
                  start it with: docker compose -p deja-orchestrator -f demo/docker-compose.orchestrator.yml up -d"
             );
             None
@@ -325,6 +325,13 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/recordings/{id}/correlations",
             get(v1_recording_correlations),
+        )
+        .route(
+            "/runs/{run_id}/recording-snapshot",
+            get(v1_run_recording_snapshot).route_layer(middleware::from_fn_with_state(
+                state.mutation_auth.clone(),
+                require_service_auth,
+            )),
         )
         .route("/runs", create_run.get(v1_list_runs))
         .route("/runs/{run_id}/events", ingest_run_event)
@@ -793,10 +800,13 @@ async fn v1_create_run(
         .get("expectation")
         .and_then(|v| v.as_str())
         .map(str::to_owned);
-    let spec: deja_orchestrator::RunSpec = match serde_json::from_value(raw) {
+    let mut spec: deja_orchestrator::RunSpec = match serde_json::from_value(raw) {
         Ok(s) => s,
         Err(e) => return error_resp(400, &format!("parse RunSpec: {e}")),
     };
+    if let Err(error) = admit_github(&mut spec) {
+        return error_resp(400, &format!("github: {error}"));
+    }
     // Refuse an oversized filter HERE, where the caller is still listening. The
     // lifecycle refuses it too — that is the gate no caller can go around — but
     // a request that will never be honoured should fail as a 400 now rather than
@@ -813,9 +823,42 @@ async fn v1_create_run(
             return error_resp(400, &format!("delta_against: {e}"));
         }
     }
-    let mut spec = spec;
-    if let Err(e) = admit_github(&mut spec) {
-        return error_resp(400, &format!("github: {e}"));
+    let explicit_day_recording = spec
+        .recording_id
+        .as_deref()
+        .is_some_and(|id| deja_compactor::day::split_recording_id(id).day.is_some());
+    let recording_snapshot = if let Some(group) = spec.recording_group.as_deref() {
+        if spec.s3_source.is_some() {
+            return error_resp(400, "recording_group cannot be combined with s3_source");
+        }
+        match snapshot_recording_group(&st, group, spec.system()).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => return error_resp(400, &format!("recording_group: {error}")),
+        }
+    } else if explicit_day_recording && spec.s3_source.is_none() {
+        let id = spec.recording_id.as_deref().unwrap_or_default();
+        match snapshot_recording_group(&st, id, spec.system()).await {
+            Ok(snapshot) => Some(snapshot),
+            Err(error) => return error_resp(400, &format!("recording_id: {error}")),
+        }
+    } else {
+        None
+    };
+    if let Some(snapshot) = recording_snapshot {
+        let mut workload = spec.workload.as_object().cloned().unwrap_or_default();
+        workload.insert(
+            "deja_recording_group_snapshot".into(),
+            match serde_json::to_value(snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return error_resp(500, &format!("pin recording group snapshot: {error}"))
+                }
+            },
+        );
+        // Replay workload is otherwise not consumed. Carry the admission pin
+        // inside the already-persisted RunSpec so both the API process and a
+        // separate Job pod receive the same immutable selection.
+        spec.workload = serde_json::Value::Object(workload);
     }
     let run = match runs::persist_new(&st.root, spec) {
         Ok(run) => run,
@@ -1120,6 +1163,357 @@ fn scan_scope(
     )
 }
 
+fn landing_root(cfg: &deja_orchestrator::s3::S3Config, configured_root: &str) -> String {
+    cfg.bucket_key(configured_root)
+}
+
+async fn v1_run_recording_snapshot(
+    State(st): State<AppState>,
+    run_id: RunId,
+    headers: HeaderMap,
+) -> Response {
+    if st.mutation_auth.service_token.is_none() {
+        return error_resp(
+            503,
+            "recording snapshot requires configured service-token authentication",
+        );
+    }
+    let expected_actor = format!("system:runner:{run_id}");
+    if headers
+        .get("x-deja-actor")
+        .and_then(|value| value.to_str().ok())
+        != Some(expected_actor.as_str())
+    {
+        return error_resp(403, "recording snapshot is restricted to this run's runner");
+    }
+    let run = match runs::get(&st.root, &run_id) {
+        Ok(run) => run,
+        Err(error) => return error_resp(404, &format!("run {run_id}: {error}")),
+    };
+    let Some(snapshot) = run
+        .spec
+        .workload
+        .get("deja_recording_group_snapshot")
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<deja_orchestrator::RecordingGroupSnapshot>(value).ok()
+        })
+    else {
+        return error_resp(404, "run has no pinned recording snapshot");
+    };
+    let Some(store) = st.store.as_deref() else {
+        return error_resp(
+            503,
+            "database store unavailable for pinned recording snapshot",
+        );
+    };
+    let mut manifests = Vec::new();
+    for member in &snapshot.members {
+        let (Some(day), Some(generation), Some(expected_token), Some(expected_seal)) = (
+            member.day.as_deref(),
+            member.generation,
+            member.dependency_token.as_deref(),
+            member.seal_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let split = deja_compactor::day::split_recording_id(&member.recording_id);
+        let scope = deja_store::LandingScope {
+            system: snapshot.system.clone(),
+            bucket: snapshot.bucket.clone(),
+            root: snapshot.landing_root.clone(),
+            session_id: split.session_id.to_owned(),
+        };
+        let view = match store.day_view_at(&scope, day, generation).await {
+            Ok(Some(view)) => view,
+            Ok(None) => return error_resp(409, "pinned day-view generation is unavailable"),
+            Err(error) => {
+                return error_resp(503, &format!("read pinned day-view generation: {error}"))
+            }
+        };
+        if view.scope != scope
+            || view.day != day
+            || view.generation != generation
+            || view.dependency_token != expected_token
+        {
+            return error_resp(409, "pinned day-view identity mismatch");
+        }
+        let manifest: deja_compactor::SessionManifest = match serde_json::from_value(view.manifest)
+        {
+            Ok(manifest) => manifest,
+            Err(error) => return error_resp(500, &format!("decode pinned manifest: {error}")),
+        };
+        if manifest.session_id != member.recording_id || manifest.seal_id != expected_seal {
+            return error_resp(409, "pinned manifest seal mismatch");
+        }
+        manifests.push((member.recording_id.clone(), manifest));
+    }
+    json_ok_ser(&manifests)
+}
+
+fn manifest_from_day_view(
+    view: &deja_store::DayView,
+    recording_id: &str,
+) -> Result<deja_compactor::SessionManifest, String> {
+    let manifest: deja_compactor::SessionManifest =
+        serde_json::from_value(view.manifest.clone())
+            .map_err(|e| format!("invalid immutable day view manifest: {e}"))?;
+    if manifest.session_id != recording_id
+        || match manifest.status.as_str() {
+            "sealed" => manifest.seal_id.is_empty() || manifest.data_parts.is_empty(),
+            "empty" => !manifest.seal_id.is_empty() || !manifest.data_parts.is_empty(),
+            _ => true,
+        }
+    {
+        return Err(format!(
+            "day view does not identify a valid recording {recording_id}"
+        ));
+    }
+    Ok(manifest)
+}
+
+fn recording_group_from_manifest(
+    recording_id: &str,
+    manifest: Option<&deja_compactor::SessionManifest>,
+) -> Option<String> {
+    if let Some(group) = group_of(&deja_orchestrator::parse_recording_id(recording_id)) {
+        return Some(group);
+    }
+    let day = deja_compactor::day::split_recording_id(recording_id).day?;
+    let revision = manifest.and_then(manifest_revision)?;
+    Some(format!("{revision}-{}", day.replace('-', "")))
+}
+
+fn recording_matches_group(
+    recording_id: &str,
+    manifest: Option<&deja_compactor::SessionManifest>,
+    group: &str,
+) -> bool {
+    if deja_orchestrator::group_matches(&deja_orchestrator::parse_recording_id(recording_id), group)
+        || recording_group_from_manifest(recording_id, manifest).as_deref() == Some(group)
+    {
+        return true;
+    }
+    let Some(day) = deja_compactor::day::split_recording_id(recording_id).day else {
+        return false;
+    };
+    let Some(revision) = manifest.and_then(manifest_revision) else {
+        return false;
+    };
+    group == format!("{revision}-{}{}", &day[5..7], &day[8..10])
+}
+async fn manifests_for_recordings(
+    st: &AppState,
+    cfg: &deja_orchestrator::s3::S3Config,
+    system: &str,
+    root: &str,
+    recordings: &[String],
+) -> std::collections::HashMap<String, Result<Option<deja_compactor::SessionManifest>, String>> {
+    let legacy_ids: Vec<String> = recordings
+        .iter()
+        .filter(|id| deja_compactor::day::split_recording_id(id).day.is_none())
+        .cloned()
+        .collect();
+    let legacy_cfg = cfg.clone();
+    let legacy_ids_for_read = legacy_ids.clone();
+    let legacy_results = tokio::task::spawn_blocking(move || {
+        deja_compactor::read_manifests(&legacy_cfg, &legacy_ids_for_read)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|result| result.map_err(|e| e.to_string()));
+    let mut out = std::collections::HashMap::with_capacity(recordings.len());
+    match legacy_results {
+        Ok(results) => out.extend(legacy_ids.into_iter().zip(results)),
+        Err(error) => out.extend(legacy_ids.into_iter().map(|id| (id, Err(error.clone())))),
+    }
+
+    let Some(store) = st.store.as_deref() else {
+        out.extend(
+            recordings
+                .iter()
+                .filter(|id| deja_compactor::day::split_recording_id(id).day.is_some())
+                .cloned()
+                .map(|id| {
+                    (
+                        id,
+                        Err("database store unavailable for immutable day seal".into()),
+                    )
+                }),
+        );
+        return out;
+    };
+    let canonical_root = landing_root(cfg, root);
+    let views = match store
+        .list_current_day_view_heads(system, &cfg.bucket, &canonical_root)
+        .await
+    {
+        Ok(views) => views,
+        Err(error) => {
+            out.extend(
+                recordings
+                    .iter()
+                    .filter(|id| deja_compactor::day::split_recording_id(id).day.is_some())
+                    .cloned()
+                    .map(|id| (id, Err(error.to_string()))),
+            );
+            return out;
+        }
+    };
+    for id in recordings
+        .iter()
+        .filter(|id| deja_compactor::day::split_recording_id(id).day.is_some())
+    {
+        let split = deja_compactor::day::split_recording_id(id);
+        let view = views.iter().find(|view| {
+            view.scope.system == system
+                && view.scope.bucket == cfg.bucket
+                && view.scope.root == canonical_root
+                && view.scope.session_id == split.session_id
+                && view.day == split.day.unwrap_or_default()
+        });
+        let result = match view {
+            None => Ok(None),
+            Some(view) => manifest_from_day_view(view, id).map(Some),
+        };
+        out.insert(id.clone(), result);
+    }
+    out
+}
+
+async fn snapshot_recording_group(
+    st: &AppState,
+    group: &str,
+    system: &str,
+) -> Result<deja_orchestrator::RecordingGroupSnapshot, String> {
+    let (location, configured_root) = deja_orchestrator::system::recording_scope(system)?;
+    let mut cfg = deja_orchestrator::s3::S3Config::from_env();
+    location.apply(&mut cfg);
+    let canonical_root = landing_root(&cfg, &configured_root);
+    let scan_cfg = cfg.clone();
+    let scan_root = configured_root.clone();
+    let mut found = tokio::task::spawn_blocking(move || {
+        deja_compactor::list_landed_recordings(&scan_cfg, &scan_root)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    let legacy_ids: Vec<String> = found
+        .iter()
+        .filter(|recording| {
+            deja_compactor::day::split_recording_id(&recording.session_id)
+                .day
+                .is_none()
+        })
+        .map(|recording| recording.session_id.clone())
+        .collect();
+    let legacy_manifests =
+        manifests_for_recordings(st, &cfg, system, &configured_root, &legacy_ids).await;
+    let views = match st.store.as_deref() {
+        Some(store) => store
+            .list_current_day_view_heads(system, &cfg.bucket, &canonical_root)
+            .await
+            .map_err(|error| error.to_string())?,
+        None => {
+            let needs_index = day_group_key(group).is_some()
+                || found.iter().any(|recording| {
+                    let id = &recording.session_id;
+                    deja_compactor::day::split_recording_id(id).day.is_some()
+                        && (id == group || recording_matches_group(id, None, group))
+                });
+            if needs_index {
+                return Err("database store is required to pin an indexed day view".into());
+            }
+            Vec::new()
+        }
+    };
+    suppress_bare_with_day_views(&mut found, &views);
+    for view in &views {
+        let manifest: deja_compactor::SessionManifest =
+            serde_json::from_value(view.manifest.clone())
+                .map_err(|error| format!("decode current day view: {error}"))?;
+        if !found
+            .iter()
+            .any(|recording| recording.session_id == manifest.session_id)
+        {
+            found.push(deja_compactor::LandedRecording {
+                session_id: manifest.session_id,
+                dates: vec![view.day.clone()],
+                prefix: configured_root.clone(),
+                objects: view.objects.len(),
+                instances: manifest
+                    .instances
+                    .into_iter()
+                    .map(|instance| instance.instance_id)
+                    .collect(),
+            });
+        }
+    }
+    let mut members = Vec::new();
+    for recording in found {
+        let recording_id = recording.session_id;
+        let split = deja_compactor::day::split_recording_id(&recording_id);
+        let day = split.day.map(str::to_owned);
+        let view = day.as_deref().and_then(|day| {
+            views.iter().find(|view| {
+                view.scope.system == system
+                    && view.scope.bucket == cfg.bucket
+                    && view.scope.root == canonical_root
+                    && view.scope.session_id == split.session_id
+                    && view.day == day
+            })
+        });
+        let manifest = if let Some(view) = view {
+            Some(manifest_from_day_view(view, &recording_id)?)
+        } else if day.is_none() {
+            legacy_manifests
+                .get(&recording_id)
+                .ok_or_else(|| format!("manifest result missing for {recording_id}"))?
+                .clone()
+                .map_err(|error| format!("cannot pin {recording_id}: {error}"))?
+        } else {
+            None
+        };
+        if recording_id != group
+            && !recording_matches_group(&recording_id, manifest.as_ref(), group)
+        {
+            continue;
+        }
+        members.push(deja_orchestrator::RecordingGroupMember {
+            recording_id,
+            day,
+            generation: view.map(|view| view.generation),
+            dependency_token: view.map(|view| view.dependency_token.clone()),
+            seal_id: manifest
+                .as_ref()
+                .filter(|manifest| manifest.status == "sealed")
+                .map(|manifest| manifest.seal_id.clone()),
+            terminal_empty: manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.status == "empty"),
+        });
+    }
+    members.sort_by(|a, b| a.recording_id.cmp(&b.recording_id));
+    if members.is_empty() {
+        return Err(format!("`{group}` names no recordings"));
+    }
+    if !members.iter().any(|member| member.seal_id.is_some()) {
+        return Err(format!(
+            "`{group}` has no sealed member available to replay"
+        ));
+    }
+    Ok(deja_orchestrator::RecordingGroupSnapshot {
+        recording_group: group.to_owned(),
+        system: system.to_owned(),
+        bucket: cfg.bucket,
+        endpoint: cfg.endpoint,
+        prefix: cfg.prefix,
+        region: cfg.region,
+        landing_root: canonical_root,
+        members,
+    })
+}
+
 /// `GET /api/v1/recordings/available` — what is in the bucket, newest first.
 ///
 /// The catalog above lists recordings that have been PULLED, which is a
@@ -1204,25 +1598,176 @@ async fn v1_available_recordings(
 ) -> Response {
     let mut cfg = deja_orchestrator::s3::S3Config::from_env();
     let system_scope = q.system.as_deref().filter(|s| !s.trim().is_empty());
-    let root = match scan_scope(system_scope) {
+    let configured_root = match scan_scope(system_scope) {
         Ok((location, root)) => {
             location.apply(&mut cfg);
             root
         }
         Err(message) => return error_resp(400, &message),
     };
+    let canonical_root = landing_root(&cfg, &configured_root);
     let scan_bucket = cfg.bucket.clone();
-    // The SCANNED config, bucket and prefix together, for the manifest
-    // enrichment below and for spelling each row's prefix in full.
     let scanned = cfg.clone();
+    let scan_root = configured_root.clone();
     let mut found = match tokio::task::spawn_blocking(move || {
-        deja_compactor::list_landed_recordings(&cfg, &root)
+        deja_compactor::list_landed_recordings(&cfg, &scan_root)
     })
     .await
     {
         Ok(Ok(found)) => found,
         Ok(Err(e)) => return error_resp(502, &format!("list recordings in bucket: {e}")),
         Err(e) => return error_resp(500, &format!("list recordings in bucket: {e}")),
+    };
+    let (heads, discovery_error) = match st.store.as_deref() {
+        Some(store) => match store
+            .list_current_day_view_heads(
+                match system_scope {
+                    Some(system) => system,
+                    None => deja_orchestrator::default_system(),
+                },
+                &scanned.bucket,
+                &canonical_root,
+            )
+            .await
+        {
+            Ok(heads) => (Some(heads), None),
+            Err(error) => (None, Some(format!("list indexed day views: {error}"))),
+        },
+        None => (
+            None,
+            Some("database store unavailable for day-view discovery".to_owned()),
+        ),
+    };
+    if let Some(heads) = heads {
+        suppress_bare_with_day_views(&mut found, &heads);
+        for view in heads {
+            let Ok(manifest) =
+                serde_json::from_value::<deja_compactor::SessionManifest>(view.manifest.clone())
+            else {
+                return error_resp(503, "invalid manifest in current database day view");
+            };
+            let id = manifest.session_id.clone();
+            if !found.iter().any(|row| row.session_id == id) {
+                found.push(deja_compactor::LandedRecording {
+                    session_id: id,
+                    dates: vec![view.day.clone()],
+                    prefix: configured_root.clone(),
+                    objects: view.objects.len(),
+                    instances: manifest
+                        .instances
+                        .iter()
+                        .map(|instance| instance.instance_id.clone())
+                        .collect(),
+                });
+            }
+        }
+    }
+    let requested_system = match system_scope {
+        Some(system) => system,
+        None => deja_orchestrator::default_system(),
+    };
+    let system_config = deja_orchestrator::system::system_config(requested_system);
+    let (recommended_group, recommendation_state) = if let Some(reason) = discovery_error {
+        (
+            None,
+            RecommendationState {
+                state: "unavailable",
+                reason: Some(reason),
+            },
+        )
+    } else {
+        match ready_workload_pods(&st, &system_config).await {
+            Err(reason) => (
+                None,
+                RecommendationState {
+                    state: "unavailable",
+                    reason: Some(reason),
+                },
+            ),
+            Ok(ready_pods) => {
+                let ids: Vec<String> = found.iter().map(|r| r.session_id.clone()).collect();
+                let manifests = manifests_for_recordings(
+                    &st,
+                    &scanned,
+                    requested_system,
+                    &configured_root,
+                    &ids,
+                )
+                .await;
+                if let Some(reason) = manifests.values().find_map(|m| m.as_ref().err()).cloned() {
+                    (
+                        None,
+                        RecommendationState {
+                            state: "unavailable",
+                            reason: Some(reason),
+                        },
+                    )
+                } else {
+                    let logical_days = match st.store.as_deref() {
+                        Some(store) => {
+                            let mut days = std::collections::HashSet::new();
+                            let mut error = None;
+                            let indexed_sessions = match store
+                                .active_landing_session_generations(
+                                    requested_system,
+                                    &scanned.bucket,
+                                    &canonical_root,
+                                )
+                                .await
+                            {
+                                Ok(sessions) => sessions
+                                    .into_keys()
+                                    .collect::<std::collections::HashSet<_>>(),
+                                Err(e) => {
+                                    error = Some(format!("list indexed landing sessions: {e}"));
+                                    std::collections::HashSet::new()
+                                }
+                            };
+                            for session in indexed_sessions {
+                                let scope = deja_store::LandingScope {
+                                    system: requested_system.to_owned(),
+                                    bucket: scanned.bucket.clone(),
+                                    root: canonical_root.clone(),
+                                    session_id: session.clone(),
+                                };
+                                match store.landing_days(&scope).await {
+                                    Ok(indexed) => days.extend(indexed.into_iter().map(|item| {
+                                        deja_compactor::day::day_recording_id(&session, &item.day)
+                                    })),
+                                    Err(e) => {
+                                        error = Some(format!(
+                                            "read indexed logical days for {session}: {e}"
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            match error {
+                                Some(error) => Err(error),
+                                None => Ok(days),
+                            }
+                        }
+                        None => Err("database store unavailable for logical day discovery".into()),
+                    };
+                    match logical_days {
+                        Ok(logical_days) => recommend_from_serving_pods(
+                            &found,
+                            &manifests,
+                            &ready_pods,
+                            system_config.main_instance_prefix.as_deref(),
+                            &logical_days,
+                        ),
+                        Err(reason) => (
+                            None,
+                            RecommendationState {
+                                state: "unavailable",
+                                reason: Some(reason),
+                            },
+                        ),
+                    }
+                }
+            }
+        }
     };
 
     // Which of them the catalog already holds. A failure to read the catalog
@@ -1251,37 +1796,39 @@ async fn v1_available_recordings(
         });
     }
     if let Some(wanted) = q.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
-        found.retain(|r| {
-            group_of(&deja_orchestrator::parse_recording_id(&r.session_id)).as_deref()
-                == Some(wanted)
-        });
-        // Resolve marker state before pagination so empty terminal markers do
-        // not appear as selectable members or inflate the group total.
-        let ids: Vec<String> = found.iter().map(|r| r.session_id.clone()).collect();
-        let cfg_for_manifests = scanned.clone();
-        let results = match tokio::task::spawn_blocking(move || {
-            deja_compactor::read_manifests(&cfg_for_manifests, &ids)
-        })
-        .await
-        {
-            Ok(Ok(results)) => results,
-            Ok(Err(error)) => {
-                return error_resp(502, &format!("recording manifests unavailable: {error}"))
-            }
-            Err(error) => {
-                return error_resp(502, &format!("recording manifest reader failed: {error}"))
-            }
-        };
-        if let Some(error) = results.iter().find_map(|result| result.as_ref().err()) {
+        let ids: Vec<String> = found
+            .iter()
+            .map(|recording| recording.session_id.clone())
+            .collect();
+        let manifests =
+            manifests_for_recordings(&st, &scanned, requested_system, &configured_root, &ids).await;
+        if let Some(error) = manifests.values().find_map(|result| result.as_ref().err()) {
             return error_resp(502, &format!("recording manifest unavailable: {error}"));
         }
-        found = without_empty_terminal_markers(
-            found,
-            results
-                .into_iter()
-                .map(|result| result.expect("manifest errors returned above"))
-                .collect(),
-        );
+        found.retain(|recording| {
+            manifests
+                .get(&recording.session_id)
+                .and_then(|result| result.as_ref().ok())
+                .and_then(Option::as_ref)
+                .map_or_else(
+                    || recording_matches_group(&recording.session_id, None, wanted),
+                    |manifest| {
+                        recording_matches_group(&recording.session_id, Some(manifest), wanted)
+                    },
+                )
+        });
+        let empty_ids: std::collections::HashSet<String> = manifests
+            .iter()
+            .filter_map(|(id, result)| {
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(Option::as_ref)
+                    .filter(|manifest| empty_terminal_manifest(manifest))
+                    .map(|_| id.clone())
+            })
+            .collect();
+        found.retain(|recording| !empty_ids.contains(&recording.session_id));
     }
     if q.main_instances.unwrap_or(false) {
         // Matched rather than `unwrap_or_else`: that unifies this borrow of
@@ -1345,31 +1892,27 @@ async fn v1_available_recordings(
     // field it had, and reports its seal facts as null rather than as zero. Zero
     // correlations and "not counted yet" are different answers, and a picker that
     // rendered the second as the first would hide good recordings as empty ones.
-    let ids: Vec<String> = page_rows.iter().map(|r| r.session_id.clone()).collect();
-    let cfg_for_manifests = scanned.clone();
-    // A missing manifest means unsealed; a failed read prevents a truthful catalog.
-    let manifest_results = match tokio::task::spawn_blocking(move || {
-        deja_compactor::read_manifests(&cfg_for_manifests, &ids)
-    })
-    .await
-    {
-        Ok(Ok(manifests)) => manifests,
-        Ok(Err(error)) => {
-            return error_resp(502, &format!("recording manifests unavailable: {error}"));
-        }
-        Err(error) => {
-            return error_resp(502, &format!("recording manifest reader failed: {error}"));
-        }
-    };
-    if let Some(error) = manifest_results
+    let ids: Vec<String> = page_rows
         .iter()
+        .map(|recording| recording.session_id.clone())
+        .collect();
+    let manifest_results =
+        manifests_for_recordings(&st, &scanned, requested_system, &configured_root, &ids).await;
+    if let Some(error) = manifest_results
+        .values()
         .find_map(|result| result.as_ref().err())
     {
         return error_resp(502, &format!("recording manifest unavailable: {error}"));
     }
-    let manifests: Vec<Option<deja_compactor::SessionManifest>> = manifest_results
-        .into_iter()
-        .map(|result| result.expect("manifest errors returned above"))
+    let manifests: Vec<Option<deja_compactor::SessionManifest>> = ids
+        .iter()
+        .map(|id| {
+            manifest_results
+                .get(id)
+                .and_then(|result| result.as_ref().ok())
+                .cloned()
+                .flatten()
+        })
         .collect();
 
     let page: Vec<serde_json::Value> = page_rows
@@ -1468,7 +2011,7 @@ async fn v1_available_recordings(
             }));
             serde_json::json!({
                 "recording_id": r.session_id,
-                "group": group_of(&identity),
+                "group": recording_group_from_manifest(&r.session_id, manifest),
                 "dates": r.dates,
                 "latest_date": r.latest_date(),
                 "objects": r.objects,
@@ -1496,6 +2039,8 @@ async fn v1_available_recordings(
         "total": total,
         "offset": offset,
         "limit": limit,
+        "recommended_group": recommended_group,
+        "recommendation_state": recommendation_state,
     }))
 }
 
@@ -1565,9 +2110,10 @@ fn empty_terminal_manifest(manifest: &deja_compactor::SessionManifest) -> bool {
 }
 
 fn is_sealed_replayable(manifest: &deja_compactor::SessionManifest) -> bool {
-    !empty_terminal_manifest(manifest)
+    manifest.status == "sealed"
 }
 
+#[cfg(test)]
 fn without_empty_terminal_markers(
     recordings: Vec<deja_compactor::LandedRecording>,
     manifests: Vec<Option<deja_compactor::SessionManifest>>,
@@ -1580,8 +2126,309 @@ fn without_empty_terminal_markers(
         })
         .collect()
 }
+/// A current indexed day supersedes the old session-as-a-day catalog row.
+/// The bare ID remains readable for historical direct replays, but offering
+/// both as separate selectable groups makes the same source look incomplete.
+fn suppress_bare_with_day_views(
+    recordings: &mut Vec<deja_compactor::LandedRecording>,
+    heads: &[deja_store::DayView],
+) {
+    let sessions: std::collections::HashSet<&str> = heads
+        .iter()
+        .map(|view| view.scope.session_id.as_str())
+        .collect();
+    recordings.retain(|row| {
+        deja_compactor::day::split_recording_id(&row.session_id)
+            .day
+            .is_some()
+            || !sessions.contains(row.session_id.as_str())
+    });
+}
+
 fn from_main_deployment(r: &deja_compactor::LandedRecording, prefix: &str) -> bool {
     !r.instances.is_empty() && r.instances.iter().all(|i| i.starts_with(prefix))
+}
+
+#[derive(serde::Serialize)]
+struct RecommendationState {
+    state: &'static str,
+    reason: Option<String>,
+}
+
+async fn ready_workload_pods(
+    st: &AppState,
+    config: &deja_orchestrator::system::SystemConfig,
+) -> Result<Vec<String>, String> {
+    let namespace = config
+        .active_workload_namespace
+        .as_deref()
+        .ok_or_else(|| "active_workload_namespace is not configured".to_owned())?;
+    let kind = config
+        .active_workload_kind
+        .as_deref()
+        .ok_or_else(|| "active_workload_kind is not configured".to_owned())?;
+    let name = config
+        .active_workload_name
+        .as_deref()
+        .ok_or_else(|| "active_workload_name is not configured".to_owned())?;
+    let Some(k) = (match &*st.executor {
+        ExecutorSelection::K8s(k) => Some(k),
+        ExecutorSelection::Compose => None,
+    }) else {
+        return Err("Kubernetes workload resolution is unavailable for this executor".into());
+    };
+    let incluster = k.incluster.clone();
+    let namespace = namespace.to_owned();
+    let name = name.to_owned();
+    let kind = kind.to_owned();
+    tokio::task::spawn_blocking(move || {
+        use deja_orchestrator::executor::{KubeApi, UreqTransport};
+        let api = KubeApi::new(UreqTransport::new(&incluster).map_err(|e| e.to_string())?);
+        let workload = match kind.as_str() {
+            "rollout" => api.get_rollout(&namespace, &name),
+            "deployment" => api.get_deployment(&namespace, &name),
+            other => return Err(format!("unsupported active_workload_kind `{other}`")),
+        }
+        .map_err(|e| e.to_string())?;
+        api.ready_pod_names(&namespace, &workload)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn day_group_key(group: &str) -> Option<(&str, &str)> {
+    let (revision, day) = group.split_once('-')?;
+    (day.len() == 8 && day.chars().all(|c| c.is_ascii_digit())).then_some((revision, day))
+}
+
+fn sha_matches(left: &str, right: &str) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
+fn recommend_from_serving_pods(
+    found: &[deja_compactor::LandedRecording],
+    manifests: &std::collections::HashMap<
+        String,
+        Result<Option<deja_compactor::SessionManifest>, String>,
+    >,
+    ready_pods: &[String],
+    main_prefix: Option<&str>,
+    logical_days: &std::collections::HashSet<String>,
+) -> (Option<String>, RecommendationState) {
+    let unavailable = |reason: String| {
+        (
+            None,
+            RecommendationState {
+                state: "unavailable",
+                reason: Some(reason),
+            },
+        )
+    };
+    if ready_pods.is_empty() {
+        return unavailable("workload has no ready serving pods".into());
+    }
+
+    let mut pod_revisions = Vec::with_capacity(ready_pods.len());
+    for pod in ready_pods {
+        let mut revisions = std::collections::BTreeSet::new();
+        for recording in found
+            .iter()
+            .filter(|r| r.instances.iter().any(|i| i == pod))
+        {
+            let Some(Ok(Some(manifest))) = manifests.get(&recording.session_id) else {
+                continue;
+            };
+            let Some(revision) = manifest_revision(manifest) else {
+                continue;
+            };
+            if let deja_orchestrator::RecordingIdentity::Described {
+                revision: id_revision,
+                ..
+            } = deja_orchestrator::parse_recording_id(&recording.session_id)
+            {
+                if !sha_matches(&id_revision, &revision) {
+                    return (
+                        None,
+                        RecommendationState {
+                            state: "ambiguous",
+                            reason: Some(format!(
+                                "recording {} id and sealed manifest disagree on revision",
+                                recording.session_id
+                            )),
+                        },
+                    );
+                }
+            }
+            revisions.insert(revision);
+        }
+        if revisions.is_empty() {
+            return unavailable(format!(
+                "ready pod {pod} has no sealed recording with a unique code revision"
+            ));
+        }
+        let Some(canonical) = revisions.iter().max_by_key(|sha| sha.len()).cloned() else {
+            return unavailable(format!("ready pod {pod} has no identifiable revision"));
+        };
+        if revisions.iter().any(|sha| !sha_matches(sha, &canonical)) {
+            return (
+                None,
+                RecommendationState {
+                    state: "ambiguous",
+                    reason: Some(format!(
+                        "ready pod {pod} matches multiple recording revisions"
+                    )),
+                },
+            );
+        }
+        pod_revisions.push(canonical);
+    }
+    let Some(active_revision) = pod_revisions.iter().max_by_key(|sha| sha.len()).cloned() else {
+        return unavailable("workload has no identified serving revision".into());
+    };
+    if pod_revisions
+        .iter()
+        .any(|sha| !sha_matches(sha, &active_revision))
+    {
+        return (
+            None,
+            RecommendationState {
+                state: "ambiguous",
+                reason: Some("ready serving pods match multiple revisions".into()),
+            },
+        );
+    }
+
+    let mut complete_days: std::collections::BTreeMap<String, bool> =
+        std::collections::BTreeMap::new();
+    // Group keys use YYYYMMDD; compare unresolved days in that same format.
+    let mut unresolved_days = std::collections::BTreeSet::new();
+    let present: std::collections::HashSet<&str> = found
+        .iter()
+        .map(|recording| recording.session_id.as_str())
+        .collect();
+    let serving_sessions: std::collections::HashSet<&str> = found
+        .iter()
+        .filter(|recording| {
+            main_prefix.is_none_or(|prefix| from_main_deployment(recording, prefix))
+                && recording
+                    .instances
+                    .iter()
+                    .any(|instance| ready_pods.contains(instance))
+        })
+        .map(|recording| deja_compactor::day::split_recording_id(&recording.session_id).session_id)
+        .collect();
+    // An indexed ingress day may have no S3 day row: its object was placed in
+    // another physical partition. It is still a logical day that must veto an
+    // older complete recommendation until it has a current view.
+    for id in logical_days {
+        if present.contains(id.as_str()) {
+            continue;
+        }
+        let split = deja_compactor::day::split_recording_id(id);
+        if let Some(day) = split.day {
+            if serving_sessions.contains(split.session_id)
+                && matches!(
+                    deja_orchestrator::parse_recording_id(id),
+                    deja_orchestrator::RecordingIdentity::Described { revision, .. }
+                        if sha_matches(&revision, &active_revision)
+                )
+            {
+                unresolved_days.insert(day.replace('-', ""));
+            }
+        }
+    }
+    for recording in found {
+        if main_prefix.is_some_and(|prefix| !from_main_deployment(recording, prefix)) {
+            continue;
+        }
+        let split = deja_compactor::day::split_recording_id(&recording.session_id);
+        let Some(day) = split.day else { continue };
+        // A physical S3 partition can contain only the tail of a request
+        // whose ingress belongs to an earlier day. It is not a logical day
+        // member and must not veto that earlier day's complete replay group.
+        // A day with indexed request/object membership remains a member even
+        // before its seal is published, and therefore still fails closed.
+        if !logical_days.contains(&recording.session_id) {
+            continue;
+        }
+        let manifest_result = manifests.get(&recording.session_id);
+        let manifest = manifest_result
+            .and_then(|result| result.as_ref().ok())
+            .and_then(Option::as_ref);
+        // A terminal empty view is complete but carries no tape. The group
+        // resolver excludes it, so it must not veto another sealed member's
+        // day or invent an unresolved revision when the marker has no code.
+        if manifest.is_some_and(empty_terminal_manifest) {
+            continue;
+        }
+        let identity_revision = match deja_orchestrator::parse_recording_id(&recording.session_id) {
+            deja_orchestrator::RecordingIdentity::Described { revision, .. } => Some(revision),
+            _ => None,
+        };
+        let manifest_sha = manifest.and_then(manifest_revision);
+        let revision = manifest_sha.as_deref().or(identity_revision.as_deref());
+        let Some(revision) = revision else {
+            unresolved_days.insert(day.replace('-', ""));
+            continue;
+        };
+        if let (Some(id_revision), Some(manifest_sha)) =
+            (identity_revision.as_deref(), manifest_sha.as_deref())
+        {
+            if !sha_matches(id_revision, manifest_sha) {
+                unresolved_days.insert(day.replace('-', ""));
+                continue;
+            }
+        }
+        if !sha_matches(revision, &active_revision) {
+            continue;
+        }
+        let Some(group) = recording_group_from_manifest(&recording.session_id, manifest) else {
+            unresolved_days.insert(day.replace('-', ""));
+            continue;
+        };
+        let replayable = matches!(manifest_result, Some(Ok(Some(m)))
+            if is_sealed_replayable(m) && !m.data_parts.is_empty());
+        if !replayable {
+            unresolved_days.insert(day.replace('-', ""));
+        }
+        complete_days
+            .entry(group)
+            .and_modify(|complete| *complete &= replayable)
+            .or_insert(replayable);
+    }
+
+    let selected = complete_days
+        .into_iter()
+        .filter_map(|(group, complete)| {
+            let (_, day) = day_group_key(&group)?;
+            (complete && !unresolved_days.contains(day)).then_some((day.to_owned(), group))
+        })
+        .max_by(|a, b| a.0.cmp(&b.0));
+    if let Some((selected_day, _)) = &selected {
+        if unresolved_days
+            .iter()
+            .any(|unresolved| unresolved > selected_day)
+        {
+            return unavailable(format!(
+                "a newer logical day for active revision {} is not fully replayable",
+                active_revision
+            ));
+        }
+    }
+    match selected {
+        Some((_, group)) => (
+            Some(group),
+            RecommendationState {
+                state: "ready",
+                reason: None,
+            },
+        ),
+        None => unavailable(format!(
+            "no fully replayable ISO day is available for active revision {}",
+            active_revision
+        )),
+    }
 }
 
 fn selection_order_key(
@@ -1674,6 +2521,10 @@ struct CorrelationsQuery {
 /// correlations drives the first [`deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN`]
 /// in this same order, so the head of page zero IS what such a run will drive.
 /// Any other default ordering here would show one set and run another.
+fn indexed_correlation_sidecar_key(manifest: &deja_compactor::SessionManifest) -> String {
+    deja_compactor::layout::correlations_key(&manifest.session_id, &manifest.seal_id)
+}
+
 async fn v1_recording_correlations(
     State(st): State<AppState>,
     Path(id): Path<String>,
@@ -1699,6 +2550,95 @@ async fn v1_recording_correlations(
     let spelled = cfg.clone();
     let scanned = root.clone();
     let wanted = id.clone();
+    let indexed_membership = if let Some(day) = deja_compactor::day::split_recording_id(&id).day {
+        let system = match q.system.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(system) => system,
+            None => deja_orchestrator::default_system(),
+        };
+        match st.store.as_deref() {
+            Some(store) => {
+                let scope = deja_store::LandingScope {
+                    system: system.to_owned(),
+                    bucket: cfg.bucket.clone(),
+                    root: landing_root(&cfg, &root),
+                    session_id: deja_compactor::day::split_recording_id(&id)
+                        .session_id
+                        .to_owned(),
+                };
+                let days = match store.landing_days(&scope).await {
+                    Ok(days) => days,
+                    Err(error) => {
+                        return error_resp(502, &format!("read indexed day membership: {error}"))
+                    }
+                };
+                let history = match store.has_day_view_history(&scope, day).await {
+                    Ok(history) => history,
+                    Err(error) => {
+                        return error_resp(502, &format!("read indexed day history: {error}"))
+                    }
+                };
+                days.iter().any(|indexed| indexed.day == day) || history
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    let indexed_manifest = if let Some(day) = deja_compactor::day::split_recording_id(&id).day {
+        let system = match q.system.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(system) => system,
+            None => deja_orchestrator::default_system(),
+        };
+        match st.store.as_deref() {
+            Some(store) => {
+                let canonical_root = landing_root(&cfg, &root);
+                match store
+                    .list_current_day_view_heads(system, &cfg.bucket, &canonical_root)
+                    .await
+                {
+                    Ok(views) => match views.into_iter().find(|view| {
+                        view.scope.session_id
+                            == deja_compactor::day::split_recording_id(&id).session_id
+                            && view.day == day
+                    }) {
+                        Some(view) => {
+                            match serde_json::from_value::<deja_compactor::SessionManifest>(
+                                view.manifest,
+                            ) {
+                                Ok(manifest) => Some(manifest),
+                                Err(error) => {
+                                    return error_resp(
+                                        502,
+                                        &format!("read indexed day manifest: {error}"),
+                                    )
+                                }
+                            }
+                        }
+                        None => None,
+                    },
+                    Err(error) => {
+                        return error_resp(502, &format!("read indexed day views: {error}"))
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    if indexed_membership && indexed_manifest.is_none() {
+        return json_ok(serde_json::json!({
+            "recording_id": id,
+            "status": "unsealed",
+            "total": serde_json::Value::Null,
+            "matched": serde_json::Value::Null,
+            "max_per_run": deja_orchestrator::scope::MAX_CORRELATIONS_PER_RUN,
+            "offset": q.offset.unwrap_or(0),
+            "limit": q.limit.unwrap_or(1000).clamp(1, 5000),
+            "correlations": serde_json::Value::Null,
+            "detail": "indexed logical day has no current sealed view",
+        }));
+    }
     let found = match tokio::task::spawn_blocking(move || -> Result<_, String> {
         use deja_compactor::CorrelationIndex;
         let landing = |cfg: &_| -> Result<RecordingCorrelations, String> {
@@ -1709,23 +2649,30 @@ async fn v1_recording_correlations(
                 },
             )
         };
+        if let Some(manifest) = indexed_manifest {
+            if manifest.status == "empty" {
+                return Ok(RecordingCorrelations::Empty);
+            }
+            let key = indexed_correlation_sidecar_key(&manifest);
+            let bytes = deja_compactor::get_object_decoded(&cfg, &key)?;
+            let mut rows = Vec::new();
+            for line in bytes.split(|&byte| byte == b'\n') {
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                rows.push(
+                    serde_json::from_slice::<deja_orchestrator::s3::CorrelationSummary>(line)
+                        .map_err(|error| format!("decode indexed correlation row: {error}"))?,
+                );
+            }
+            return Ok(RecordingCorrelations::Sealed(rows));
+        }
         match deja_orchestrator::s3::read_correlation_index(&cfg, &wanted)? {
             CorrelationIndex::Empty => Ok(RecordingCorrelations::Empty),
             CorrelationIndex::Rows(rows) => Ok(RecordingCorrelations::Sealed(rows)),
-            // Sealed before the index sidecar existed. The recording is real and
-            // the landing area can still say what is in it, so this reads it
-            // from there rather than failing — a missing index is a fact about
-            // the seal, not about the recording.
-            // NOT the landing fallback: we can prove this recording was sealed,
-            // so answering "unknown" when its landing objects have since been
-            // cleaned up would deny a recording we hold the manifest for. The
-            // count is what the manifest knows; the rows are what it lost.
             CorrelationIndex::SealedWithoutIndex { correlations } => {
                 Ok(RecordingCorrelations::SealedWithoutIndex { correlations })
             }
-            // Not sealed. Whether that means "not ingested yet" or "no such
-            // recording" is a question only the landing area can answer, and
-            // they must not come back as the same thing.
             CorrelationIndex::NotSealed => landing(&cfg),
         }
     })
@@ -4143,6 +5090,16 @@ mod tests {
         assert_eq!(body["correlations"], serde_json::json!([]));
         assert!(body.get("note").is_none());
     }
+    #[test]
+    fn indexed_day_correlations_read_the_sidecar_named_by_the_current_seal() {
+        let mut manifest = manifest_with_codes(&[]);
+        manifest.session_id = "rec-a1b2c3d-10072359-x.2026-10-15".to_owned();
+        manifest.seal_id = "seal-42".to_owned();
+        assert_eq!(
+            super::indexed_correlation_sidecar_key(&manifest),
+            "sessions/v1/rec-a1b2c3d-10072359-x.2026-10-15/index/seal-42/correlations.ndjson.zst"
+        );
+    }
 
     /// The bin's tests share one process environment too. See the lib's
     /// `test_env` for why readers hold this as well as writers.
@@ -5509,6 +6466,70 @@ mod tests {
             ["sealed", "unsealed"]
         );
     }
+    #[test]
+    fn unsealed_rows_only_belong_to_their_own_group() {
+        assert!(!super::recording_matches_group(
+            "rec-bbbbbbb-10081400-y",
+            None,
+            "a1b2c3d-20261008",
+        ));
+        assert!(super::recording_matches_group(
+            "rec-bbbbbbb-10081400-y",
+            None,
+            "bbbbbbb-1008",
+        ));
+        assert!(super::recording_matches_group(
+            "rec-a1b2c3d-10072359-x.2026-10-08",
+            None,
+            "a1b2c3d-20261008",
+        ));
+    }
+    #[test]
+    fn boot_derived_day_uses_its_manifest_revision_for_grouping() {
+        let id = "run-1789076520165195354.2026-10-08";
+        let mut sealed = manifest_with_codes(&[Some("28d8299")]);
+        sealed.session_id = id.to_owned();
+        assert_eq!(
+            super::recording_group_from_manifest(id, Some(&sealed)).as_deref(),
+            Some("28d8299-20261008")
+        );
+    }
+
+    #[test]
+    fn terminal_empty_day_is_valid_but_not_a_replayable_member() {
+        let id = "rec-a1b2c3d-10072359-x.2026-10-08";
+        let mut manifest = manifest_with_codes(&[Some("a1b2c3d")]);
+        manifest.session_id = id.to_owned();
+        manifest.status = "empty".into();
+        manifest.seal_id.clear();
+        manifest.data_parts.clear();
+        let view = deja_store::DayView {
+            scope: deja_store::LandingScope {
+                system: "hyperswitch".into(),
+                bucket: "hyperswitch-art".into(),
+                root: "landing/v1".into(),
+                session_id: "rec-a1b2c3d-10072359-x".into(),
+            },
+            day: "2026-10-08".into(),
+            generation: 1,
+            dependency_token: "source-1".into(),
+            manifest: serde_json::to_value(&manifest).expect("serializable marker"),
+            objects: Vec::new(),
+        };
+        assert_eq!(
+            super::manifest_from_day_view(&view, id)
+                .expect("empty marker is a valid terminal view")
+                .status,
+            "empty"
+        );
+        manifest.status = "sealed".into();
+        let invalid = deja_store::DayView {
+            manifest: serde_json::to_value(manifest).expect("serializable invalid seal"),
+            ..view
+        };
+        assert!(super::manifest_from_day_view(&invalid, id).is_err());
+    }
+
     /// Two different shas means the recording spans revisions, so it has no
     /// single one. Picking either would be a confident lie in exactly the case
     /// where a caller most needs to know it cannot compare a candidate to this
@@ -5565,6 +6586,36 @@ mod tests {
         rows.into_iter().map(|r| r.session_id).collect()
     }
 
+    #[test]
+    fn indexed_day_replaces_only_its_own_bare_session_in_the_picker() {
+        let session = "rec-a1b2c3d-10072359-x";
+        let other = "rec-bbbbbbb-10081400-y";
+        let mut rows = vec![
+            landed(session, "2026-10-08", &["sbx-hyperswitch-server-a"]),
+            landed(other, "2026-10-08", &["sbx-hyperswitch-server-b"]),
+        ];
+        let heads = [deja_store::DayView {
+            scope: deja_store::LandingScope {
+                system: "hyperswitch".into(),
+                bucket: "hyperswitch-art".into(),
+                root: "landing/v1".into(),
+                session_id: session.into(),
+            },
+            day: "2026-10-08".into(),
+            generation: 1,
+            dependency_token: "source-1".into(),
+            manifest: serde_json::Value::Null,
+            objects: Vec::new(),
+        }];
+        super::suppress_bare_with_day_views(&mut rows, &heads);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            [other]
+        );
+    }
+
     /// The sandbox failure written as a test. Two revisions recorded on the same
     /// day, and the raw session-id tiebreak preferred the OLDER tape because it
     /// compares the revision hex before the timestamp.
@@ -5611,6 +6662,142 @@ mod tests {
             newest_first(vec![older, newer])[0],
             "run-1788680145151199733"
         );
+    }
+
+    #[test]
+    fn rollback_picks_the_serving_revision_before_the_newest_day() {
+        let a_day = "rec-a1b2c3d-10072359-x.2026-10-08";
+        let b_day = "rec-bbbbbbb-10081400-y.2026-10-09";
+        let found = vec![
+            landed(b_day, "2026-10-09", &["sbx-hyperswitch-server-b"]),
+            landed(a_day, "2026-10-08", &["sbx-hyperswitch-server-a"]),
+        ];
+        let sealed = |id: &str, sha: &str| {
+            let mut manifest = manifest_with_codes(&[Some(sha)]);
+            manifest.session_id = id.to_owned();
+            manifest.data_parts.push(deja_compactor::DataPart {
+                key: format!("sessions/v1/{id}/data/part-00000.ndjsonl.zst"),
+                events: 1,
+                bytes: 1,
+            });
+            Ok(Some(manifest))
+        };
+        let manifests = std::collections::HashMap::from([
+            (a_day.to_owned(), sealed(a_day, "a1b2c3d")),
+            (b_day.to_owned(), sealed(b_day, "bbbbbbb")),
+        ]);
+        let logical = std::collections::HashSet::from([a_day.to_owned(), b_day.to_owned()]);
+        let (rollback_group, rollback_state) = super::recommend_from_serving_pods(
+            &found,
+            &manifests,
+            &["sbx-hyperswitch-server-a".to_owned()],
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+        );
+        assert_eq!(rollback_state.state, "ready");
+        assert_eq!(rollback_group.as_deref(), Some("a1b2c3d-20261008"));
+
+        let (newer_group, newer_state) = super::recommend_from_serving_pods(
+            &found,
+            &manifests,
+            &["sbx-hyperswitch-server-b".to_owned()],
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+        );
+        assert_eq!(newer_state.state, "ready");
+        assert_eq!(newer_group.as_deref(), Some("bbbbbbb-20261009"));
+    }
+
+    #[test]
+    fn terminal_empty_marker_does_not_veto_a_sealed_sibling_day() {
+        let sealed_id = "rec-a1b2c3d-10072359-x.2026-10-08";
+        let empty_id = "rec-a1b2c3d-10070800-y.2026-10-08";
+        let found = vec![
+            landed(sealed_id, "2026-10-08", &["sbx-hyperswitch-server-a"]),
+            landed(empty_id, "2026-10-08", &["sbx-hyperswitch-server-a"]),
+        ];
+        let mut sealed = manifest_with_codes(&[Some("a1b2c3d")]);
+        sealed.session_id = sealed_id.into();
+        sealed.data_parts.push(deja_compactor::DataPart {
+            key: "sessions/v1/sealed/data/part-00000.ndjsonl.zst".into(),
+            events: 1,
+            bytes: 1,
+        });
+        let mut empty = manifest_with_codes(&[]);
+        empty.session_id = empty_id.into();
+        empty.status = "empty".into();
+        empty.seal_id.clear();
+        empty.data_parts.clear();
+        let manifests = std::collections::HashMap::from([
+            (sealed_id.to_owned(), Ok(Some(sealed))),
+            (empty_id.to_owned(), Ok(Some(empty))),
+        ]);
+        let (group, state) = super::recommend_from_serving_pods(
+            &found,
+            &manifests,
+            &["sbx-hyperswitch-server-a".into()],
+            Some("sbx-hyperswitch-server-"),
+            &std::collections::HashSet::from([sealed_id.to_owned(), empty_id.to_owned()]),
+        );
+        assert_eq!(state.state, "ready");
+        assert_eq!(group.as_deref(), Some("a1b2c3d-20261008"));
+    }
+    #[test]
+    fn physical_only_tail_does_not_veto_but_logical_unsealed_day_does() {
+        let complete_id = "rec-a1b2c3d-10072359-x.2026-10-07";
+        let physical_tail_id = "rec-a1b2c3d-10072359-x.2026-10-08";
+        let found = vec![
+            landed(complete_id, "2026-10-07", &["sbx-hyperswitch-server-a"]),
+            landed(
+                physical_tail_id,
+                "2026-10-08",
+                &["sbx-hyperswitch-server-a"],
+            ),
+        ];
+        let mut complete = manifest_with_codes(&[Some("a1b2c3d")]);
+        complete.session_id = complete_id.into();
+        complete.data_parts.push(deja_compactor::DataPart {
+            key: format!("sessions/v1/{complete_id}/data/part-00000.ndjsonl.zst"),
+            events: 1,
+            bytes: 1,
+        });
+        let manifests =
+            std::collections::HashMap::from([(complete_id.to_owned(), Ok(Some(complete)))]);
+        let pods = ["sbx-hyperswitch-server-a".to_owned()];
+        let logical = std::collections::HashSet::from([complete_id.to_owned()]);
+        let (group, state) = super::recommend_from_serving_pods(
+            &found,
+            &manifests,
+            &pods,
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+        );
+        assert_eq!(state.state, "ready");
+        assert_eq!(group.as_deref(), Some("a1b2c3d-20261007"));
+
+        let logical =
+            std::collections::HashSet::from([complete_id.to_owned(), physical_tail_id.to_owned()]);
+        let (group, state) = super::recommend_from_serving_pods(
+            &found,
+            &manifests,
+            &pods,
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+        );
+        assert_eq!(state.state, "unavailable");
+        assert!(group.is_none());
+
+        // The logical D8 ingress can be indexed before S3 has any D8 day row.
+        // Its absence from `found` must not make D7 look current.
+        let (group, state) = super::recommend_from_serving_pods(
+            &found[..1],
+            &manifests,
+            &pods,
+            Some("sbx-hyperswitch-server-"),
+            &logical,
+        );
+        assert_eq!(state.state, "unavailable");
+        assert!(group.is_none());
     }
 
     /// Seed one hydrated artifact with a chosen size and modification time.

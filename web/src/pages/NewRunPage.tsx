@@ -10,6 +10,7 @@ import { spanOf } from "../lib/recordings";
 import { useSystems } from "../lib/systems";
 import { CORRELATION_CAP, useCorrelationCandidates } from "../lib/correlations";
 import { daySummary, groupRecordings } from "../lib/recordings";
+import { recommendedGroup } from "../lib/recommendation";
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -91,8 +92,8 @@ export default function NewRunPage() {
   // What EXISTS (the bucket) and what has been PULLED (the catalog). The picker
   // offers the first; the second is joined on for the counts only it knows.
   const available = useQuery({
-    queryKey: ["recordings-available"],
-    queryFn: () => availableRecordings(),
+    queryKey: ["recordings-available", systemUnderTest],
+    queryFn: () => availableRecordings(200, 0, systemUnderTest || undefined),
   });
   const recordings = useQuery({ queryKey: ["recordings"], queryFn: api.recordings });
 
@@ -108,36 +109,30 @@ export default function NewRunPage() {
   const chosen = rows.find((r) => r.recording_id === recordingId.trim());
   const picked = recordings.data?.find((r) => r.recording_id === recordingId.trim());
 
-  // Latest SEALED preselected, not latest outright. The server returns newest
-  // first, so the head of the list is the newest recording — and the newest
-  // recording is always UNSEALED, because sealing waits for the pod to stop
-  // writing plus a quiescence window plus a sealer tick. Preselecting it left
-  // the form in its least useful state: the correlation filter below lists
-  // candidates only for a sealed recording, so the default selection could
-  // never populate it. On the live catalog the first sealed row sat SIXTEEN
-  // rows down, so reaching a usable filter meant scrolling past every
-  // recording still being written.
-  //
-  // Falls back to the head of the list when nothing is sealed, so a fresh
-  // bucket still preselects something rather than nothing. No client-side
-  // re-sort either way: the order is the server's and a local sort could only
-  // disagree with it.
-  //
-  // Runs once — a refetch must not overwrite a choice the caller has since
-  // made, and `?recording=` arrives already set.
+  // The server recommendation is scoped to the selected system. Manual/URL
+  // selections remain authoritative when the system changes.
+  const explicitSelection = React.useRef(
+    Boolean(params.get("recording") || params.get("group")),
+  );
+  const recommendationApplied = React.useRef(explicitSelection.current);
   React.useEffect(() => {
-    // NOT while a deployment day is chosen. Clearing the recording is how
-    // choosing a day makes the two mutually exclusive, and this effect used to
-    // undo that on the very next render — which left `recordingId` populated,
-    // fetched THAT recording's correlation index, and sent its ids as a
-    // `correlation_filter` alongside `recording_group`. The run then drove a
-    // hundred correlations out of one arbitrary pod while reporting itself a
-    // replay of the whole day, and nothing on the page or in the payload said
-    // so.
-    if (recordingGroup.trim() || recordingId.trim() || rows.length === 0) return;
-    const sealed = rows.find((r) => r.sealed === true && (r.correlations ?? 0) > 0);
-    setRecordingId((sealed ?? rows[0]).recording_id);
-  }, [rows, recordingId, recordingGroup]);
+    if (explicitSelection.current) return;
+    setRecordingGroup("");
+    recommendationApplied.current = false;
+  }, [systemUnderTest]);
+  React.useEffect(() => {
+    if (recommendationApplied.current || !available.data) return;
+    recommendationApplied.current = true;
+    const group = recommendedGroup(available.data);
+    if (group) setRecordingGroup(group);
+  }, [available.data]);
+
+  const chooseRecording = React.useCallback((id: string) => {
+    explicitSelection.current = Boolean(id);
+    recommendationApplied.current = true;
+    setRecordingId(id);
+    if (id) setRecordingGroup("");
+  }, []);
 
   // THE ONE PLACE candidate correlations come from. Swapping in the sealed
   // correlations index later is a change to that hook and to nothing here.
@@ -255,6 +250,14 @@ export default function NewRunPage() {
             still sealing is listed as unavailable WITH its reason rather than
             hidden, because a day missing from a list reads as a day that does
             not exist. */}
+        {available.data && available.data.recommendation_state.state !== "ready" && (
+          <p className="scopewarn" role="status">
+            No automatic deployment-day recommendation is available
+            {available.data.recommendation_state.reason
+              ? `: ${available.data.recommendation_state.reason}`
+              : "."} Choose a day manually or use a recording ID.
+          </p>
+        )}
         {days.length > 0 && (
           <div className="dayfield">
             <span className="reclabel">
@@ -279,6 +282,8 @@ export default function NewRunPage() {
                         // Mutually exclusive on the wire: the orchestrator
                         // refuses a payload naming both, so choosing a day
                         // clears the recording rather than leaving both set.
+                        explicitSelection.current = true;
+                        recommendationApplied.current = true;
                         setRecordingGroup(chosen ? "" : d.group);
                         if (!chosen) setRecordingId("");
                       }}
@@ -332,7 +337,11 @@ export default function NewRunPage() {
 
             {recordingGroup.trim() && (
               <p>
-                <button type="button" className="btn" onClick={() => setRecordingGroup("")}>
+                <button type="button" className="btn" onClick={() => {
+                  explicitSelection.current = true;
+                  recommendationApplied.current = true;
+                  setRecordingGroup("");
+                }}>
                   clear the day and pick a single recording
                 </button>
               </p>
@@ -389,7 +398,7 @@ export default function NewRunPage() {
                 type="text"
                 placeholder="run-1785331134782268537"
                 value={recordingId}
-                onChange={(e) => setRecordingId(e.target.value)}
+                onChange={(e) => chooseRecording(e.target.value)}
               />
             </div>
           )}
@@ -410,7 +419,7 @@ export default function NewRunPage() {
                 recordings={rows}
                 catalog={recordings.data}
                 value={recordingId}
-                onChange={setRecordingId}
+                onChange={chooseRecording}
                 truncated={
                   available.data && available.data.total > rows.length
                     ? available.data.total
