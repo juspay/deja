@@ -153,23 +153,20 @@ fn run(cmd: &str, session_id: &str, system: Option<&str>) -> Result<(), String> 
             let rows: Vec<serde_json::Value> = found
                 .iter()
                 .map(|r| {
-                    // Sealed state is one small GET per recording. It is the
-                    // whole point of the listing for a sealing job: the ones
-                    // already sealed are the ones it must not re-read.
                     let manifest = deja_compactor::read_manifest(&cfg, &r.session_id)
-                        .ok()
-                        .flatten();
-                    serde_json::json!({
+                        .map_err(|e| format!("read manifest for {}: {e}", r.session_id))?;
+                    let status = manifest.as_ref().map(|m| m.status.as_str());
+                    Ok(serde_json::json!({
                         "recording_id": r.session_id,
                         "dates": r.dates,
                         "objects": r.objects,
-                        // In full, since it is read beside `bucket`.
                         "prefix": cfg.bucket_key(&r.prefix),
-                        "sealed": manifest.is_some(),
+                        "sealed": status == Some("sealed"),
+                        "status": status,
                         "correlations": manifest.as_ref().map(|m| m.counts.correlations),
-                    })
+                    }))
                 })
-                .collect();
+                .collect::<Result<_, String>>()?;
             print_json(&serde_json::json!({
                 "system": system,
                 "bucket": cfg.bucket,
@@ -190,12 +187,19 @@ fn run(cmd: &str, session_id: &str, system: Option<&str>) -> Result<(), String> 
                 // Nothing new since the seal. A SUCCESS, not a no-op to report as
                 // failure: a cron that treats its own steady state as an error
                 // alerts every time it runs.
-                deja_compactor::SealDecision::AlreadyCurrent { sealed_objects } => {
-                    eprintln!(
-                        "deja-compactor: {session_id} is sealed and current ({sealed_objects} \
-                         landing object(s) covered); nothing to do"
-                    );
+                deja_compactor::SealDecision::AlreadyCurrent { source_objects } => {
                     if let Some(manifest) = existing {
+                        if manifest.status == "empty" {
+                            eprintln!(
+                                "deja-compactor: {session_id} is an empty day and current \
+                                 ({source_objects} source object(s) covered); no tape to replay"
+                            );
+                        } else {
+                            eprintln!(
+                                "deja-compactor: {session_id} is sealed and current ({source_objects} \
+                                 source object(s) covered); nothing to do"
+                            );
+                        }
                         print_json(&manifest);
                     }
                     return Ok(());
@@ -242,11 +246,23 @@ fn run(cmd: &str, session_id: &str, system: Option<&str>) -> Result<(), String> 
                 }
             }
             let manifest = deja_compactor::compact_session(&cfg, session_id, &root)?;
+            if manifest.status == "empty" {
+                eprintln!(
+                    "deja-compactor: {session_id} has no lines assigned to this day; \
+                     published terminal empty manifest"
+                );
+            }
             print_json(&manifest);
             Ok(())
         }
         "compact" => {
             let manifest = deja_compactor::compact_session(&cfg, session_id, &root)?;
+            if manifest.status == "empty" {
+                eprintln!(
+                    "deja-compactor: {session_id} has no lines assigned to this day; \
+                     published terminal empty manifest"
+                );
+            }
             print_json(&manifest);
             Ok(())
         }
@@ -350,8 +366,9 @@ fn run_sealing_pass() -> Result<(), String> {
             )
         };
         eprintln!(
-            "sealer: pass complete — {} sealed, {} already current, {} not ready{refused}",
-            totals.sealed, totals.already_current, totals.not_ready
+            "sealer: pass complete — {} sealed, {} already current, {} not ready, \
+             {} empty days{refused}",
+            totals.sealed, totals.already_current, totals.not_ready, totals.empty_days
         );
         return Ok(());
     }

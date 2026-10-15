@@ -164,7 +164,16 @@ impl<T: KubeTransport> KubeApi<T> {
         };
         self.expect_2xx(self.transport.send(&req)?, name)
     }
-
+    /// GET an Argo Rollout. The rollout's selector identifies its serving pods.
+    pub fn get_rollout(&self, ns: &str, name: &str) -> Result<Value, KubeError> {
+        let req = KubeRequest {
+            method: "GET",
+            path: format!("/apis/argoproj.io/v1alpha1/namespaces/{ns}/rollouts/{name}"),
+            body: None,
+            content_type: None,
+        };
+        self.expect_2xx(self.transport.send(&req)?, name)
+    }
     /// GET a Secret — existence/metadata only, for the pre-launch check that every
     /// secret the copied env references is present. Never reads values: the
     /// candidate resolves them itself via `secretKeyRef` at pod start.
@@ -195,6 +204,48 @@ impl<T: KubeTransport> KubeApi<T> {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default())
+    }
+    /// Ready, non-terminating pod names selected by a workload's matchLabels.
+    pub fn ready_pod_names(&self, ns: &str, workload: &Value) -> Result<Vec<String>, KubeError> {
+        let labels = workload
+            .pointer("/spec/selector/matchLabels")
+            .and_then(Value::as_object)
+            .ok_or_else(|| KubeError::Config("workload has no matchLabels selector".into()))?;
+        if labels.is_empty() {
+            return Err(KubeError::Config(
+                "workload has an empty pod selector".into(),
+            ));
+        }
+        let selector = labels
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|value| format!("{key}={value}"))
+                    .ok_or_else(|| {
+                        KubeError::Config("workload selector value is not a string".into())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
+        let pods = self.list_pods(ns, &selector)?;
+        Ok(pods
+            .iter()
+            .filter(|pod| {
+                pod.pointer("/metadata/deletionTimestamp").is_none()
+                    && pod
+                        .pointer("/status/conditions")
+                        .and_then(Value::as_array)
+                        .is_some_and(|conditions| {
+                            conditions.iter().any(|condition| {
+                                condition.get("type").and_then(Value::as_str) == Some("Ready")
+                                    && condition.get("status").and_then(Value::as_str)
+                                        == Some("True")
+                            })
+                        })
+            })
+            .filter_map(|pod| pod.pointer("/metadata/name")?.as_str().map(str::to_owned))
+            .collect())
     }
 
     /// GET one container's log. Returns plain text, not JSON.
@@ -592,6 +643,44 @@ mod tests {
         assert_eq!(
             seen[0].1,
             "/apis/batch/v1/namespaces/replay-sbx/jobs?labelSelector=deja.run-id"
+        );
+    }
+
+    #[test]
+    fn rollout_serving_pods_use_selector_and_keep_only_ready_nonterminating_pods() {
+        let rollout = json!({
+            "spec": { "selector": { "matchLabels": { "app": "router" } } }
+        });
+        let pods = json!({"items": [
+            {"metadata": {"name": "router-current"}, "status": {
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }},
+            {"metadata": {"name": "router-starting"}, "status": {
+                "conditions": [{"type": "Ready", "status": "False"}]
+            }},
+            {"metadata": {"name": "router-terminating", "deletionTimestamp": "2026-10-14T00:00:00Z"},
+             "status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+        ]});
+        let api = KubeApi::new(FakeTransport::new(vec![resp(200, pods)]));
+        assert_eq!(
+            api.ready_pod_names("sandbox", &rollout)
+                .expect("fixture pod listing succeeds"),
+            vec!["router-current"]
+        );
+        assert_eq!(
+            api.transport.seen.borrow()[0].1,
+            "/api/v1/namespaces/sandbox/pods?labelSelector=app=router"
+        );
+    }
+
+    #[test]
+    fn rollout_reads_from_argoproj_api() {
+        let api = KubeApi::new(FakeTransport::new(vec![resp(200, json!({"spec": {}}))]));
+        api.get_rollout("sandbox", "router")
+            .expect("fixture rollout exists");
+        assert_eq!(
+            api.transport.seen.borrow()[0].1,
+            "/apis/argoproj.io/v1alpha1/namespaces/sandbox/rollouts/router"
         );
     }
 

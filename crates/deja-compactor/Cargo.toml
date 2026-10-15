@@ -15,7 +15,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 # Content address of a seal: two sealers that read the same landing must write
 # the same object keys, and two that read different landings must not share any.
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "time"] }
+deja-store = { path = "../deja-store" }
 zstd = "0.13"
 # The declared configuration (`settings`): systems are declared in one TOML
 # document with `DEJA__*` environment overrides, the convention the router and

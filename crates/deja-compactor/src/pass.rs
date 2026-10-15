@@ -38,6 +38,7 @@
 //! was never planned. That is the equality a silent drop breaks and a failure
 //! count never could.
 
+use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::{Compaction, DynStore, S3Config, SealDecision, SealReadiness, SessionManifest};
@@ -50,8 +51,8 @@ use crate::{Compaction, DynStore, S3Config, SealDecision, SealReadiness, Session
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum Outcome {
-    /// A manifest was written. `resealed` means one already existed and the
-    /// landing had grown past it.
+    /// A replayable manifest was written. `resealed` means an earlier replayable
+    /// tape existed and the source snapshot changed.
     Sealed {
         correlations: usize,
         landing_objects: usize,
@@ -85,12 +86,10 @@ pub enum Outcome {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         instances_without_eof: Vec<String>,
     },
-    /// A seal already covers everything that has landed.
-    AlreadyCurrent { sealed_objects: usize },
-    /// Still being written. Not a drop: the recording is fine and the next
-    /// pass will find it finished.
+    /// The current manifest's source snapshot matches the landing.
+    AlreadyCurrent { source_objects: usize },
+    /// A UTC request-start day still in progress. No daily or bare seal is published.
     NotReady { state: String, objects: usize },
-    /// The landing passed the pass's memory budget while it was being read, so
     /// no seal was attempted. A DROP: this recording will not seal until
     /// either the budget rises or compaction stops holding the whole landing.
     TooLarge {
@@ -107,6 +106,12 @@ pub enum Outcome {
         /// whole shared partition parent's, and this recording may be small.
         shared_prefix: bool,
     },
+    /// A day currently assigned no lines of its own. The terminal empty
+    /// manifest supersedes any previously published tape for this day.
+    EmptyDay {
+        other_day_lines: usize,
+        lines_without_ingress: usize,
+    },
     /// A clean failure — the store, the layout, or the recording's contents. A
     /// DROP, and the message is the whole point of the row.
     Failed { error: String },
@@ -121,6 +126,7 @@ impl Outcome {
             Outcome::AlreadyCurrent { .. } => "already_current",
             Outcome::NotReady { .. } => "not_ready",
             Outcome::TooLarge { .. } => "too_large",
+            Outcome::EmptyDay { .. } => "empty_day",
             Outcome::Failed { .. } => "failed",
         }
     }
@@ -209,8 +215,11 @@ impl std::fmt::Display for Row {
                 }
                 Ok(())
             }
-            Outcome::AlreadyCurrent { sealed_objects } => {
-                write!(f, "already current ({sealed_objects} object(s) covered)")
+            Outcome::AlreadyCurrent { source_objects } => {
+                write!(
+                    f,
+                    "already current ({source_objects} source object(s) covered)"
+                )
             }
             Outcome::NotReady { state, objects } => {
                 write!(f, "not ready ({state}, {objects} object(s))")
@@ -240,6 +249,14 @@ impl std::fmt::Display for Row {
                 }
                 Ok(())
             }
+            Outcome::EmptyDay {
+                other_day_lines,
+                lines_without_ingress,
+            } => write!(
+                f,
+                "empty day — {other_day_lines} line(s) belong to requests assigned elsewhere; \
+                 {lines_without_ingress} are retained without their ingress"
+            ),
             Outcome::Failed { error } => write!(f, "DROPPED failed — {error}"),
         }
     }
@@ -330,8 +347,8 @@ pub struct PassLedger {
     pub roster_error: Option<String>,
 }
 
-/// A pass in numbers. `planned` is EXTRACT's count and the four outcome counts
-/// are LOAD's; they are reported side by side so an imbalance is visible in the
+/// A pass in numbers. `planned` is EXTRACT's count and the outcome counts are
+/// LOAD's; they are reported side by side so an imbalance is visible in the
 /// summary itself rather than only in [`PassLedger::disagreements`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Totals {
@@ -341,6 +358,9 @@ pub struct Totals {
     pub sealed: usize,
     pub already_current: usize,
     pub not_ready: usize,
+    /// Terminal empty day manifests published when selection moves elsewhere.
+    #[serde(default)]
+    pub empty_days: usize,
     /// Refusals plus failures. Kept as the total it always was, so a reader of
     /// the JSON that predates the split still sees every unsealed recording in
     /// the field it already reads.
@@ -368,6 +388,7 @@ impl PassLedger {
                     Outcome::Sealed { .. } => t.sealed += 1,
                     Outcome::AlreadyCurrent { .. } => t.already_current += 1,
                     Outcome::NotReady { .. } => t.not_ready += 1,
+                    Outcome::EmptyDay { .. } => t.empty_days += 1,
                     Outcome::TooLarge { .. } => {
                         t.dropped += 1;
                         t.refused += 1;
@@ -502,12 +523,42 @@ pub(crate) async fn seal_one_in(
     quiet_after_secs: u64,
     max_landing_bytes: Option<u64>,
 ) -> Row {
-    let outcome = seal_outcome_in(
+    seal_one_indexed_in(
+        store,
+        system,
+        recording_id,
+        root,
+        "",
+        quiet_after_secs,
+        max_landing_bytes,
+        None,
+        "",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn seal_one_indexed_in(
+    store: &DynStore,
+    system: &str,
+    recording_id: &str,
+    root: &str,
+    scope_root: &str,
+    quiet_after_secs: u64,
+    max_landing_bytes: Option<u64>,
+    index: Option<&deja_store::Store>,
+    bucket: &str,
+) -> Row {
+    let outcome = seal_outcome_indexed_in(
         store,
         recording_id,
         root,
+        scope_root,
         quiet_after_secs,
         max_landing_bytes,
+        index,
+        system,
+        bucket,
     )
     .await
     .unwrap_or_else(|error| Outcome::Failed { error });
@@ -518,21 +569,39 @@ pub(crate) async fn seal_one_in(
     }
 }
 
-/// The one place a `?` becomes a named drop. Everything above it is total.
-async fn seal_outcome_in(
+#[allow(clippy::too_many_arguments)]
+async fn seal_outcome_indexed_in(
     store: &DynStore,
     recording_id: &str,
     root: &str,
+    scope_root: &str,
     quiet_after_secs: u64,
     max_landing_bytes: Option<u64>,
+    index: Option<&deja_store::Store>,
+    system: &str,
+    bucket: &str,
 ) -> Result<Outcome, String> {
-    let existing = crate::manifest_of(store, recording_id).await?;
+    let mut cfg = S3Config::from_env();
+    cfg.bucket = bucket.to_owned();
+    let recording_day = crate::day::split_recording_id(recording_id);
+    if let Some(day) = recording_day.day {
+        let current_utc_day = crate::day::current_utc_day(std::time::SystemTime::now())?;
+        if !crate::day::day_has_ended(day, &current_utc_day)? {
+            return Ok(Outcome::NotReady {
+                state: "day_in_progress".to_owned(),
+                objects: 0,
+            });
+        }
+    }
+    let existing = if index.is_some() && recording_day.day.is_some() {
+        None
+    } else {
+        crate::manifest_of(store, recording_id).await?
+    };
     let readiness = crate::readiness_of(store, recording_id, root, quiet_after_secs).await?;
-    // The decision stays in `seal_decision`: a pass that re-derived it would be
-    // a second spelling of the rule the CLI applies, and the two would drift.
     let resealed = match crate::seal_decision(existing.as_ref(), &readiness) {
-        SealDecision::AlreadyCurrent { sealed_objects } => {
-            return Ok(Outcome::AlreadyCurrent { sealed_objects });
+        SealDecision::AlreadyCurrent { source_objects } => {
+            return Ok(Outcome::AlreadyCurrent { source_objects });
         }
         SealDecision::NotReady => {
             return Ok(Outcome::NotReady {
@@ -542,16 +611,51 @@ async fn seal_outcome_in(
         }
         SealDecision::Seal { resealing } => resealing,
     };
-    match crate::compact_session_inner(store, recording_id, root, max_landing_bytes).await? {
+    if let Some(db) = index {
+        if let Some(day) = crate::day::split_recording_id(recording_id).day {
+            let session_id = crate::day::split_recording_id(recording_id).session_id;
+            crate::materialize_indexed_days_scoped(
+                store,
+                bucket,
+                system,
+                root,
+                scope_root,
+                session_id,
+                max_landing_bytes,
+                db,
+            )
+            .await?;
+            let scope = deja_store::LandingScope {
+                system: system.to_owned(),
+                bucket: bucket.to_owned(),
+                root: scope_root.to_owned(),
+                session_id: session_id.to_owned(),
+            };
+            let view = db
+                .day_view_head(&scope, day)
+                .await
+                .map_err(|_| format!("read published day head {day} failed"))?
+                .ok_or_else(|| format!("day {day} has no current published head"))?;
+            let manifest: SessionManifest = serde_json::from_value(view.manifest)
+                .map_err(|e| format!("decode published day manifest: {e}"))?;
+            if manifest.status == "empty" {
+                return Ok(Outcome::EmptyDay {
+                    other_day_lines: manifest.counts.other_day_lines,
+                    lines_without_ingress: manifest.counts.lines_without_ingress,
+                });
+            }
+            return Ok(sealed_outcome(&manifest, resealed, &readiness, 0, 0, false));
+        }
+    }
+    let compacted =
+        crate::compact_session_inner(store, recording_id, root, max_landing_bytes).await?;
+    match compacted {
         Compaction::Sealed {
-            // The pass does not act on it yet; the sealer's own line already
-            // carries the warning. Named so the match is exhaustive rather
-            // than silently widening later.
-            merge: _,
             manifest,
             landing_bytes_read,
             landing_bytes_fetched,
             shared_prefix,
+            ..
         } => Ok(sealed_outcome(
             &manifest,
             resealed,
@@ -574,6 +678,17 @@ async fn seal_outcome_in(
             objects_read,
             objects_total,
             shared_prefix,
+        }),
+        Compaction::RefusedSourceIncomplete { day, .. } => Ok(Outcome::Failed {
+            error: format!("day {day} has correlated records with no ingress; no seal was written"),
+        }),
+        Compaction::EmptyDay {
+            other_day_lines,
+            lines_without_ingress,
+            ..
+        } => Ok(Outcome::EmptyDay {
+            other_day_lines,
+            lines_without_ingress,
         }),
     }
 }
@@ -625,6 +740,7 @@ fn readiness_state(readiness: &SealReadiness) -> &'static str {
 /// could never be re-sealed by the cron, and the code that handles it had no
 /// caller. Deciding in `seal_decision` instead of in the query is the same
 /// principle the CronJob's own comment stated and the `jq` filter broke.
+#[cfg(test)]
 pub(crate) async fn plan_in(store: &DynStore, root: &str) -> Result<Vec<String>, String> {
     let keys: Vec<String> = crate::list_keys(store, root)
         .await?
@@ -636,23 +752,44 @@ pub(crate) async fn plan_in(store: &DynStore, root: &str) -> Result<Vec<String>,
     // Sealing does not need to tell "not sealed" from "could not tell": either
     // way there is a seal to attempt, so both plan the recording the same way
     // the collapsed shape used to.
-    let manifests = crate::manifests_of(store, &ids)
-        .await
-        .into_iter()
-        .map(|r| r.ok().flatten());
-    Ok(landed
-        .into_iter()
-        .zip(manifests)
-        .filter(|(rec, manifest)| match manifest {
-            None => true,
-            Some(m) => rec.objects > m.counts.landing_objects,
-        })
-        .map(|(rec, _)| rec.session_id)
-        .collect())
+    let manifests = crate::manifests_of(store, &ids).await;
+    let mut planned = Vec::new();
+    for (rec, manifest) in landed.into_iter().zip(manifests) {
+        match manifest {
+            Err(error) => {
+                return Err(format!(
+                    "read existing manifest for {}: {error}",
+                    rec.session_id
+                ));
+            }
+            Ok(None) => planned.push(rec.session_id),
+            Ok(Some(m)) => {
+                let dependency_objects = crate::day::split_recording_id(&rec.session_id)
+                    .day
+                    .map_or(0, |day| {
+                        keys.iter()
+                            .filter(|key| {
+                                crate::key_names_session(
+                                    key,
+                                    crate::day::split_recording_id(&rec.session_id).session_id,
+                                ) && crate::key_date(key).is_some_and(|date| date != day)
+                            })
+                            .count()
+                    });
+                if rec.objects != m.counts.landing_objects
+                    || dependency_objects != m.counts.day_dependency_objects
+                {
+                    planned.push(rec.session_id);
+                }
+            }
+        }
+    }
+    Ok(planned)
 }
 
 /// One system's pass, isolated: anything that goes wrong here is recorded in
 /// this system's ledger and never propagated to the walk.
+#[cfg(test)]
 pub(crate) async fn seal_system_in(
     store: &DynStore,
     system: &str,
@@ -758,20 +895,220 @@ fn seal_system(
         Ok(store) => store,
         Err(error) => return unreachable(error),
     };
-    let rt = match crate::runtime() {
-        Ok(rt) => rt,
+    let runtime = match crate::runtime() {
+        Ok(runtime) => runtime,
         Err(error) => return unreachable(error),
     };
-    rt.block_on(seal_system_in(
-        &store,
-        system,
-        &root,
-        quiet_after_secs,
-        max_landing_bytes,
-        observe,
-    ))
+    let db_url = match std::env::var("DEJA_DB_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+    {
+        Some(url) => url,
+        None => return unreachable("DEJA_DB_URL is required for durable day indexing".to_owned()),
+    };
+    let db = match runtime.block_on(deja_store::Store::connect(&db_url)) {
+        Ok(db) => db,
+        Err(_) => return unreachable("connect durable index failed".to_owned()),
+    };
+    runtime.block_on(async {
+        let current_utc_day = match crate::day::current_utc_day(std::time::SystemTime::now()) {
+            Ok(day) => day,
+            Err(error) => return unreachable(error),
+        };
+        let scope_root = cfg.bucket_key(&root);
+        let known_generations = match db.active_landing_session_generations(system, &cfg.bucket, &scope_root).await {
+            Ok(generations) => generations,
+            Err(error) => return unreachable(format!("read indexed sessions before S3 LIST: {error}")),
+        };
+        let prefix = object_store::path::Path::from(root.as_str());
+        let metas: Vec<object_store::ObjectMeta> = match store.list(Some(&prefix)).try_collect().await {
+            Ok(metas) => metas,
+            Err(error) => return unreachable(format!("list system landing {root}: {error}")),
+        };
+        let keys: Vec<String> = metas.iter().map(|meta| meta.location.as_ref().to_owned()).collect();
+        let timestamps: std::collections::BTreeMap<&str, i64> = metas.iter().map(|meta| {
+            (meta.location.as_ref(), meta.last_modified.timestamp())
+        }).collect();
+        let mut sessions: std::collections::BTreeSet<String> = crate::index_landed_keys(&root, &keys)
+            .into_iter()
+            .map(|recording| {
+                crate::day::split_recording_id(&recording.session_id)
+                    .session_id
+                    .to_owned()
+            })
+            .collect();
+        sessions.extend(known_generations.keys().cloned());
+        let mut ledger = SystemLedger {
+            system: system.to_owned(),
+            ..SystemLedger::default()
+        };
+        // A session absent from S3 remains in the indexed set until this pass
+        // records its source deletion; it must not retain a falsely current head.
+        for session in sessions {
+            let (scope, days, fingerprints) = match crate::index_landing_session_from_listing(
+                &store,
+                &cfg.bucket,
+                system,
+                &scope_root,
+                &session,
+                max_landing_bytes,
+                &db,
+                &metas,
+                known_generations.get(&session).copied(),
+            )
+            .await
+            {
+                Ok(indexed) => indexed,
+                Err(error) => {
+                    let row = failed_row(system, &session, error);
+                    observe(&row);
+                    ledger.planned.push(session);
+                    ledger.rows.push(row);
+                    continue;
+                }
+            };
+            if !metas.iter().any(|meta| crate::key_names_session(meta.location.as_ref(), &session)) {
+                let row = failed_row(
+                    system,
+                    &session,
+                    "all raw source objects for this indexed session disappeared; current day views are unavailable".into(),
+                );
+                observe(&row);
+                ledger.planned.push(session);
+                ledger.rows.push(row);
+                continue;
+            }
+            if days.is_empty() {
+                let row = failed_row(
+                    system,
+                    &session,
+                    "no indexed UTC request-start day; refuse an unbounded whole-session seal"
+                        .to_owned(),
+                );
+                observe(&row);
+                ledger.planned.push(session);
+                ledger.rows.push(row);
+                continue;
+            }
+            for day in &days {
+                let id = crate::day::day_recording_id(&session, &day.day);
+                let ended = match crate::day::day_has_ended(&day.day, &current_utc_day) {
+                    Ok(ended) => ended,
+                    Err(error) => {
+                        let row = failed_row(system, &id, format!("check day cutoff: {error}"));
+                        observe(&row);
+                        ledger.planned.push(id);
+                        ledger.rows.push(row);
+                        continue;
+                    }
+                };
+                if !ended {
+                    ledger.planned.push(id.clone());
+                    let row = Row {
+                        system: system.to_owned(),
+                        recording_id: id,
+                        outcome: Outcome::NotReady {
+                            state: "day_in_progress".to_owned(),
+                            objects: day.object_keys.len(),
+                        },
+                    };
+                    observe(&row);
+                    ledger.rows.push(row);
+                    continue;
+                }
+                let current = match db.day_view_head(&scope, &day.day).await {
+                    Ok(current) => current,
+                    Err(error) => {
+                        let id = crate::day::day_recording_id(&session, &day.day);
+                        let row =
+                            failed_row(system, &id, format!("read indexed day head: {error}"));
+                        observe(&row);
+                        ledger.planned.push(id);
+                        ledger.rows.push(row);
+                        continue;
+                    }
+                };
+                if current
+                    .as_ref()
+                    .is_some_and(|view| view.dependency_token == day.dependency_token)
+                {
+                    continue;
+                }
+                ledger.planned.push(id.clone());
+                let outcome = async {
+                    let newest = {
+                        let mut newest = 0;
+                        for key in &day.object_keys {
+                            let timestamp = timestamps.get(key.as_str())
+                                .ok_or_else(|| format!("indexed day dependency {key} disappeared from the source listing"))?;
+                            newest = newest.max(*timestamp);
+                        }
+                        newest
+                    };
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_err(|e| format!("clock before Unix epoch: {e}"))?
+                        .as_secs() as i64;
+                    if now.saturating_sub(newest).max(0) < quiet_after_secs as i64 {
+                        return Ok(Outcome::NotReady {
+                            state: "active".to_owned(),
+                            objects: day.object_keys.len(),
+                        });
+                    }
+                    let resealed = db.has_day_view_history(&scope, &day.day).await
+                        .map_err(|e| format!("read prior day-view history: {e}"))?;
+                    let eligible = std::iter::once(day.day.clone()).collect();
+                    let (written, bytes_read, bytes_fetched) = crate::materialize_indexed_days_from_index(
+                        &store,
+                        max_landing_bytes,
+                        &db,
+                        &scope,
+                        &days,
+                        &fingerprints,
+                        &eligible,
+                    )
+                    .await?;
+                    if written == 0 {
+                        return Err(format!("day {} source changed during publication", day.day));
+                    }
+                    let view = db
+                        .day_view_head(&scope, &day.day)
+                        .await
+                        .map_err(|e| format!("read published day head: {e}"))?
+                        .ok_or_else(|| format!("published day {} is not current", day.day))?;
+                    let manifest: SessionManifest = serde_json::from_value(view.manifest)
+                        .map_err(|e| format!("decode published day manifest: {e}"))?;
+                    if manifest.status == "empty" {
+                        Ok(Outcome::EmptyDay {
+                            other_day_lines: manifest.counts.other_day_lines,
+                            lines_without_ingress: manifest.counts.lines_without_ingress,
+                        })
+                    } else {
+                        Ok(Outcome::Sealed {
+                            correlations: manifest.counts.correlations,
+                            landing_objects: manifest.counts.landing_objects,
+                            landing_bytes_read: bytes_read,
+                            landing_bytes_fetched: bytes_fetched,
+                            shared_prefix: false,
+                            resealed,
+                            instances_without_eof: Vec::new(),
+                        })
+                    }
+                }
+                .await
+                .unwrap_or_else(|error: String| Outcome::Failed { error });
+                let row = Row {
+                    system: system.to_owned(),
+                    recording_id: id,
+                    outcome,
+                };
+                observe(&row);
+                ledger.rows.push(row);
+            }
+        }
+        ledger
+    })
 }
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1450,5 +1787,456 @@ mod tests {
         }
         assert!(!row.outcome.is_drop());
         assert!(block(crate::manifest_of(&store, "r1")).unwrap().is_none());
+    }
+
+    /// 2026-10-07T23:59:58Z and 2026-10-08T00:00:03Z, in nanoseconds.
+    const BEFORE_MIDNIGHT: u64 = 1_791_417_598_000_000_000;
+    const AFTER_MIDNIGHT: u64 = 1_791_417_603_000_000_000;
+
+    fn timed(session: &str, gseq: u64, corr: &str, rseq: u64, ns: u64) -> String {
+        format!(
+            r#"{{"schema_version":2,"artifact_type":"deja_artifact_record","instance_id":"i1","capture":{{"mode":"session","session_id":"{session}"}},"code":{{"sha":"abc","deja_version":"0.1.0"}},"event":{{"recording_run_id":"{session}","global_sequence":{gseq},"request_sequence":{rseq},"correlation_id":"{corr}","boundary":"b","timestamp_ns":{ns}}}}}"#
+        )
+    }
+
+    fn correlations_of(store: &DynStore, id: &str) -> Vec<String> {
+        let manifest = block(crate::manifest_of(store, id)).unwrap().unwrap();
+        let lines = block(crate::session_lines(store, &manifest)).unwrap();
+        let mut out: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                format!(
+                    "{}#{}",
+                    v["event"]["correlation_id"].as_str().unwrap(),
+                    v["event"]["global_sequence"]
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn an_unended_day_waits_while_a_previous_day_can_reseal() {
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let store = store();
+        let now = SystemTime::now();
+        let unended = crate::day::current_utc_day(now + Duration::from_secs(172_800)).unwrap();
+        let previous = crate::day::current_utc_day(now - Duration::from_secs(172_800)).unwrap();
+        let previous_ns = u64::try_from(
+            (now - Duration::from_secs(172_800))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+        let now_ns = u64::try_from(now.duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+        let future_ns = u64::try_from(
+            (now + Duration::from_secs(172_800))
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        )
+        .unwrap();
+
+        land_dated(
+            &store,
+            &unended,
+            "active",
+            0,
+            &[timed("active", 0, "new", 0, future_ns)],
+        );
+        let active_id = crate::day::day_recording_id("active", &unended);
+        let row = block(seal_one_in(&store, "sys", &active_id, ROOT, 0, None));
+        assert!(
+            matches!(row.outcome, Outcome::NotReady { ref state, .. } if state == "day_in_progress")
+        );
+        assert!(block(crate::manifest_of(&store, &active_id))
+            .unwrap()
+            .is_none());
+        let day_override = block(crate::compact_session_inner(&store, &active_id, ROOT, None))
+            .expect_err("manual compaction cannot publish an unended day");
+        assert!(day_override.contains("still in progress"), "{day_override}");
+        let bare_override = block(crate::compact_session_inner(&store, "active", ROOT, None))
+            .expect_err("bare whole-session override cannot publish an unended partition");
+        assert!(
+            bare_override.contains("still in progress"),
+            "{bare_override}"
+        );
+        assert!(block(crate::manifest_of(&store, "active"))
+            .unwrap()
+            .is_none());
+
+        // Partition date is not ingress date. A bare override cannot use an
+        // old `dt=` directory to publish an unfinished request-start day.
+        land_dated(
+            &store,
+            &previous,
+            "misplaced",
+            0,
+            &[timed("misplaced", 0, "future", 0, future_ns)],
+        );
+        let mismatched = block(crate::compact_session_inner(
+            &store,
+            "misplaced",
+            ROOT,
+            None,
+        ))
+        .expect_err("bare compaction must inspect the recorded ingress day");
+        assert!(mismatched.contains("request-start day"), "{mismatched}");
+        assert!(block(crate::manifest_of(&store, "misplaced"))
+            .unwrap()
+            .is_none());
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&timed("legacy-dated", 0, "future", 0, future_ns)).unwrap();
+        let event = legacy["event"].as_object_mut().unwrap();
+        event.remove("request_sequence");
+        event.remove("timestamp_ns");
+        event.insert(
+            "started_at_unix_nanos".to_owned(),
+            serde_json::json!(future_ns),
+        );
+        land_dated(&store, &previous, "legacy-dated", 0, &[legacy.to_string()]);
+        let legacy_error = block(crate::compact_session_inner(
+            &store,
+            "legacy-dated",
+            ROOT,
+            None,
+        ))
+        .expect_err("legacy timestamp in an older partition must not publish early");
+        assert!(legacy_error.contains("request-start day"), "{legacy_error}");
+
+        land_dated(
+            &store,
+            &previous,
+            "older",
+            0,
+            &[timed("older", 0, "prior", 0, previous_ns)],
+        );
+        let older_id = crate::day::day_recording_id("older", &previous);
+        let first = block(seal_one_in(&store, "sys", &older_id, ROOT, 0, None));
+        assert!(matches!(first.outcome, Outcome::Sealed { .. }));
+        land_dated(
+            &store,
+            &unended,
+            "older",
+            1,
+            &[timed("older", 1, "prior", 1, now_ns)],
+        );
+        let revised = block(seal_one_in(&store, "sys", &older_id, ROOT, 0, None));
+        assert!(matches!(
+            revised.outcome,
+            Outcome::Sealed { resealed: true, .. }
+        ));
+        assert_eq!(correlations_of(&store, &older_id), ["prior#0", "prior#1"]);
+    }
+
+    /// A pod's session runs across midnight. The pass seals it as two days,
+    /// each holding the requests that BEGAN on it — the one in flight at
+    /// midnight goes whole into the earlier day, tail included — and the next
+    /// pass has nothing left to plan.
+    #[test]
+    fn a_session_across_midnight_seals_as_one_recording_per_day() {
+        let store = store();
+        land_dated(
+            &store,
+            "2026-10-07",
+            "s1",
+            0,
+            &[
+                timed("s1", 0, "c0", 0, BEFORE_MIDNIGHT - 60_000_000_000),
+                timed("s1", 1, "c1", 0, BEFORE_MIDNIGHT),
+            ],
+        );
+        land_dated(
+            &store,
+            "2026-10-08",
+            "s1",
+            1,
+            &[
+                timed("s1", 2, "c2", 0, AFTER_MIDNIGHT),
+                timed("s1", 3, "c1", 1, AFTER_MIDNIGHT),
+                timed("s1", 4, "c2", 1, AFTER_MIDNIGHT),
+            ],
+        );
+
+        let ledger = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+        assert_eq!(ledger.planned, ["s1.2026-10-08", "s1.2026-10-07"]);
+        assert!(ledger.disagreements().is_empty());
+        assert!(
+            ledger
+                .rows
+                .iter()
+                .all(|r| matches!(r.outcome, Outcome::Sealed { .. })),
+            "{:?}",
+            ledger.rows
+        );
+
+        assert_eq!(
+            correlations_of(&store, "s1.2026-10-07"),
+            ["c0#0", "c1#1", "c1#3"],
+            "the request in flight at midnight is sealed whole with the day it began"
+        );
+        assert_eq!(correlations_of(&store, "s1.2026-10-08"), ["c2#2", "c2#4"]);
+
+        let earlier = block(crate::manifest_of(&store, "s1.2026-10-07"))
+            .unwrap()
+            .unwrap();
+        let later = block(crate::manifest_of(&store, "s1.2026-10-08"))
+            .unwrap()
+            .unwrap();
+        // Every input line across all listed partitions is kept or explicitly
+        // attributed to another day/request with no visible ingress.
+        let named = |c: &crate::Counts| (c.lines_in, c.other_day_lines, c.lines_without_ingress);
+        assert_eq!(named(&earlier.counts), (3, 2, 0));
+        assert_eq!(named(&later.counts), (2, 3, 0));
+        // A day's own partition is its landing; the next one is only read.
+        assert_eq!(earlier.counts.landing_objects, 1);
+        assert_eq!(later.counts.landing_objects, 1);
+        // gseq 2 is the later day's and 3 is the earlier day's: neither is a
+        // hole in the other.
+        assert!(
+            earlier.instances[0].gaps.is_empty(),
+            "{:?}",
+            earlier.instances
+        );
+        assert!(later.instances[0].gaps.is_empty(), "{:?}", later.instances);
+        assert!(block(crate::manifest_of(&store, "s1")).unwrap().is_none());
+
+        let again = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+        assert!(again.planned.is_empty(), "{:?}", again.planned);
+        // A request has no duration bound: a late tail may arrive several
+        // partitions after its ingress. The old day's manifest must be
+        // reconsidered from the dependency partition count and refreshed.
+        land_dated(
+            &store,
+            "2026-10-09",
+            "s1",
+            2,
+            &[timed("s1", 5, "c1", 2, AFTER_MIDNIGHT + 86_400_000_000_000)],
+        );
+        let planned = block(plan_in(&store, ROOT)).unwrap();
+        assert!(planned.contains(&"s1.2026-10-07".to_owned()), "{planned:?}");
+        let update = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+        assert!(
+            update.rows.iter().any(|r| {
+                r.recording_id == "s1.2026-10-07"
+                    && matches!(r.outcome, Outcome::Sealed { resealed: true, .. })
+            }),
+            "{:?}",
+            update.rows
+        );
+        assert_eq!(
+            correlations_of(&store, "s1.2026-10-07"),
+            ["c0#0", "c1#1", "c1#3", "c1#5"]
+        );
+    }
+
+    /// A day whose partition holds only a tail publishes a terminal empty
+    /// manifest, so later readers cannot replay a previously assigned stale tape.
+    #[test]
+    fn a_day_holding_only_anothers_tail_is_named_not_dropped() {
+        let store = store();
+        land_dated(
+            &store,
+            "2026-10-07",
+            "s1",
+            0,
+            &[timed("s1", 0, "c1", 0, BEFORE_MIDNIGHT)],
+        );
+        land_dated(
+            &store,
+            "2026-10-08",
+            "s1",
+            1,
+            &[timed("s1", 1, "c1", 1, AFTER_MIDNIGHT)],
+        );
+
+        let ledger = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+        let row = |id: &str| {
+            &ledger
+                .rows
+                .iter()
+                .find(|r| r.recording_id == id)
+                .unwrap()
+                .outcome
+        };
+        assert_eq!(
+            row("s1.2026-10-08"),
+            &Outcome::EmptyDay {
+                other_day_lines: 2,
+                lines_without_ingress: 0
+            }
+        );
+        assert!(!row("s1.2026-10-08").is_drop());
+        assert!(matches!(row("s1.2026-10-07"), Outcome::Sealed { .. }));
+        assert_eq!(correlations_of(&store, "s1.2026-10-07"), ["c1#0", "c1#1"]);
+        let empty = block(crate::manifest_of(&store, "s1.2026-10-08"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.status, "empty");
+        assert!(empty.data_parts.is_empty());
+        assert_eq!(empty.counts.correlations, 0);
+        let again = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+        assert!(again.planned.is_empty(), "{:?}", again.planned);
+        land_dated(
+            &store,
+            "2026-10-08",
+            "s1",
+            2,
+            &[timed("s1", 2, "c2", 0, AFTER_MIDNIGHT)],
+        );
+        let reopened = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+        assert!(matches!(
+            reopened
+                .rows
+                .iter()
+                .find(|r| r.recording_id == "s1.2026-10-08")
+                .unwrap()
+                .outcome,
+            Outcome::Sealed { .. }
+        ));
+        let reopened = block(crate::manifest_of(&store, "s1.2026-10-08"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.status, "sealed");
+        assert_eq!(correlations_of(&store, "s1.2026-10-08"), ["c2#2"]);
+    }
+
+    #[test]
+    fn late_ingress_unblocks_days_without_publishing_an_orphan_tape() {
+        for include_day_two_tail in [false, true] {
+            let store = store();
+            land_dated(
+                &store,
+                "2026-10-07",
+                "s1",
+                0,
+                &[timed("s1", 0, "c0", 0, BEFORE_MIDNIGHT)],
+            );
+            land_dated(
+                &store,
+                "2026-10-08",
+                "s1",
+                1,
+                &[timed("s1", 1, "orphan", 1, AFTER_MIDNIGHT)],
+            );
+            if include_day_two_tail {
+                land_dated(
+                    &store,
+                    "2026-10-09",
+                    "s1",
+                    2,
+                    &[timed(
+                        "s1",
+                        3,
+                        "orphan",
+                        2,
+                        AFTER_MIDNIGHT + 86_400_000_000_000,
+                    )],
+                );
+            }
+            let initial = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+            for day in ["2026-10-07", "2026-10-08"] {
+                let id = format!("s1.{day}");
+                let outcome = &initial
+                    .rows
+                    .iter()
+                    .find(|row| row.recording_id == id)
+                    .expect("orphan day was accounted for")
+                    .outcome;
+                assert!(
+                    matches!(outcome, Outcome::Failed { error } if error.contains("no ingress"))
+                );
+                assert!(block(crate::manifest_of(&store, &id)).unwrap().is_none());
+            }
+
+            land_dated(
+                &store,
+                "2026-10-07",
+                "s1",
+                2,
+                &[timed("s1", 2, "orphan", 0, BEFORE_MIDNIGHT)],
+            );
+            let revised = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+            assert!(revised.disagreements().is_empty());
+            assert!(matches!(
+                revised
+                    .rows
+                    .iter()
+                    .find(|r| r.recording_id == "s1.2026-10-08")
+                    .unwrap()
+                    .outcome,
+                Outcome::EmptyDay { .. }
+            ));
+            let empty = block(crate::manifest_of(&store, "s1.2026-10-08"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(empty.status, "empty");
+            assert!(empty.data_parts.is_empty());
+            assert_eq!(empty.counts.correlations, 0);
+            assert!(block(crate::session_lines(&store, &empty))
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    /// Dependency snapshots cover every non-own partition while readiness
+    /// remains based only on the day's own partition.
+    #[test]
+    fn a_days_readiness_counts_only_its_own_partition() {
+        let store = store();
+        land_dated(
+            &store,
+            "2026-10-07",
+            "s1",
+            0,
+            &[timed("s1", 0, "c1", 0, BEFORE_MIDNIGHT)],
+        );
+        land_dated(
+            &store,
+            "2026-10-08",
+            "s1",
+            1,
+            &[timed("s1", 1, "c2", 0, AFTER_MIDNIGHT)],
+        );
+        land_dated(
+            &store,
+            "2026-10-08",
+            "s1",
+            2,
+            &[timed("s1", 2, "c3", 0, AFTER_MIDNIGHT)],
+        );
+        let readiness = block(crate::readiness_of(&store, "s1.2026-10-07", ROOT, 0)).unwrap();
+        assert_eq!(readiness.objects(), 1, "{readiness:?}");
+        assert_eq!(readiness.dependency_objects(), 2, "{readiness:?}");
+        let readiness = block(crate::readiness_of(&store, "s1.2026-10-08", ROOT, 0)).unwrap();
+        assert_eq!(readiness.objects(), 2, "{readiness:?}");
+        assert_eq!(readiness.dependency_objects(), 1, "{readiness:?}");
+        assert_eq!(
+            block(crate::readiness_of(&store, "s1.2026-10-09", ROOT, 0)).unwrap(),
+            SealReadiness::Absent,
+            "a day the session never wrote is not there"
+        );
+    }
+
+    /// A session within one partition keeps its bare id, so every recording
+    /// sealed before days were split still reads, and is not sealed again.
+    #[test]
+    fn a_session_within_one_day_keeps_its_id() {
+        let store = store();
+        land_dated(
+            &store,
+            "2026-10-07",
+            "s1",
+            0,
+            &[timed("s1", 0, "c1", 0, BEFORE_MIDNIGHT)],
+        );
+        let ledger = block(seal_system_in(&store, "sys", ROOT, 0, None, &mut |_| {}));
+        assert_eq!(ledger.planned, ["s1"]);
+        assert!(block(crate::manifest_of(&store, "s1")).unwrap().is_some());
     }
 }

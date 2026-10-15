@@ -52,6 +52,124 @@ Use one orchestrator writer per `HARNESS_STATE_DIR`: baseline re-points and
 push-back events that rewrite a run record share an in-process lock, so a late
 recording event cannot restore an older baseline. The lock is not distributed.
 
+## Scheduled recording sealer
+
+The chart's independent sealer CronJob runs `deja-compactor pass` every 30
+minutes (`Forbid`, 1,500-second deadline), separate from any router restart.
+It scans each declared system's S3 landing and indexes object fingerprints,
+request ingress days, and source dependencies in the same Postgres database as
+the orchestrator (`DEJA_DB_URL` is required). A long-lived pod contributes to
+multiple UTC request-start-day views without rotating its session ID. The S3
+`dt=` prefix locates raw objects; it does not decide request day. A cross-midnight
+tail belongs to the request's ingress day, even if it arrives several partitions
+later. Missing ingress refuses an exact day seal instead of assigning a guessed
+date. Indexed day manifests have immutable database revisions and a transactional
+current head; old whole-session `sessions/v1` manifests remain readable.
+Same-count object replacement invalidates the affected source snapshot. Raw
+source deletion marks the session incomplete and refuses a partial reseal; old
+pinned day revisions remain readable until their immutable S3 parts expire.
+
+A request-start day is eligible for publication only once its UTC calendar day
+has ended: the first possible pass is on the following UTC day, subject to the
+existing source-quietness check. The pass still indexes today's raw objects,
+but records `day_in_progress` rather than publishing a thin same-day seal.
+Manual compaction of a dated current-day recording is refused too; a bare
+recording's request-start dates are checked against its envelopes rather than
+trusted from its `dt=` partitions. A late tail arriving today can still create
+a new immutable revision of an earlier day.
+The recommendation ignores older same-day seals until that day ends. This
+prevents premature selection, but a completed day with little traffic still
+does not establish coverage of a PR's changed path.
+
+Earlier draft smoke (before the Postgres index) against disposable MinIO plus API:
+initial D7/D8 pass sealed both; a later D9 tail for D7 caused reseal (seal ID
+`7a52560118d34354` → `8a404437ea48ee45`, events 1 → 2), D9 published a
+terminal empty marker, and the next pass planned zero. In another session, a
+late D7 ingress replaced D8's orphan-tail seal with an empty manifest (no parts)
+and resealed D7 at three events. API checks returned D7 total 1/events 2 and an
+empty group total 0; bare replay split and empty replay were refused. Grouped
+replay persisted `recording_group` and ingested its member seal, but synthetic
+tape lookup rendering failed (`trait_name` missing). Corrupt manifest returned
+HTTP 502. This is local evidence only: no live sandbox smoke or deployment.
+Separately, a terminal empty manifest in a named system's prefixed bucket
+returned HTTP 200 from `/recordings/{id}/correlations` with `status=empty`,
+zero correlations; the same ID in the wrong system returned HTTP 404.
+
+Indexed local smoke against disposable MinIO and Postgres (not a deployment):
+one unchanged Hyperswitch pod yielded D7/D8 seals and a no-change pass planned
+zero; a D9 object carrying a late D8 tail resealed D8 while Prism's separate
+bucket remained unchanged. Replacing one D8 object under the same key/count
+changed the seal. An ingress timestamp on D8 stored under physical `dt=D9`
+produced the D8 view. Actual HTTP `/available?group=…` returned only that
+group's member; grouped replay ingested its pinned immutable seal, then the
+synthetic fixture failed lookup rendering for missing `trait_name` (no full
+replay claim). Deleting a previously indexed raw object marked that session
+incomplete, removed its current group, and retained a separately admitted
+Prism run's historical seal through `/runs/{id}/recording-snapshot`.
+Additional local checks: two concurrent passes over one new Prism day produced
+one immutable database revision; a stale source listing was rejected after
+another worker indexed an object; and removing the final raw object tombstoned
+its current view while retaining the historical seal. An indexed day and a
+legacy whole-session member in the same saved `revision-MMDD` group replayed
+once each, while a legacy-only group still ingested its S3 seal with Postgres
+unavailable. A prefixed Prism bucket sealed and ingested from its own root.
+The UI was rendered in Chromium; without a sandbox Kubernetes context it
+correctly displayed the recommendation as unavailable rather than guessing
+an active deployment. No live rollout/rollback was exercised.
+
+Follow-up local HTTP smoke with disposable Postgres and tmpfs-backed MinIO:
+`/recordings/{id}/correlations` returned the current indexed day's seal-specific
+sidecar (HTTP 200, `status=sealed`, one correlation). After the source was marked
+incomplete, the same request returned `status=unsealed` despite an old S3
+manifest and sidecar remaining; a separate legacy-only day still returned its
+S3 correlation index as sealed. The real-Postgres regression also confirms
+that an orphan-only source object blocks day publication and hides existing
+current heads until another object supplies its ingress. No Kubernetes
+recommendation or full stage-two replay was exercised by this smoke.
+
+A separate real `deja-compactor pass` smoke with disposable Postgres and MinIO
+indexed a D14 request and a D15 request in one session on D15. It sealed D14
+and reported D15 as `not_ready` (`day_in_progress`), with no D15 view head.
+After another D15 object carried a late D14 tail, the next pass re-sealed D14:
+Postgres retained two immutable D14 revisions and one current D14 head, while
+D15 remained unsealed. This exercises the scheduled pass, not a Kubernetes
+deployment or a full replay.
+
+An oversized recording is a named refusal in the pass ledger, not necessarily
+a failed Job; the current refusal path can exit successfully. Alert on ledger
+refusals/incomplete or missing pass output, not Job success alone.
+
+Before rollout: merged main's `0010_cd.sql` and `0011_cd_controls.sql`
+precede `0012_view_index.sql` and retain their original migration checksums.
+Do not deploy to a database that applied different migrations under either
+number. CD tracking remains opt-in, and no live CD writer/observer has been
+verified in the inspected infra; the current-version picker uses the live
+Kubernetes provider. ART's strict recommendation consumer must deploy only
+after the indexed API, database migrations/backfill, workload descriptors/RBAC,
+and an eligible sealed day are present. No rollout is authorized by this note.
+
+The index avoids full-session decoding once per day. Compressed source-object
+reads stop after the configured byte ceiling, but materialization still retains
+the selected day's decoded objects, lines, and collated events in memory. Verify
+actual peak memory against the configured 4 GiB decoded allowance / 16 GiB pod
+limit and alert on failed/refused day rows and missing pass summaries. Source
+cleanup is a terminal incomplete state until backfill; it must never
+masquerade as a smaller current tape.
+
+Read-only verification against the checked-out infra chart (no cluster access):
+
+```sh
+grep -nE 'schedule:|concurrencyPolicy:|activeDeadlineSeconds:|quietSeconds:|maxLandingBytes:|memory:' \
+  ~/hyperswitch-infra/helm-charts/charts/replay-orchestrator/{templates/sealer-cronjob.yaml,values.yaml}
+grep -RniE 'restartPolicy|hourly|schedule:' ~/hyperswitch-infra/argo-sandbox/apps
+```
+
+Operationally, inspect per-record pass ledger outcomes (especially
+`too_large`/failed rows), planned-versus-accounted totals, pass duration and
+missed/overlapping ticks, and manifest reseal counts/IDs. No live metrics or
+hourly restart registration was confirmed in the local Argo configuration
+search; verify those in the target environment before relying on them.
+
 ## Known-unverified (test before relying on it)
 
 - The DinD daemon's ECR auth path (login lands in the APP container's docker

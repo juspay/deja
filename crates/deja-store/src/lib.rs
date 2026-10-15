@@ -15,6 +15,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
+/// Convert and deduplicate direct per-object UTC day memberships.
+fn normalized_days(days: &[String]) -> Result<Vec<chrono::NaiveDate>, sqlx::Error> {
+    let mut normalized = std::collections::BTreeSet::new();
+    for day in days {
+        normalized.insert(parse_index_day(day)?);
+    }
+    Ok(normalized.into_iter().collect())
+}
 
 pub const DEFAULT_DB_URL: &str = "postgres://deja:deja@127.0.0.1:55432/deja";
 
@@ -205,6 +213,933 @@ pub struct NewAcknowledgement {
     pub lane: Option<serde_json::Value>,
     pub pattern: serde_json::Value,
     pub value_hash: Option<String>,
+}
+/// Exact landing namespace for a session. Do not collapse these fields: a
+/// session id is not globally unique across systems or buckets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingScope {
+    pub system: String,
+    pub bucket: String,
+    pub root: String,
+    pub session_id: String,
+}
+
+/// A single envelope-derived request ingress assigned to a UTC day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestDayMembership {
+    pub correlation_id: String,
+    pub day: String,
+}
+
+/// Replacement index for one raw landing object. `fingerprint` must change
+/// whenever bytes/key identity change; correlations are all request ids
+/// represented in the object, while `requests` contains ingress assignments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingObjectIndex {
+    pub object_key: String,
+    pub fingerprint: String,
+    pub correlation_ids: Vec<String>,
+    pub requests: Vec<RequestDayMembership>,
+    /// UTC days containing uncorrelated events.
+    pub object_days: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingIndexUpdate {
+    pub changed: bool,
+    pub generation: i64,
+}
+
+/// Current exact source dependency set for one day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingDayGeneration {
+    pub day: String,
+    pub generation: i64,
+    pub dependency_token: String,
+    pub object_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DayViewObject {
+    pub object_key: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DayView {
+    pub scope: LandingScope,
+    pub day: String,
+    pub generation: i64,
+    pub dependency_token: String,
+    pub manifest: serde_json::Value,
+    pub objects: Vec<DayViewObject>,
+}
+
+impl Store {
+    /// Atomically replace one object's indexed requests. Replayed identical
+    /// objects are no-ops; changed fingerprints or memberships advance the
+    /// session generation exactly once.
+    pub async fn index_landing_object(
+        &self,
+        scope: &LandingScope,
+        object: &LandingObjectIndex,
+    ) -> Result<LandingIndexUpdate, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO landing_sessions (system,bucket,root,session_id) VALUES ($1,$2,$3,$4)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .execute(&mut *tx)
+        .await?;
+        let _session_lock: i64 = sqlx::query_scalar(
+            "SELECT generation FROM landing_sessions WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4 FOR UPDATE",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .fetch_one(&mut *tx).await?;
+        let prior: Option<String> = sqlx::query_scalar(
+            "SELECT fingerprint FROM landing_objects WHERE system=$1 AND bucket=$2 AND root=$3
+             AND session_id=$4 AND object_key=$5",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(&object.object_key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let requests = normalized_requests(&object.requests)?;
+        let object_days = normalized_days(&object.object_days)?;
+        let mut correlations: std::collections::BTreeSet<String> =
+            object.correlation_ids.iter().cloned().collect();
+        correlations.extend(requests.iter().map(|(correlation, _)| correlation.clone()));
+        let correlations: Vec<String> = correlations.into_iter().collect();
+        if prior.as_deref() == Some(object.fingerprint.as_str()) {
+            let existing: Vec<String> = sqlx::query_scalar(
+                "SELECT correlation_id FROM landing_object_requests WHERE system=$1 AND bucket=$2
+                 AND root=$3 AND session_id=$4 AND object_key=$5 ORDER BY correlation_id",
+            )
+            .bind(&scope.system)
+            .bind(&scope.bucket)
+            .bind(&scope.root)
+            .bind(&scope.session_id)
+            .bind(&object.object_key)
+            .fetch_all(&mut *tx)
+            .await?;
+            let existing_days: Vec<chrono::NaiveDate> = sqlx::query_scalar(
+                "SELECT day FROM landing_object_days WHERE system=$1 AND bucket=$2 AND root=$3
+                 AND session_id=$4 AND object_key=$5 ORDER BY day",
+            )
+            .bind(&scope.system)
+            .bind(&scope.bucket)
+            .bind(&scope.root)
+            .bind(&scope.session_id)
+            .bind(&object.object_key)
+            .fetch_all(&mut *tx)
+            .await?;
+            let request_ids: Vec<String> = requests.iter().map(|(id, _)| id.clone()).collect();
+            let current_requests: Vec<(String, chrono::NaiveDate)> = if request_ids.is_empty() {
+                Vec::new()
+            } else {
+                sqlx::query_as(
+                    "SELECT correlation_id,day FROM landing_requests WHERE system=$1 AND bucket=$2
+                     AND root=$3 AND session_id=$4 AND correlation_id=ANY($5) ORDER BY correlation_id",
+                ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+                 .bind(&request_ids).fetch_all(&mut *tx).await?
+            };
+            if existing == correlations
+                && existing_days == object_days
+                && current_requests == requests
+            {
+                let generation = session_generation(&mut tx, scope).await?;
+                tx.commit().await?;
+                return Ok(LandingIndexUpdate {
+                    changed: false,
+                    generation,
+                });
+            }
+        }
+        sqlx::query(
+            "INSERT INTO landing_objects (system,bucket,root,session_id,object_key,fingerprint)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             ON CONFLICT (system,bucket,root,session_id,object_key)
+             DO UPDATE SET fingerprint=EXCLUDED.fingerprint,indexed_at=now()",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(&object.object_key)
+        .bind(&object.fingerprint)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM landing_object_days WHERE system=$1 AND bucket=$2 AND root=$3
+             AND session_id=$4 AND object_key=$5",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(&object.object_key)
+        .execute(&mut *tx)
+        .await?;
+        for day in object_days {
+            sqlx::query(
+                "INSERT INTO landing_object_days (system,bucket,root,session_id,object_key,day)
+                 VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
+            )
+            .bind(&scope.system)
+            .bind(&scope.bucket)
+            .bind(&scope.root)
+            .bind(&scope.session_id)
+            .bind(&object.object_key)
+            .bind(day)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(
+            "DELETE FROM landing_object_requests WHERE system=$1 AND bucket=$2 AND root=$3
+             AND session_id=$4 AND object_key=$5",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(&object.object_key)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "DELETE FROM landing_request_ingresses WHERE system=$1 AND bucket=$2 AND root=$3
+             AND session_id=$4 AND object_key=$5",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(&object.object_key)
+        .execute(&mut *tx)
+        .await?;
+        for (correlation, day) in requests {
+            sqlx::query(
+                "INSERT INTO landing_requests (system,bucket,root,session_id,correlation_id,day)
+                 VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (system,bucket,root,session_id,correlation_id)
+                 DO UPDATE SET day=EXCLUDED.day",
+            ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+             .bind(&correlation).bind(day).execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO landing_request_ingresses (system,bucket,root,session_id,object_key,correlation_id)
+                 VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
+            ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+             .bind(&object.object_key).bind(&correlation).execute(&mut *tx).await?;
+        }
+        for correlation in correlations {
+            sqlx::query(
+                "INSERT INTO landing_object_requests (system,bucket,root,session_id,object_key,correlation_id)
+                 VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING",
+            ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+             .bind(&object.object_key).bind(correlation).execute(&mut *tx).await?;
+        }
+        sqlx::query(
+            "DELETE FROM landing_requests r WHERE r.system=$1 AND r.bucket=$2 AND r.root=$3
+             AND r.session_id=$4 AND NOT EXISTS (SELECT 1 FROM landing_request_ingresses o
+               WHERE o.system=r.system AND o.bucket=r.bucket AND o.root=r.root
+               AND o.session_id=r.session_id AND o.correlation_id=r.correlation_id)",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .execute(&mut *tx)
+        .await?;
+        let generation: i64 = sqlx::query_scalar(
+            "UPDATE landing_sessions SET generation=generation+1 WHERE system=$1 AND bucket=$2
+             AND root=$3 AND session_id=$4 RETURNING generation",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(LandingIndexUpdate {
+            changed: true,
+            generation,
+        })
+    }
+    /// Remove an object no longer present in the source listing. Any request
+    /// whose ingress existed only in this object is removed in the same
+    /// transaction, and the generation advances only when an indexed object
+    /// was actually deleted.
+    pub async fn remove_landing_object(
+        &self,
+        scope: &LandingScope,
+        object_key: &str,
+    ) -> Result<LandingIndexUpdate, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let generation: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM landing_sessions WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4 FOR UPDATE",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .fetch_optional(&mut *tx).await?;
+        let Some(generation) = generation else {
+            tx.commit().await?;
+            return Ok(LandingIndexUpdate {
+                changed: false,
+                generation: 0,
+            });
+        };
+        let removed = sqlx::query(
+            "DELETE FROM landing_objects WHERE system=$1 AND bucket=$2 AND root=$3
+             AND session_id=$4 AND object_key=$5",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(object_key)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if removed == 0 {
+            tx.commit().await?;
+            return Ok(LandingIndexUpdate {
+                changed: false,
+                generation,
+            });
+        }
+        sqlx::query(
+            "DELETE FROM landing_requests r WHERE r.system=$1 AND r.bucket=$2 AND r.root=$3
+             AND r.session_id=$4 AND NOT EXISTS (SELECT 1 FROM landing_request_ingresses o
+               WHERE o.system=r.system AND o.bucket=r.bucket AND o.root=r.root
+               AND o.session_id=r.session_id AND o.correlation_id=r.correlation_id)",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .execute(&mut *tx)
+        .await?;
+        let next: i64 = sqlx::query_scalar(
+            "UPDATE landing_sessions SET generation=generation+1 WHERE system=$1 AND bucket=$2
+             AND root=$3 AND session_id=$4 RETURNING generation",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(LandingIndexUpdate {
+            changed: true,
+            generation: next,
+        })
+    }
+    /// Snapshot session generations BEFORE the corresponding S3 LIST, including
+    /// previously tombstoned sessions so they cannot be silently resurrected
+    /// when a key reappears. A concurrent worker may index a new object after
+    /// that listing began; the reconciler below must not mistake the omitted
+    /// new key for source GC. Existing tombstones stay unavailable until an
+    /// explicit backfill/reconciliation policy is implemented.
+    pub async fn active_landing_session_generations(
+        &self,
+        system: &str,
+        bucket: &str,
+        root: &str,
+    ) -> Result<std::collections::BTreeMap<String, i64>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT session_id,generation FROM landing_sessions
+             WHERE system=$1 AND bucket=$2 AND root=$3
+             ORDER BY session_id",
+        )
+        .bind(system)
+        .bind(bucket)
+        .bind(root)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Reconcile indexed keys against one complete source listing. Its
+    /// `expected_generation` was read before the LIST, so an older listing
+    /// cannot delete an object another worker indexed in the meantime.
+    pub async fn reconcile_landing_objects(
+        &self,
+        scope: &LandingScope,
+        listed_keys: &[String],
+        expected_generation: Option<i64>,
+    ) -> Result<LandingIndexUpdate, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let generation: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM landing_sessions WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4 FOR UPDATE",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .fetch_optional(&mut *tx).await?;
+        let Some(generation) = generation else {
+            tx.commit().await?;
+            return Ok(LandingIndexUpdate {
+                changed: false,
+                generation: 0,
+            });
+        };
+        if Some(generation) != expected_generation {
+            tx.rollback().await?;
+            return Err(sqlx::Error::Protocol(
+                "landing index changed while listing source objects; retry the pass".into(),
+            ));
+        }
+        let removed = sqlx::query(
+            "DELETE FROM landing_objects WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4
+             AND NOT (object_key = ANY($5))",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .bind(listed_keys).execute(&mut *tx).await?.rows_affected();
+        if removed == 0 {
+            tx.commit().await?;
+            return Ok(LandingIndexUpdate {
+                changed: false,
+                generation,
+            });
+        }
+        sqlx::query(
+            "DELETE FROM landing_requests r WHERE r.system=$1 AND r.bucket=$2 AND r.root=$3
+             AND r.session_id=$4 AND NOT EXISTS (SELECT 1 FROM landing_request_ingresses o
+               WHERE o.system=r.system AND o.bucket=r.bucket AND o.root=r.root
+               AND o.session_id=r.session_id AND o.correlation_id=r.correlation_id)",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .execute(&mut *tx)
+        .await?;
+        let next: i64 = sqlx::query_scalar(
+            "UPDATE landing_sessions SET generation=generation+1, source_incomplete=true WHERE system=$1 AND bucket=$2
+             AND root=$3 AND session_id=$4 RETURNING generation",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(LandingIndexUpdate {
+            changed: true,
+            generation: next,
+        })
+    }
+    /// Current key/fingerprint index for incremental S3 delta comparison.
+    pub async fn indexed_landing_objects(
+        &self,
+        scope: &LandingScope,
+    ) -> Result<std::collections::BTreeMap<String, String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT object_key,fingerprint FROM landing_objects
+             WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4 ORDER BY object_key",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect())
+    }
+
+    /// Request ownership inferred from ingress for only the source objects of
+    /// one materialized day. A mixed object can contain an earlier day's tail,
+    /// whose ingress object need not be fetched again.
+    pub async fn indexed_request_days(
+        &self,
+        scope: &LandingScope,
+        object_keys: &[String],
+    ) -> Result<std::collections::BTreeMap<String, String>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT r.correlation_id,r.day FROM landing_object_requests o
+             JOIN landing_requests r USING (system,bucket,root,session_id,correlation_id)
+             WHERE o.system=$1 AND o.bucket=$2 AND o.root=$3 AND o.session_id=$4
+               AND o.object_key=ANY($5) ORDER BY r.correlation_id",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(object_keys)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let day: chrono::NaiveDate = row.get(1);
+                (row.get(0), day.to_string())
+            })
+            .collect())
+    }
+
+    /// Refuse materialization before writing parts if reconciliation has
+    /// observed that an indexed source object disappeared.
+    pub async fn require_complete_landing_source(
+        &self,
+        scope: &LandingScope,
+    ) -> Result<(), sqlx::Error> {
+        let incomplete: Option<bool> = sqlx::query_scalar(
+            "SELECT source_incomplete FROM landing_sessions
+             WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match incomplete {
+            Some(false) => Ok(()),
+            Some(true) => Err(sqlx::Error::Protocol(
+                "raw landing source was removed; refuse a partial day reseal".into(),
+            )),
+            None => Err(sqlx::Error::Protocol(
+                "indexed landing session is missing; refuse day seal".into(),
+            )),
+        }
+    }
+
+    /// Enumerate indexed days, with sorted exact dependency keys and a
+    /// deterministic token over current source object fingerprints.
+    pub async fn landing_days(
+        &self,
+        scope: &LandingScope,
+    ) -> Result<Vec<LandingDayGeneration>, sqlx::Error> {
+        let unresolved: Option<String> = sqlx::query_scalar(
+            "SELECT o.correlation_id FROM landing_object_requests o
+             LEFT JOIN landing_requests r USING (system,bucket,root,session_id,correlation_id)
+             WHERE o.system=$1 AND o.bucket=$2 AND o.root=$3 AND o.session_id=$4
+               AND r.correlation_id IS NULL
+             LIMIT 1",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(correlation) = unresolved {
+            return Err(sqlx::Error::Protocol(format!(
+                "indexed landing session contains correlation {correlation} with no ingress"
+            )));
+        }
+        let rows = sqlx::query(
+            "SELECT day FROM (
+               SELECT r.day FROM landing_requests r WHERE r.system=$1 AND r.bucket=$2 AND r.root=$3 AND r.session_id=$4
+               UNION
+               SELECT d.day FROM landing_object_days d WHERE d.system=$1 AND d.bucket=$2 AND d.root=$3 AND d.session_id=$4
+             ) days ORDER BY day",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .fetch_all(&self.pool).await?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let day: chrono::NaiveDate = row.get(0);
+            let deps = sqlx::query(
+                "SELECT object_key, fingerprint FROM (
+                   SELECT DISTINCT o.object_key, lo.fingerprint FROM landing_object_requests o
+                   JOIN landing_objects lo USING (system,bucket,root,session_id,object_key)
+                   JOIN landing_requests r USING (system,bucket,root,session_id,correlation_id)
+                   WHERE r.system=$1 AND r.bucket=$2 AND r.root=$3 AND r.session_id=$4 AND r.day=$5
+                   UNION
+                   SELECT lo.object_key, lo.fingerprint FROM landing_object_days d
+                   JOIN landing_objects lo USING (system,bucket,root,session_id,object_key)
+                   WHERE d.system=$1 AND d.bucket=$2 AND d.root=$3 AND d.session_id=$4 AND d.day=$5
+                 ) dependencies ORDER BY object_key",
+            )
+            .bind(&scope.system)
+            .bind(&scope.bucket)
+            .bind(&scope.root)
+            .bind(&scope.session_id)
+            .bind(day)
+            .fetch_all(&self.pool)
+            .await?;
+            let digest_input: Vec<(String, String)> =
+                deps.iter().map(|row| (row.get(0), row.get(1))).collect();
+            let keys: Vec<String> = digest_input.iter().map(|(key, _)| key.clone()).collect();
+            let token_input =
+                serde_json::to_string(&digest_input).expect("serializing string pairs");
+            let token: String = sqlx::query_scalar("SELECT md5($1)")
+                .bind(token_input)
+                .fetch_one(&self.pool)
+                .await?;
+            let generation = sqlx::query_scalar(
+                "SELECT generation FROM landing_sessions WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4",
+            ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+             .fetch_one(&self.pool).await?;
+            result.push(LandingDayGeneration {
+                day: day.to_string(),
+                generation,
+                dependency_token: token,
+                object_keys: keys,
+            });
+        }
+        Ok(result)
+    }
+
+    /// Publish immutable materialization and advance its head only if the
+    /// indexed dependency generation/token still matches this compaction.
+    pub async fn publish_day_view(
+        &self,
+        scope: &LandingScope,
+        day: &str,
+        expected_generation: i64,
+        dependency_token: &str,
+        manifest: &serde_json::Value,
+        objects: &[DayViewObject],
+    ) -> Result<bool, sqlx::Error> {
+        let day = parse_index_day(day)?;
+        let mut tx = self.pool.begin().await?;
+        let source: Option<(i64, bool)> = sqlx::query_as(
+            "SELECT generation,source_incomplete FROM landing_sessions WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4 FOR UPDATE",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .fetch_optional(&mut *tx).await?;
+        if source.is_some_and(|(_, incomplete)| incomplete) {
+            return Err(sqlx::Error::Protocol(
+                "raw landing source was removed; refuse a partial day reseal".into(),
+            ));
+        }
+        if source.map(|(generation, _)| generation) != Some(expected_generation) {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let current = day_dependency_token(&mut tx, scope, day).await?;
+        if current != dependency_token {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let objects_json =
+            serde_json::to_value(objects).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let inserted: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO day_views (system,bucket,root,session_id,day,generation,dependency_token,manifest,objects)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+             ON CONFLICT (system,bucket,root,session_id,day,dependency_token) DO NOTHING RETURNING id",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .bind(day).bind(expected_generation).bind(dependency_token).bind(manifest).bind(&objects_json)
+         .fetch_optional(&mut *tx).await?;
+        let view_id = match inserted {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "SELECT id FROM day_views WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4
+                 AND day=$5 AND dependency_token=$6",
+            ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+             .bind(day).bind(dependency_token).fetch_one(&mut *tx).await?,
+        };
+        let stored: (serde_json::Value, serde_json::Value) =
+            sqlx::query_as("SELECT manifest,objects FROM day_views WHERE id=$1")
+                .bind(view_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if stored.0 != *manifest || stored.1 != objects_json {
+            tx.rollback().await?;
+            return Err(sqlx::Error::Protocol(
+                "day view token already names different immutable content".into(),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO day_view_heads (system,bucket,root,session_id,day,view_id,generation,dependency_token)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             ON CONFLICT (system,bucket,root,session_id,day) DO UPDATE SET
+               view_id=EXCLUDED.view_id,generation=EXCLUDED.generation,dependency_token=EXCLUDED.dependency_token",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .bind(day).bind(view_id).bind(expected_generation).bind(dependency_token).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Return the published head only while it still exactly matches indexed
+    /// dependencies. Historical revisions remain available by token below.
+    pub async fn day_view_head(
+        &self,
+        scope: &LandingScope,
+        day: &str,
+    ) -> Result<Option<DayView>, sqlx::Error> {
+        let day = parse_index_day(day)?;
+        let mut tx = self.pool.begin().await?;
+        let source: Option<(i64, bool)> = sqlx::query_as(
+            "SELECT generation, source_incomplete OR EXISTS (
+               SELECT 1 FROM landing_object_requests o
+               LEFT JOIN landing_requests r USING (system,bucket,root,session_id,correlation_id)
+               WHERE o.system=$1 AND o.bucket=$2 AND o.root=$3 AND o.session_id=$4
+                 AND r.correlation_id IS NULL
+             ) FROM landing_sessions WHERE system=$1 AND bucket=$2 AND root=$3
+             AND session_id=$4 FOR SHARE",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if source.is_none_or(|(_, incomplete)| incomplete) {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT v.generation,v.dependency_token,v.manifest,v.objects FROM day_view_heads h
+             JOIN day_views v ON v.id=h.view_id WHERE h.system=$1 AND h.bucket=$2 AND h.root=$3
+             AND h.session_id=$4 AND h.day=$5",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(day)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let view = if let Some(row) = row {
+            let view_generation: i64 = row.get(0);
+            let token: String = row.get(1);
+            let current = day_dependency_token(&mut tx, scope, day).await?;
+            if token == current {
+                Some(DayView {
+                    scope: scope.clone(),
+                    day: day.to_string(),
+                    generation: view_generation,
+                    dependency_token: token,
+                    manifest: row.get(2),
+                    objects: serde_json::from_value(row.get(3))
+                        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(view)
+    }
+    /// Whether this logical day has ever published a view, even if its
+    /// current source token no longer matches that historical seal.
+    pub async fn has_day_view_history(
+        &self,
+        scope: &LandingScope,
+        day: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let day = parse_index_day(day)?;
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM day_views WHERE system=$1 AND bucket=$2 AND root=$3
+             AND session_id=$4 AND day=$5)",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .bind(day)
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Read any immutable revision by its generation number.
+    pub async fn day_view_at(
+        &self,
+        scope: &LandingScope,
+        day: &str,
+        generation: i64,
+    ) -> Result<Option<DayView>, sqlx::Error> {
+        let day = parse_index_day(day)?;
+        let row = sqlx::query(
+            "SELECT dependency_token,manifest,objects FROM day_views
+             WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4 AND day=$5 AND generation=$6",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id)
+         .bind(day).bind(generation).fetch_optional(&self.pool).await?;
+        row.map(|row| {
+            Ok(DayView {
+                scope: scope.clone(),
+                day: day.to_string(),
+                generation,
+                dependency_token: row.get(0),
+                manifest: row.get(1),
+                objects: serde_json::from_value(row.get(2))
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Enumerate exact current heads across sessions in a source namespace.
+    pub async fn list_day_view_heads(
+        &self,
+        system: &str,
+        bucket: &str,
+        root: &str,
+        day: &str,
+    ) -> Result<Vec<DayView>, sqlx::Error> {
+        let day = parse_index_day(day)?;
+        let sessions: Vec<String> = sqlx::query_scalar(
+            "SELECT session_id FROM day_view_heads WHERE system=$1 AND bucket=$2 AND root=$3 AND day=$4 ORDER BY session_id",
+        ).bind(system).bind(bucket).bind(root).bind(day).fetch_all(&self.pool).await?;
+        let mut heads = Vec::with_capacity(sessions.len());
+        for session_id in sessions {
+            let scope = LandingScope {
+                system: system.to_owned(),
+                bucket: bucket.to_owned(),
+                root: root.to_owned(),
+                session_id,
+            };
+            if let Some(head) = self.day_view_head(&scope, &day.to_string()).await? {
+                heads.push(head);
+            }
+        }
+        Ok(heads)
+    }
+    /// Enumerate only source-complete current views in one repeatable-read
+    /// transaction. Historical revisions remain available through `day_view_at`.
+    pub async fn list_current_day_view_heads(
+        &self,
+        system: &str,
+        bucket: &str,
+        root: &str,
+    ) -> Result<Vec<DayView>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *tx)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT h.session_id,h.day,v.generation,v.dependency_token,v.manifest,v.objects
+             FROM day_view_heads h JOIN day_views v ON v.id=h.view_id
+             JOIN landing_sessions s ON s.system=h.system AND s.bucket=h.bucket
+               AND s.root=h.root AND s.session_id=h.session_id
+             WHERE h.system=$1 AND h.bucket=$2 AND h.root=$3 AND NOT s.source_incomplete
+               AND NOT EXISTS (
+                 SELECT 1 FROM landing_object_requests o
+                 LEFT JOIN landing_requests r USING (system,bucket,root,session_id,correlation_id)
+                 WHERE o.system=h.system AND o.bucket=h.bucket AND o.root=h.root
+                   AND o.session_id=h.session_id AND r.correlation_id IS NULL
+               )
+             ORDER BY h.day,h.session_id",
+        )
+        .bind(system)
+        .bind(bucket)
+        .bind(root)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut result = Vec::with_capacity(rows.len());
+        for row in rows {
+            let scope = LandingScope {
+                system: system.to_owned(),
+                bucket: bucket.to_owned(),
+                root: root.to_owned(),
+                session_id: row.get(0),
+            };
+            let day: chrono::NaiveDate = row.get(1);
+            let dependency_token: String = row.get(3);
+            if day_dependency_token(&mut tx, &scope, day).await? == dependency_token {
+                result.push(DayView {
+                    scope,
+                    day: day.to_string(),
+                    generation: row.get(2),
+                    dependency_token,
+                    manifest: row.get(4),
+                    objects: serde_json::from_value(row.get(5))
+                        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                });
+            }
+        }
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Read an immutable published revision by dependency token, even after
+    /// source retention removes the dependencies from the current index.
+    pub async fn day_view_revision(
+        &self,
+        scope: &LandingScope,
+        day: &str,
+        dependency_token: &str,
+    ) -> Result<Option<DayView>, sqlx::Error> {
+        let day = parse_index_day(day)?;
+        let row = sqlx::query(
+            "SELECT generation,dependency_token,manifest,objects FROM day_views
+             WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4 AND day=$5 AND dependency_token=$6",
+        ).bind(&scope.system).bind(&scope.bucket).bind(&scope.root)
+         .bind(&scope.session_id).bind(day).bind(dependency_token).fetch_optional(&self.pool).await?;
+        row.map(|row| {
+            Ok(DayView {
+                scope: scope.clone(),
+                day: day.to_string(),
+                generation: row.get(0),
+                dependency_token: row.get(1),
+                manifest: row.get(2),
+                objects: serde_json::from_value(row.get(3))
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+            })
+        })
+        .transpose()
+    }
+}
+
+fn parse_index_day(day: &str) -> Result<chrono::NaiveDate, sqlx::Error> {
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d")
+        .map_err(|e| sqlx::Error::Protocol(format!("invalid UTC day {day:?}: {e}")))
+}
+
+fn normalized_requests(
+    requests: &[RequestDayMembership],
+) -> Result<Vec<(String, chrono::NaiveDate)>, sqlx::Error> {
+    let mut normalized = std::collections::BTreeMap::new();
+    for request in requests {
+        let day = parse_index_day(&request.day)?;
+        if let Some(prior) = normalized.insert(request.correlation_id.clone(), day) {
+            if prior != day {
+                return Err(sqlx::Error::Protocol(
+                    "request has conflicting ingress days".into(),
+                ));
+            }
+        }
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+async fn session_generation(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &LandingScope,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT generation FROM landing_sessions WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4")
+        .bind(&scope.system).bind(&scope.bucket).bind(&scope.root).bind(&scope.session_id).fetch_one(&mut **tx).await
+}
+
+async fn day_dependency_token(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope: &LandingScope,
+    day: chrono::NaiveDate,
+) -> Result<String, sqlx::Error> {
+    let deps: Vec<(String, String)> = sqlx::query_as(
+        "SELECT object_key,fingerprint FROM (
+           SELECT DISTINCT o.object_key,lo.fingerprint FROM landing_object_requests o
+           JOIN landing_objects lo USING (system,bucket,root,session_id,object_key)
+           JOIN landing_requests r USING (system,bucket,root,session_id,correlation_id)
+           WHERE r.system=$1 AND r.bucket=$2 AND r.root=$3 AND r.session_id=$4 AND r.day=$5
+           UNION
+           SELECT lo.object_key,lo.fingerprint FROM landing_object_days d
+           JOIN landing_objects lo USING (system,bucket,root,session_id,object_key)
+           WHERE d.system=$1 AND d.bucket=$2 AND d.root=$3 AND d.session_id=$4 AND d.day=$5
+         ) dependencies ORDER BY object_key",
+    )
+    .bind(&scope.system)
+    .bind(&scope.bucket)
+    .bind(&scope.root)
+    .bind(&scope.session_id)
+    .bind(day)
+    .fetch_all(&mut **tx)
+    .await?;
+    let token_input = serde_json::to_string(&deps).expect("serializing string pairs");
+    sqlx::query_scalar("SELECT md5($1)")
+        .bind(token_input)
+        .fetch_one(&mut **tx)
+        .await
 }
 
 /// One thing a system can run: a merge (one pull request, named by its short
@@ -1707,6 +2642,162 @@ mod tests {
              from every open tab, and it OOMKilled the orchestrator ten times \
              on 2026-09-17. A caller that needs a scorecard fetches one run."
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a disposable Postgres at DEJA_TEST_DATABASE_URL"]
+    async fn landing_days_refuses_orphan_correlations_until_any_object_indexes_ingress() {
+        let url = std::env::var("DEJA_TEST_DATABASE_URL")
+            .expect("DEJA_TEST_DATABASE_URL names a disposable Postgres");
+        let store = super::Store::connect(&url)
+            .await
+            .expect("connect to disposable Postgres");
+        let scope = super::LandingScope {
+            system: "deja-store-test".into(),
+            bucket: "landing-days-orphan-regression".into(),
+            root: "test".into(),
+            session_id: uuid::Uuid::now_v7().to_string(),
+        };
+        let ingress = super::LandingObjectIndex {
+            object_key: "ingress.jsonl".into(),
+            fingerprint: "ingress-v1".into(),
+            correlation_ids: vec!["request-a".into()],
+            requests: vec![super::RequestDayMembership {
+                correlation_id: "request-a".into(),
+                day: "2026-10-01".into(),
+            }],
+            object_days: vec![],
+        };
+        let orphan = super::LandingObjectIndex {
+            object_key: "tail.jsonl".into(),
+            fingerprint: "tail-v1".into(),
+            correlation_ids: vec!["request-orphan".into()],
+            requests: vec![],
+            object_days: vec!["2026-10-02".into()],
+        };
+
+        let result = async {
+            store.index_landing_object(&scope, &ingress).await?;
+            let original_day = store.landing_days(&scope).await?.remove(0);
+            assert!(
+                store
+                    .publish_day_view(
+                        &scope,
+                        &original_day.day,
+                        original_day.generation,
+                        &original_day.dependency_token,
+                        &serde_json::json!({"seal": "before-orphan"}),
+                        &[],
+                    )
+                    .await?
+            );
+            assert!(store
+                .day_view_head(&scope, &original_day.day)
+                .await?
+                .is_some());
+            assert_eq!(
+                store
+                    .list_current_day_view_heads(&scope.system, &scope.bucket, &scope.root)
+                    .await?
+                    .len(),
+                1
+            );
+            store.index_landing_object(&scope, &orphan).await?;
+
+            let error = match store.landing_days(&scope).await {
+                Ok(_) => {
+                    return Err(sqlx::Error::Protocol(
+                        "an orphan correlation did not block landing days".into(),
+                    ))
+                }
+                Err(error) => error,
+            };
+            if !error.to_string().contains("request-orphan") {
+                return Err(sqlx::Error::Protocol(format!(
+                    "refusal did not identify request-orphan: {error}"
+                )));
+            }
+            assert!(store
+                .day_view_head(&scope, &original_day.day)
+                .await?
+                .is_none());
+            assert!(store
+                .list_current_day_view_heads(&scope.system, &scope.bucket, &scope.root)
+                .await?
+                .is_empty());
+
+            let mut resolved_ingress = ingress.clone();
+            resolved_ingress.fingerprint = "ingress-v2".into();
+            resolved_ingress
+                .correlation_ids
+                .push("request-orphan".into());
+            resolved_ingress.requests.push(super::RequestDayMembership {
+                correlation_id: "request-orphan".into(),
+                day: "2026-10-02".into(),
+            });
+            store
+                .index_landing_object(&scope, &resolved_ingress)
+                .await?;
+
+            let days = store.landing_days(&scope).await?;
+            if days.len() != 2 {
+                return Err(sqlx::Error::Protocol(format!(
+                    "expected two ingress days, found {days:?}"
+                )));
+            }
+            let day_one = days
+                .iter()
+                .find(|day| day.day == "2026-10-01")
+                .ok_or_else(|| sqlx::Error::Protocol("missing 2026-10-01 ingress day".into()))?;
+            let day_two = days
+                .iter()
+                .find(|day| day.day == "2026-10-02")
+                .ok_or_else(|| sqlx::Error::Protocol("missing 2026-10-02 ingress day".into()))?;
+            if day_one.object_keys != ["ingress.jsonl"] {
+                return Err(sqlx::Error::Protocol(format!(
+                    "unexpected day-one dependencies: {:?}",
+                    day_one.object_keys
+                )));
+            }
+            if day_two.object_keys != ["ingress.jsonl", "tail.jsonl"] {
+                return Err(sqlx::Error::Protocol(format!(
+                    "cross-object ingress did not include both dependencies: {:?}",
+                    day_two.object_keys
+                )));
+            }
+            store.require_complete_landing_source(&scope).await?;
+            let removed = store
+                .reconcile_landing_objects(
+                    &scope,
+                    &["ingress.jsonl".to_owned()],
+                    Some(day_one.generation),
+                )
+                .await?;
+            assert!(removed.changed);
+            let error = store
+                .require_complete_landing_source(&scope)
+                .await
+                .expect_err("removed raw object must stop writes before materialization");
+            assert!(error.to_string().contains("raw landing source was removed"));
+            Ok::<(), sqlx::Error>(())
+        }
+        .await;
+
+        // Scope is unique per invocation; remove it even when an assertion or
+        // SQL operation fails, without touching any other session's rows.
+        let cleanup = sqlx::query(
+            "DELETE FROM landing_sessions
+             WHERE system=$1 AND bucket=$2 AND root=$3 AND session_id=$4",
+        )
+        .bind(&scope.system)
+        .bind(&scope.bucket)
+        .bind(&scope.root)
+        .bind(&scope.session_id)
+        .execute(&store.pool)
+        .await;
+        drop(store);
+        cleanup.expect("clean up this test's isolated landing session");
+        result.expect("exercise real PostgreSQL landing index behavior");
     }
 
     /// Against a real Postgres, named by `DEJA_TEST_DB_URL`; absent, these
