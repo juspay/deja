@@ -318,6 +318,58 @@ pub struct CdControlRow {
     pub changed_at: DateTime<Utc>,
 }
 
+/// One hop replay of a version against the release the next environment
+/// runs; see migration 0012. `run_state` and `run_delta_verdict` are read
+/// from the candidate run's row at query time: the run's word is current
+/// (an acknowledgement changes it), the copy in `verdict` is what the job
+/// read when it finished.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CdHopRow {
+    pub id: i64,
+    pub system: String,
+    pub version: String,
+    pub against_version: String,
+    pub against_commit: Option<String>,
+    pub state: String,
+    pub candidate_run: Option<String>,
+    pub baseline_run: Option<String>,
+    pub verdict: Option<String>,
+    pub reason: Option<String>,
+    pub requested_by: String,
+    pub jenkins_build: Option<String>,
+    pub detail: serde_json::Value,
+    pub at: DateTime<Utc>,
+    pub run_state: Option<String>,
+    pub run_delta_verdict: Option<String>,
+}
+
+/// A hop row to append: everything but what the database fills in. The
+/// version is the path of the request; the body names the rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewCdHop {
+    pub system: String,
+    #[serde(default)]
+    pub version: String,
+    pub against_version: String,
+    #[serde(default)]
+    pub against_commit: Option<String>,
+    pub state: String,
+    #[serde(default)]
+    pub candidate_run: Option<String>,
+    #[serde(default)]
+    pub baseline_run: Option<String>,
+    #[serde(default)]
+    pub verdict: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub requested_by: String,
+    #[serde(default)]
+    pub jenkins_build: Option<String>,
+    #[serde(default)]
+    pub detail: serde_json::Value,
+}
+
 impl Store {
     /// Connect and run migrations. Errors are returned (the caller decides
     /// whether the store is mandatory).
@@ -965,6 +1017,71 @@ impl Store {
         Ok(cd_control_row(row))
     }
 
+    // -- cd hops -------------------------------------------------------------
+
+    pub async fn cd_hop_append(&self, h: &NewCdHop) -> Result<CdHopRow, sqlx::Error> {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO cd_hops
+               (system, version, against_version, against_commit, state, candidate_run,
+                baseline_run, verdict, reason, requested_by, jenkins_build, detail)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+             RETURNING id",
+        )
+        .bind(&h.system)
+        .bind(&h.version)
+        .bind(&h.against_version)
+        .bind(&h.against_commit)
+        .bind(&h.state)
+        .bind(&h.candidate_run)
+        .bind(&h.baseline_run)
+        .bind(&h.verdict)
+        .bind(&h.reason)
+        .bind(&h.requested_by)
+        .bind(&h.jenkins_build)
+        .bind(&h.detail)
+        .fetch_one(&self.pool)
+        .await?;
+        let row = sqlx::query(&format!("{CD_HOP_SELECT} WHERE h.id = $1"))
+            .bind(id)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(cd_hop_row(row))
+    }
+
+    /// A version's hops, newest first.
+    pub async fn cd_hops_of_version(
+        &self,
+        system: &str,
+        version: &str,
+        limit: i64,
+    ) -> Result<Vec<CdHopRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "{CD_HOP_SELECT} WHERE h.system = $1 AND h.version = $2
+             ORDER BY h.id DESC LIMIT $3"
+        ))
+        .bind(system)
+        .bind(version)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_hop_row).collect())
+    }
+
+    /// The newest hop row of every version that has one: where each stands.
+    pub async fn cd_latest_hop_per_version(
+        &self,
+        system: &str,
+    ) -> Result<Vec<CdHopRow>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "{CD_HOP_SELECT} WHERE h.id IN
+               (SELECT max(id) FROM cd_hops WHERE system = $1 GROUP BY version)"
+        ))
+        .bind(system)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(cd_hop_row).collect())
+    }
+
     // -- recordings ----------------------------------------------------------
 
     #[allow(clippy::too_many_arguments)] // mirrors the catalog row shape
@@ -1539,6 +1656,32 @@ fn cd_control_row(r: sqlx::postgres::PgRow) -> CdControlRow {
         changed_by: r.get(3),
         changed_by_sub: r.get(4),
         changed_at: r.get(5),
+    }
+}
+
+const CD_HOP_SELECT: &str = "SELECT h.id, h.system, h.version, h.against_version, h.against_commit, \
+     h.state, h.candidate_run, h.baseline_run, h.verdict, h.reason, h.requested_by, h.jenkins_build, \
+     h.detail, h.at, r.state, r.delta_verdict \
+     FROM cd_hops h LEFT JOIN replay_runs r ON r.run_id = h.candidate_run";
+
+fn cd_hop_row(r: sqlx::postgres::PgRow) -> CdHopRow {
+    CdHopRow {
+        id: r.get(0),
+        system: r.get(1),
+        version: r.get(2),
+        against_version: r.get(3),
+        against_commit: r.get(4),
+        state: r.get(5),
+        candidate_run: r.get(6),
+        baseline_run: r.get(7),
+        verdict: r.get(8),
+        reason: r.get(9),
+        requested_by: r.get(10),
+        jenkins_build: r.get(11),
+        detail: r.get(12),
+        at: r.get(13),
+        run_state: r.get(14),
+        run_delta_verdict: r.get(15),
     }
 }
 

@@ -1073,6 +1073,31 @@ export type CdDeploymentRow = {
 /** The newest row a version has on one environment. */
 export type CdVersionWhere = CdDeploymentRow;
 
+/** One hop replay: a version replayed against the release the next
+ *  environment runs (a pair of runs on one tape, three-way). Append-only
+ *  like the deployment log: `requested` when the job starts, then `done`,
+ *  `failed` or `skipped` with a reason. `run_state` and `run_delta_verdict`
+ *  are the candidate run's own, read at query time; `verdict` is the word
+ *  the job read when it finished. */
+export type CdHopRow = {
+  id: number;
+  system: string;
+  version: string;
+  against_version: string;
+  against_commit: string | null;
+  state: string;
+  candidate_run: string | null;
+  baseline_run: string | null;
+  verdict: string | null;
+  reason: string | null;
+  requested_by: string;
+  jenkins_build: string | null;
+  detail: Record<string, unknown>;
+  at: string;
+  run_state: string | null;
+  run_delta_verdict: string | null;
+};
+
 export type CdEnvironment = {
   environment: string;
   /** The newest row of any state: what is happening. */
@@ -1081,6 +1106,8 @@ export type CdEnvironment = {
   live: CdDeploymentRow | null;
   latest_version: CdVersionRow | null;
   live_version: CdVersionRow | null;
+  /** The live version's newest hop, when it has one. */
+  live_hop: CdHopRow | null;
 };
 
 const sys = (system: string) => `system=${encodeURIComponent(system)}`;
@@ -1102,11 +1129,11 @@ export const cdApi = {
       `/api/v1/cd/environments/${encodeURIComponent(environment)}/deployments?${sys(system)}&limit=${limit}`,
     ),
   versions: (system: string, limit = 200) =>
-    request<{ system: string; versions: { version: CdVersionRow; where: CdVersionWhere[] }[] }>(
+    request<{ system: string; versions: { version: CdVersionRow; where: CdVersionWhere[]; hop: CdHopRow | null }[] }>(
       `/api/v1/cd/versions?${sys(system)}&limit=${limit}`,
     ),
   version: (system: string, version: string) =>
-    request<{ version: CdVersionRow; deployments: CdDeploymentRow[] }>(
+    request<{ version: CdVersionRow; deployments: CdDeploymentRow[]; hops: CdHopRow[] }>(
       `/api/v1/cd/versions/${encodeURIComponent(version)}?${sys(system)}`,
     ),
   pullRequest: (owner: string, repo: string, number: number) =>

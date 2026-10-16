@@ -356,7 +356,8 @@ fn app_router(state: AppState) -> Router {
     let cd_read = |h: MethodRouter<AppState>| h.route_layer(reader.clone());
     let post_cd_version = post(v1_cd_post_version).route_layer(service.clone());
     let post_cd_deployment = post(v1_cd_post_deployment).route_layer(service.clone());
-    let post_cd_observed = post(v1_cd_post_observed).route_layer(service);
+    let post_cd_observed = post(v1_cd_post_observed).route_layer(service.clone());
+    let post_cd_hop = post(v1_cd_post_hop).route_layer(service);
     let cd_pause = cd_read(get(v1_cd_pause)).merge(post(v1_cd_set_pause).route_layer(
         middleware::from_fn_with_state(state.clone(), require_session),
     ));
@@ -402,6 +403,10 @@ fn app_router(state: AppState) -> Router {
             cd_read(get(v1_cd_versions)).merge(post_cd_version),
         )
         .route("/cd/versions/{version}", cd_read(get(v1_cd_version)))
+        .route(
+            "/cd/versions/{version}/hops",
+            cd_read(get(v1_cd_version_hops)).merge(post_cd_hop),
+        )
         .route("/cd/deployments", post_cd_deployment)
         .route("/cd/environments", cd_read(get(v1_cd_environments)))
         .route("/cd/environments/{env}/observed", post_cd_observed)
@@ -4429,6 +4434,9 @@ fn cd_limit(q: &std::collections::HashMap<String, String>, default: i64) -> i64 
         .min(1000)
 }
 
+const CD_HOP_STATES: [&str; 4] = ["requested", "done", "failed", "skipped"];
+const CD_HOP_VERDICTS: [&str; 5] = ["pass", "fail", "acknowledged", "inconclusive", "unknown"];
+
 const CD_DEPLOYMENT_STATES: [&str; 6] = [
     "requested",
     "committed",
@@ -4825,6 +4833,10 @@ async fn v1_cd_environments(
             }
         }
     }
+    let hops = match store.cd_latest_hop_per_version(&system).await {
+        Ok(h) => h,
+        Err(e) => return error_resp(500, &format!("hops: {e}")),
+    };
     let environments: Vec<serde_json::Value> = cd
         .environments
         .iter()
@@ -4837,6 +4849,9 @@ async fn v1_cd_environments(
                 "live": v,
                 "latest_version": l.and_then(|r| versions.get(&r.version)).cloned().flatten(),
                 "live_version": v.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+                // The live version's newest hop: what it changes against the
+                // release the next environment runs.
+                "live_hop": v.and_then(|r| hops.iter().find(|h| h.version == r.version)),
             })
         })
         .collect();
@@ -4896,12 +4911,17 @@ async fn v1_cd_versions(State(st): State<AppState>, axum::extract::Query(q): Que
         Ok(p) => p,
         Err(e) => return error_resp(500, &format!("deployments: {e}")),
     };
+    let hops = match store.cd_latest_hop_per_version(&system).await {
+        Ok(h) => h,
+        Err(e) => return error_resp(500, &format!("hops: {e}")),
+    };
     let out: Vec<serde_json::Value> = versions
         .into_iter()
         .map(|v| {
             let where_: Vec<&deja_store::CdDeploymentRow> =
                 places.iter().filter(|p| p.version == v.version).collect();
-            serde_json::json!({ "version": v, "where": where_ })
+            let hop = hops.iter().find(|h| h.version == v.version);
+            serde_json::json!({ "version": v, "where": where_, "hop": hop })
         })
         .collect();
     json_ok(serde_json::json!({ "system": system, "versions": out }))
@@ -4930,13 +4950,125 @@ async fn v1_cd_version(
         Ok(None) => return error_resp(404, "no such version"),
         Err(e) => return error_resp(500, &format!("version: {e}")),
     };
-    match store
+    let rows = match store
         .cd_deployments_of_version(&system, &version, 200)
         .await
     {
-        Ok(rows) => json_ok(serde_json::json!({ "version": v, "deployments": rows })),
-        Err(e) => error_resp(500, &format!("deployments: {e}")),
+        Ok(rows) => rows,
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    match store.cd_hops_of_version(&system, &version, 50).await {
+        Ok(hops) => json_ok(serde_json::json!({ "version": v, "deployments": rows, "hops": hops })),
+        Err(e) => error_resp(500, &format!("hops: {e}")),
     }
+}
+
+/// `GET /api/v1/cd/versions/{version}/hops?system=`: a version's hop
+/// replays, newest first.
+async fn v1_cd_version_hops(
+    State(st): State<AppState>,
+    Path(version): Path<String>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store
+        .cd_hops_of_version(&system, &version, cd_limit(&q, 50))
+        .await
+    {
+        Ok(hops) => json_ok_ser(&hops),
+        Err(e) => error_resp(500, &format!("hops: {e}")),
+    }
+}
+
+/// `POST /api/v1/cd/versions/{version}/hops`: the hop-replay job records
+/// that it is replaying a version against the next environment's release,
+/// and then how that went. Append-only; the version must be known.
+async fn v1_cd_post_hop(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(version): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut h: deja_store::NewCdHop = match serde_json::from_slice(&body) {
+        Ok(h) => h,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    h.version = version;
+    if !cd.knows_system(&h.system) {
+        return error_resp(400, &format!("unknown system {:?}", h.system));
+    }
+    if !CD_HOP_STATES.contains(&h.state.as_str()) {
+        return error_resp(
+            400,
+            &format!("state must be one of {}", CD_HOP_STATES.join(", ")),
+        );
+    }
+    if let Some(v) = h.verdict.as_deref() {
+        if !CD_HOP_VERDICTS.contains(&v) {
+            return error_resp(
+                400,
+                &format!("verdict must be one of {}", CD_HOP_VERDICTS.join(", ")),
+            );
+        }
+    }
+    if h.against_version.trim().is_empty() {
+        return error_resp(400, "against_version is required");
+    }
+    for (name, run) in [
+        ("candidate_run", h.candidate_run.as_deref()),
+        ("baseline_run", h.baseline_run.as_deref()),
+    ] {
+        if let Some(run) = run {
+            if let Err(e) = run.parse::<RunId>() {
+                return error_resp(400, &format!("{name}: {e}"));
+            }
+        }
+    }
+    if h.requested_by.trim().is_empty() {
+        h.requested_by = actor.0.clone();
+    }
+    if h.detail.is_null() {
+        h.detail = serde_json::json!({});
+    }
+    match store.cd_version_get(&h.system, &h.version).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_resp(
+                409,
+                &format!(
+                    "unknown version {:?}: post it to /cd/versions first",
+                    h.version
+                ),
+            )
+        }
+        Err(e) => return error_resp(500, &format!("version: {e}")),
+    }
+    let row = match store.cd_hop_append(&h).await {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("hop: {e}")),
+    };
+    cd_audit(&store, &actor.0, "cd.hop", "version", &format!("{}/{}", h.system, h.version),
+        &serde_json::json!({ "against_version": h.against_version, "state": h.state, "verdict": h.verdict, "candidate_run": h.candidate_run, "baseline_run": h.baseline_run, "jenkins_build": h.jenkins_build })).await;
+    json_ok_ser(&row)
 }
 
 /// `GET /api/v1/cd/pull-requests/{owner}/{repo}/{number}`: the versions
