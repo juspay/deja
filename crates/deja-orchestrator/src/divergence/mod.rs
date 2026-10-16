@@ -2789,6 +2789,10 @@ fn args_identity_kind(change: &deja::identity::IdentityChange) -> &'static str {
     match change {
         deja::identity::IdentityChange::ArrayOrder(_) => "ArgsOrderAbsorbed",
         deja::identity::IdentityChange::DocumentText(_) => "ArgsDocumentAbsorbed",
+        // A derived value the matched body already explains: absorbed, but on
+        // its own kind so a body's derived shadow is visible next to the
+        // body's own rendering differences.
+        deja::identity::IdentityChange::ProvenanceValue(_) => "ArgsProvenanceAbsorbed",
     }
 }
 
@@ -5030,6 +5034,16 @@ fn identity_sites(
             }
             deja::identity::IdentityChange::ArrayOrder(inner) => {
                 orders.push(site_path(&format!(
+                    "{path}{}",
+                    inner.trim_start_matches('$')
+                )));
+            }
+            // A derived-value difference rides the document it shadows:
+            // named where text differences are named, so the report string
+            // for a shadowed signature points at the body it was computed
+            // from.
+            deja::identity::IdentityChange::ProvenanceValue(inner) => {
+                texts.push(site_path(&format!(
                     "{path}{}",
                     inner.trim_start_matches('$')
                 )));

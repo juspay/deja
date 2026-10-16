@@ -43,23 +43,44 @@ pub enum IdentityChange {
     ArrayOrder(String),
     /// A string holding the same JSON document, written differently.
     DocumentText(String),
+    /// An envelope member named as derived from the envelope's body bytes
+    /// (see [`PROVENANCE_HEADERS`]): ignored in the comparison because a body
+    /// that canonically matched produces it, and reported here so the
+    /// absorption stays visible rather than silent.
+    ProvenanceValue(String),
 }
 
 impl IdentityChange {
     /// The path of the value read differently.
     pub fn path(&self) -> &str {
         match self {
-            Self::ArrayOrder(path) | Self::DocumentText(path) => path,
+            Self::ArrayOrder(path) | Self::DocumentText(path) | Self::ProvenanceValue(path) => path,
         }
     }
 }
+
+/// Envelope header names whose value is derived from the envelope's body
+/// bytes rather than chosen independently: a signature over the body is one.
+/// A body that canonically matched produces such a value entirely, so its
+/// difference is the body's difference restated and counts nothing of its
+/// own; the difference is still reported as a provenance change so the
+/// absorption is visible. Add a name here only when it is provably a pure
+/// function of the body; a value a third party chose is not.
+const PROVENANCE_HEADERS: &[&str] = &["x-webhook-signature-512"];
+
+/// The largest string the base64 rung will decode. The rung exists because
+/// captures carry documents in text; a text larger than this is compared as
+/// text rather than decoded at any cost.
+const MAX_ENCODED_INPUT: usize = 1 << 22;
 
 /// Whether another call could be written differently from `value` and still
 /// have its identity: it holds an array of two or more members, or a string
 /// read as a document. Such a call is addressed by its identity alone.
 pub fn identity_applies(value: &Value) -> bool {
     match value {
-        Value::String(text) => embedded_document(text).is_some(),
+        Value::String(text) => {
+            embedded_document(text).is_some() || encoded_document(text).is_some()
+        }
         Value::Object(map) if is_form_request_body(map) => false,
         Value::Object(map) if is_json_request_body(map) => {
             map.get("json").is_some_and(identity_applies)
@@ -98,13 +119,11 @@ pub fn identity_differences(recorded: &Value, observed: &Value) -> Option<Vec<Id
 /// number as written.
 pub fn same(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::String(x), Value::String(y)) => {
-            match (embedded_document(x), embedded_document(y)) {
-                (Some(x), Some(y)) => same(&x, &y),
-                (None, None) => x == y,
-                _ => false,
-            }
-        }
+        (Value::String(x), Value::String(y)) => match documents(x, y) {
+            (Some(x), Some(y)) => same(&x, &y),
+            (None, None) => x == y,
+            _ => false,
+        },
         (Value::Object(x), Value::Object(y)) if is_form_request_body(x) => {
             is_form_request_body(y) && form_fields_same(x, y)
         }
@@ -114,6 +133,12 @@ pub fn same(a: &Value, b: &Value) -> bool {
                     (Some(x), Some(y)) => same(x, y),
                     _ => false,
                 }
+        }
+        (Value::Object(x), Value::Object(y)) if wire_envelope(x).is_some() => {
+            match (wire_envelope(x), wire_envelope(y)) {
+                (Some((xb, xh)), Some((yb, yh))) => envelope_same(xb, xh, yb, yh),
+                _ => false,
+            }
         }
         (Value::Object(x), Value::Object(y)) => {
             !is_form_request_body(y)
@@ -129,6 +154,115 @@ pub fn same(a: &Value, b: &Value) -> bool {
         (Value::Number(x), Value::Number(y)) => x.to_string() == y.to_string(),
         (x, y) => x == y,
     }
+}
+
+/// Both strings read as documents when either holds one: an inline JSON
+/// document, or a base64 string whose UTF-8 payload is one — the two
+/// encodings a capture uses for the same document. A string that holds no
+/// document stays text, so a signature or a ciphertext compares as written.
+fn documents(x: &str, y: &str) -> (Option<Value>, Option<Value>) {
+    let x = embedded_document(x).or_else(|| encoded_document(x));
+    let y = embedded_document(y).or_else(|| encoded_document(y));
+    (x, y)
+}
+
+/// A base64 string whose UTF-8 payload is a JSON object or array, decoded to
+/// it. Anything else stays text. The comparison recurses on the document, so
+/// encoding layers resolve (a document in a string in a base64 string), and
+/// the chain is finite because each layer is strictly shorter than its
+/// encoding. Only a string under [`MAX_ENCODED_INPUT`], holding brackets a
+/// document would, is decoded at all.
+fn encoded_document(text: &str) -> Option<Value> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let trimmed = text.trim();
+    if trimmed.len() < 4 || trimmed.len() > MAX_ENCODED_INPUT {
+        return None;
+    }
+    let bytes = STANDARD.decode(trimmed).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    embedded_document(text)
+}
+
+/// An object of exactly `body` and `headers`: a string body, and a headers
+/// array of `[name, value]` string pairs — the shape an HTTP envelope
+/// capture carries once decoded. Anything else is not an envelope: a header
+/// triple, a non-string body or an extra member each mean someone else
+/// assembled this object, and it compares by the generic arm.
+fn wire_envelope(map: &serde_json::Map<String, Value>) -> Option<(&Value, &[Value])> {
+    if map.len() != 2 {
+        return None;
+    }
+    let body = map.get("body").filter(|body| body.is_string())?;
+    let headers = map.get("headers")?.as_array()?;
+    for header in headers {
+        let pair = header.as_array()?;
+        if pair.len() != 2 || !pair.iter().all(Value::is_string) {
+            return None;
+        }
+    }
+    Some((body, headers))
+}
+
+/// One `[name, value]` header pair, without its brackets.
+fn header_parts(header: &Value) -> (&str, &str) {
+    let pair = header.as_array().expect("envelope headers are pairs");
+    (
+        pair[0].as_str().expect("envelope header names are strings"),
+        pair[1]
+            .as_str()
+            .expect("envelope header values are strings"),
+    )
+}
+
+/// Whether two envelopes' derived-header pairs read differently, given both
+/// are envelopes. Called only on one identity, where the body matched: a
+/// change there is the body's own difference restated by the derived value.
+fn headers_dropped(r: &serde_json::Map<String, Value>, o: &serde_json::Map<String, Value>) -> bool {
+    let derived = |map: &serde_json::Map<String, Value>| -> Vec<String> {
+        wire_envelope(map)
+            .map(|(_, headers)| {
+                let mut derived: Vec<String> = headers
+                    .iter()
+                    .filter(|h| PROVENANCE_HEADERS.contains(&header_parts(h).0))
+                    .map(|h| {
+                        let (name, value) = header_parts(h);
+                        format!("{name}:{value}")
+                    })
+                    .collect();
+                derived.sort();
+                derived
+            })
+            .unwrap_or_default()
+    };
+    derived(r) != derived(o)
+}
+
+/// Two envelopes with the same body are the same envelope when their headers
+/// agree as a multiset outside the derived names: a name listed in
+/// [`PROVENANCE_HEADERS`] is a pure function of the body, so with the body
+/// matched its pairs are not compared at all — they cannot disagree
+/// independently of the body they came from, and whatever value arrives is
+/// the body's own — while a body that does not match, or a genuine header
+/// difference, stays blocking. The derived pair is reported as a provenance
+/// change by [`differences`], not silently dropped.
+fn envelope_same(body_x: &Value, headers_x: &[Value], body_y: &Value, headers_y: &[Value]) -> bool {
+    if !same(body_x, body_y) {
+        return false;
+    }
+    let chosen = |headers: &[Value]| {
+        let mut counts: std::collections::BTreeMap<(String, String), usize> =
+            std::collections::BTreeMap::new();
+        for header in headers {
+            let (name, value) = header_parts(header);
+            if !PROVENANCE_HEADERS.contains(&name) {
+                *counts
+                    .entry((name.to_owned(), value.to_owned()))
+                    .or_default() += 1;
+            }
+        }
+        counts
+    };
+    chosen(headers_x) == chosen(headers_y)
 }
 
 /// One object member of each side: a byte string as written unless both hold
@@ -268,6 +402,7 @@ pub fn element_hash(value: &Value) -> u64 {
     const DOCUMENT: u64 = 0x0064_6f63;
     const FORM: u64 = 0x666f_726d;
     const BODY: u64 = 0x626f_6479;
+    const ENVELOPE: u64 = 0x656e_7665_6c6f_7065;
     const BYTES: u64 = 0x0062_7974_6573;
     let tagged = |tag: u64, inner: u64| finalise(tag ^ inner.rotate_left(17));
     match value {
@@ -277,7 +412,10 @@ pub fn element_hash(value: &Value) -> u64 {
             0x006e_756d,
             crate::fnv1a_str(crate::FNV_OFFSET_BASIS, &n.to_string()),
         ),
-        Value::String(text) => match embedded_document(text) {
+        Value::String(text) => match embedded_document(text).or_else(|| encoded_document(text)) {
+            // A document hashes as the document however its string encodes it,
+            // in line with `same` resolving both encodings, and apart from
+            // the byte-as-written bucket, as the comment there says.
             Some(document) => tagged(DOCUMENT, element_hash(&document)),
             None => tagged(0x0073_7472, crate::fnv1a_str(crate::FNV_OFFSET_BASIS, text)),
         },
@@ -290,6 +428,23 @@ pub fn element_hash(value: &Value) -> u64 {
         }
         Value::Object(map) if is_json_request_body(map) => {
             tagged(BODY, map.get("json").map_or(0, element_hash))
+        }
+        Value::Object(map) if wire_envelope(map).is_some() => {
+            // An envelope hashes as its body plus its chosen headers: the
+            // derived names read out so that a signature over body bytes
+            // hashes as the body it signs, in line with `envelope_same`.
+            let (body, headers) = wire_envelope(map).expect("an envelope");
+            let sum = headers
+                .iter()
+                .filter(|header| !PROVENANCE_HEADERS.contains(&header_parts(header).0))
+                .fold(element_hash(body), |sum, header| {
+                    let (name, value) = header_parts(header);
+                    sum.wrapping_add(finalise(
+                        crate::fnv1a_str(crate::FNV_OFFSET_BASIS, name)
+                            ^ crate::fnv1a_str(crate::FNV_OFFSET_BASIS, value).rotate_left(29),
+                    ))
+                });
+            tagged(ENVELOPE, sum)
         }
         Value::Object(map) => {
             let sum = map.iter().fold(0u64, |sum, (key, member)| {
@@ -373,6 +528,9 @@ fn differences(recorded: &Value, observed: &Value, path: &str, out: &mut Vec<Ide
                 differences(r, o, &format!("{path}.json"), out);
             }
         }
+        (Value::Object(r), Value::Object(o)) if wire_envelope(r).is_some() => {
+            envelope_differences(r, o, path, out);
+        }
         (Value::Object(r), Value::Object(o)) => {
             for (key, value) in r {
                 if let Some(other) = o.get(key) {
@@ -399,10 +557,58 @@ fn differences(recorded: &Value, observed: &Value, path: &str, out: &mut Vec<Ide
                 differences(&r[index], &o[partner], &format!("{path}[{index}]"), out);
             }
         }
-        (Value::String(_), Value::String(_)) => {
+        (Value::String(x), Value::String(y)) => {
             out.push(IdentityChange::DocumentText(path.to_owned()));
+            // A document inside the string walks its own parts only when the
+            // walk can name them — an envelope names body and headers, and a
+            // derived-header change is reported at its own path, not folded
+            // into the plain text difference above.
+            if let (Some(Value::Object(xm)), Some(Value::Object(om))) =
+                (documents(x, y).0, documents(x, y).1)
+            {
+                if wire_envelope(&xm).is_some() && wire_envelope(&om).is_some() {
+                    envelope_differences(&xm, &om, path, out);
+                }
+            }
         }
         _ => {}
+    }
+}
+
+/// The member walk of two envelopes, shared between a bare envelope object
+/// and one held inside a decoded string: body's own differences land under
+/// `.body`, chosen headers compare as an array walk under `.headers`, and a
+/// derived value the captured encoding wrote landing on the comparison is
+/// reported as a provenance change so the absorption stays visible.
+fn envelope_differences(
+    r: &serde_json::Map<String, Value>,
+    o: &serde_json::Map<String, Value>,
+    path: &str,
+    out: &mut Vec<IdentityChange>,
+) {
+    let (rb, rh) = wire_envelope(r).expect("an envelope");
+    let (ob, oh) = wire_envelope(o).expect("one identity is one envelope");
+    if rb != ob {
+        differences(rb, ob, &format!("{path}.body"), out);
+    }
+    let chosen = |headers: &[Value]| {
+        headers
+            .iter()
+            .filter(|h| !PROVENANCE_HEADERS.contains(&header_parts(h).0))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let (rh, oh) = (chosen(rh), chosen(oh));
+    if rh != oh {
+        differences(
+            &Value::Array(rh),
+            &Value::Array(oh),
+            &format!("{path}.headers"),
+            out,
+        );
+    }
+    if headers_dropped(r, o) {
+        out.push(IdentityChange::ProvenanceValue(format!("{path}.headers")));
     }
 }
 
@@ -1005,6 +1211,135 @@ mod tests {
             Some(vec![IdentityChange::ArrayOrder(
                 "$.body.json.ids".to_owned()
             )])
+        );
+    }
+
+    fn b64(text: &str) -> String {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        STANDARD.encode(text)
+    }
+
+    /// A string base64-encoding a JSON document is read as that document:
+    /// the encoding is a rendering, the members inside are the identity.
+    /// This is how call args cross a layer of capture that base64s its body
+    /// (the keymanager's `request.data`, for one) without losing identity.
+    #[test]
+    fn a_base64_document_is_read_as_its_document() {
+        let (a, b) = (
+            json!(b64(r#"{"a":1,"b":["x","y"]}"#)),
+            json!(b64(r#"{"b":["y","x"],"a":1}"#)),
+        );
+        assert!(same(&a, &b));
+        assert!(
+            identity_applies(&a),
+            "a document can be written another way"
+        );
+        assert_eq!(identity_args_hash(&a), identity_args_hash(&b));
+        assert_eq!(
+            identity_differences(&a, &b),
+            Some(vec![IdentityChange::DocumentText("$".to_owned())])
+        );
+        // One changed member below the encoding is a different call, even
+        // with the encoding's order untouched.
+        assert_eq!(
+            identity_differences(&a, &json!(b64(r#"{"a":2,"b":["x","y"]}"#))),
+            None
+        );
+    }
+
+    /// Encoding layers resolve: a document whose own member is a base64
+    /// document is read through both.
+    #[test]
+    fn an_encoding_layer_inside_a_document_resolves() {
+        let inner = b64(r#"{"k":[1,2]}"#);
+        let inner_reordered = b64(r#"{"k":[2,1]}"#);
+        let (a, b) = (
+            json!(b64(&format!(r#"{{"inner":"{inner}"}}"#))),
+            json!(b64(&format!(r#"{{"inner":"{inner_reordered}"}}"#))),
+        );
+        assert!(same(&a, &b));
+        assert_eq!(identity_args_hash(&a), identity_args_hash(&b));
+    }
+
+    /// What the rung refuses: not base64, base64 of non-UTF-8, base64 of
+    /// text that is not a document, and a string about to run past the
+    /// decode budget. Each stays text, so only its exact text compares.
+    #[test]
+    fn the_rung_reads_only_a_document_that_is_actually_there() {
+        let not_b64 = json!("it's not base64!!");
+        assert!(!identity_applies(&not_b64));
+        assert!(!same(&not_b64, &json!(b64(r#"{"a":1}"#))));
+        // base64 of bytes that are not UTF-8.
+        {
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            let garbage = json!(STANDARD.encode([0xff, 0xfe, 0xfd]));
+            assert!(!identity_applies(&garbage));
+        }
+        // base64 of a bare scalar: not a document.
+        let scalar = json!(b64("42"));
+        assert!(!identity_applies(&scalar));
+        assert!(same(&scalar, &json!(b64("42"))));
+        assert!(!same(&scalar, &json!(b64("43"))));
+    }
+
+    /// The km webhook case: a decoded HTTP envelope whose reordered body and
+    /// derived signature header differ is one identity, its differences
+    /// named where they sit.
+    #[test]
+    fn an_envelope_reads_body_and_separates_its_derived_headers() {
+        let envelope = |body: &str, signature: &str| {
+            json!({"request": {"data": b64(&format!(
+                r#"{{"body":{body:?},"headers":[["content-type","application/json"],["x-webhook-signature-512",{signature:?}]]}}"#
+            ))}})
+        };
+        let (a, b) = (
+            envelope(r#"{"m":1,"n":[2,1]}"#, "sig-a"),
+            envelope(r#"{"n":[1,2],"m":1}"#, "sig-b"),
+        );
+        assert!(same(&a, &b));
+        assert!(identity_applies(&a));
+        assert_eq!(identity_args_hash(&a), identity_args_hash(&b));
+        assert_eq!(
+            identity_differences(&a, &b),
+            Some(vec![
+                IdentityChange::DocumentText("$.request.data".to_owned()),
+                IdentityChange::DocumentText("$.request.data.body".to_owned()),
+                IdentityChange::ProvenanceValue("$.request.data.headers".to_owned()),
+            ])
+        );
+    }
+
+    /// What the envelope arm refuses, each still different calls: a body that
+    /// moved semantically (a member added), a derived name whose body differs
+    /// with it, and a chosen header whose value changed.
+    #[test]
+    fn an_envelope_still_blocks_everything_of_its_own() {
+        let envelope = |body: &str, signature: &str, chosen: &str| {
+            json!(b64(&format!(
+                r#"{{"body":{body:?},"headers":[["content-type",{chosen:?}],["x-webhook-signature-512",{signature:?}]]}}"#
+            )))
+        };
+        let (a, b) = (
+            envelope(r#"{"m":1}"#, "sig-a", "application/json"),
+            envelope(r#"{"m":2}"#, "sig-b", "application/json"),
+        );
+        // A changed body is a changed call, signature change under it or no.
+        assert!(!same(&a, &b));
+        assert_eq!(identity_differences(&a, &b), None);
+        // A chosen header that changed is a changed call.
+        let changed_header = envelope(r#"{"m":1}"#, "sig-a", "text/html");
+        assert!(!same(&a, &changed_header));
+        // And an invented signature with the body untouched absorbs with it:
+        // pure functions of the body cannot disagree with it.
+        let invented = envelope(r#"{"m":1}"#, "sig-other", "application/json");
+        let original = envelope(r#"{"m":1}"#, "sig-a", "application/json");
+        assert!(same(&original, &invented));
+        assert_eq!(
+            identity_differences(&original, &invented),
+            Some(vec![
+                IdentityChange::DocumentText("$".to_owned()),
+                IdentityChange::ProvenanceValue("$.headers".to_owned()),
+            ])
         );
     }
 }
