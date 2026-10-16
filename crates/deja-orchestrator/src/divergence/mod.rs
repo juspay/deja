@@ -7755,7 +7755,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
 pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecard> {
     let art = load_artifacts(root, run_id)?;
     let graph_plan = GraphScoringPlan::build(&art);
-    let card = detect_with_plan(&art, &graph_plan);
+    let mut card = detect_with_plan(&art, &graph_plan);
     let path = root
         .root
         .join("runs")
@@ -7766,8 +7766,24 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
     // Streamed straight to the file. Collecting first held every resolved row —
     // each carrying the recorded side's full `args` and `result` — alongside the
     // parsed table and graph, which is what OOMKilled the runner on a dense tape.
-    if let Err(e) = stream_ledger(&root.call_ledger_path(run_id), &art, &graph_plan) {
-        eprintln!("divergence: ledger stream failed for {run_id}: {e}");
+    let warning_count = card.warnings.len();
+    match stream_ledger(
+        &root.call_ledger_path(run_id),
+        &art,
+        &graph_plan,
+        &mut card.warnings,
+    ) {
+        Err(e) => eprintln!("divergence: ledger stream failed for {run_id}: {e}"),
+        Ok(()) if card.warnings.len() > warning_count => {
+            let bytes = serde_json::to_vec_pretty(&card).map_err(io::Error::other);
+            match bytes.and_then(|bytes| behaviour_tree::write_atomic(&path, &bytes)) {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!("divergence: ledger warning persistence failed for {run_id}: {e}")
+                }
+            }
+        }
+        Ok(()) => {}
     }
     Ok(card)
 }
@@ -7784,10 +7800,16 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
 pub fn build_ledger(art: &RunArtifacts) -> io::Result<Vec<CallRecord>> {
     let graph_plan = GraphScoringPlan::build(art);
     let mut rows = Vec::new();
-    build_ledger_into(art, &graph_plan, &mut |row| {
-        rows.push(row);
-        Ok(())
-    })?;
+    let mut warnings = Vec::new();
+    build_ledger_into(
+        art,
+        &graph_plan,
+        &mut |row| {
+            rows.push(row);
+            Ok(())
+        },
+        &mut warnings,
+    )?;
     Ok(rows)
 }
 
@@ -7795,6 +7817,7 @@ pub(crate) fn build_ledger_into(
     art: &RunArtifacts,
     graph_plan: &GraphScoringPlan,
     sink: &mut dyn FnMut(CallRecord) -> io::Result<()>,
+    warnings: &mut Vec<String>,
 ) -> io::Result<()> {
     let events = &art.events;
     let span_paths = ledger::recorded_span_paths(&art.table);
@@ -7850,6 +7873,7 @@ pub(crate) fn build_ledger_into(
         &art.unplanted_presence,
         &SeedGapCascade::build(art),
         graph_plan,
+        warnings,
         sink,
     )
 }
@@ -7859,17 +7883,23 @@ fn stream_ledger(
     path: &std::path::Path,
     art: &RunArtifacts,
     graph_plan: &GraphScoringPlan,
+    warnings: &mut Vec<String>,
 ) -> io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    build_ledger_into(art, graph_plan, &mut |row| {
-        let line = serde_json::to_vec(&row).map_err(io::Error::other)?;
-        out.write_all(&line)?;
-        out.write_all(b"\n")
-    })?;
+    build_ledger_into(
+        art,
+        graph_plan,
+        &mut |row| {
+            let line = serde_json::to_vec(&row).map_err(io::Error::other)?;
+            out.write_all(&line)?;
+            out.write_all(b"\n")
+        },
+        warnings,
+    )?;
     out.flush()
 }
 
@@ -8624,6 +8654,49 @@ mod tests {
             card.summary.omitted_calls, 1,
             "the driven-but-unobserved c-keep call is a real omission; \
              the undriven c-drop call must not count"
+        );
+    }
+
+    #[test]
+    fn missing_tape_event_warning_is_persisted_in_scorecard() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let run_id = "run-missing-tape-event";
+        run_with_namespaces(&root, run_id, Vec::new());
+        let events = vec![db_read_ev(
+            "c1",
+            "payment_attempt",
+            1,
+            serde_json::json!({"attempt_id": "present"}),
+            100,
+            110,
+            "root",
+            0,
+        )];
+        write_recording_tape(&crate::scope::TapeSlot::for_write(&root, "rec-ns"), &events);
+        crate::write_json(
+            &root.lookup_table_path(run_id),
+            &LookupTable {
+                recording_id: "rec-ns".to_owned(),
+                policy_version: deja::POLICY_VERSION,
+                event_schema_version: Some(deja::CURRENT_EVENT_SCHEMA_VERSION),
+                entries: vec![
+                    seq_entry(Some("c1"), "db", 1),
+                    seq_entry(Some("c1"), "db", 2),
+                ],
+                identity_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        detect_and_score(&root, run_id).unwrap();
+        let card: Scorecard = crate::read_json(&root.scorecard_path(run_id)).unwrap();
+        assert!(
+            card.warnings
+                .iter()
+                .any(|warning| warning.contains("no row for 1 unclaimed recorded call")),
+            "the persisted scorecard must name the missing tape event: {:?}",
+            card.warnings
         );
     }
 
@@ -17490,6 +17563,234 @@ mod tests {
             1
         );
     }
+    /// Real ledger rows, one JSON row per line, from two runs of router
+    /// fde19cb433 on 2026-09-30:
+    ///
+    /// - `rp-sbx-fde19cb433-fde19cb-09300817-nx-0930100503002.ledger`, the
+    ///   passing correlation `01a0f167-bce5-74b0-8467-e3fb090f02c8`, sequences
+    ///   9569 (a served km `call_encryption_service`), 9589 (the clock read
+    ///   inside it, labelled `pruned_subtree`), 9592 (a served
+    ///   `create_merchant_publishable_key`), 9593 (the uuid drawn inside it,
+    ///   labelled `omitted`) and 9697 (a clock read after the response,
+    ///   `omitted`);
+    /// - `rp-sbx-fde19cb433-fde19cb-09300822-o6-0930100718896.ledger`, the
+    ///   failing correlation `01a0f16a-7bb1-7812-a438-808d9a87eba4`, sequences
+    ///   8672 (the km `data/encrypt` that stopped the request), 8673 (the clock
+    ///   read inside it) and 8677 (a redis DEL after it), both
+    ///   `pruned_subtree`.
+    ///
+    /// Each line parses equal to the row the run wrote, except that the two
+    /// key-manager rows carry `<redacted>` in place of the key, plaintext and
+    /// ciphertext strings they transported. Nothing here reads those values.
+    fn nested_in_served_call_fixture() -> Vec<serde_json::Value> {
+        include_str!("fixtures/nested_in_served_call.ledger.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture row parses"))
+            .collect()
+    }
+
+    /// The recorded event a real ledger row was built from. The tape's timing
+    /// is not on a ledger row, so start and end are supplied: a call made from
+    /// inside another is given a window inside the other's, as the recorder
+    /// stamps it.
+    fn event_from_ledger_row(row: &serde_json::Value, start: u64, end: u64) -> deja::BoundaryEvent {
+        let recorded = &row["recorded"];
+        let mut event = omitted_ev(
+            row["source_event_global_sequence"].as_u64().unwrap(),
+            row["boundary"].as_str().unwrap(),
+            row["correlation_id"].as_str(),
+        );
+        event.trait_name = row["trait_name"].as_str().unwrap().to_owned();
+        event.method_name = row["method_name"].as_str().unwrap().to_owned();
+        event.call_file = recorded["call_file"].as_str().unwrap().to_owned();
+        event.call_line = recorded["call_line"].as_u64().unwrap() as u32;
+        event.call_column = recorded["call_column"].as_u64().unwrap() as u32;
+        event.args = recorded["args"].clone().into();
+        event.result = recorded["result"].clone().into();
+        event.is_error = recorded["is_error"].as_bool().unwrap();
+        event.graph_node_id = recorded["graph_node_id"].as_u64();
+        event.task_id = Some("request".to_owned());
+        event.timestamp_ns = start;
+        event.end_timestamp_ns = Some(end);
+        event
+    }
+
+    fn table_entries_for_ledger_row(row: &serde_json::Value) -> Vec<LookupEntry> {
+        let recorded = &row["recorded"];
+        let unlocated = seq_entry_method_res(
+            row["correlation_id"].as_str(),
+            row["boundary"].as_str().unwrap(),
+            row["method_name"].as_str().unwrap(),
+            row["source_event_global_sequence"].as_u64().unwrap(),
+            recorded["result"].clone(),
+        );
+        let mut span = unlocated.clone();
+        span.key.locus = Locus::SpanPath {
+            path: recorded["span_path"].as_str().unwrap().to_owned(),
+        };
+        vec![unlocated, span]
+    }
+
+    fn served_from_ledger_row(row: &serde_json::Value) -> ObservedCall {
+        let mut observed = substituted_obs_method(
+            row["boundary"].as_str().unwrap(),
+            row["correlation_id"].as_str(),
+            row["method_name"].as_str().unwrap(),
+            row["source_event_global_sequence"].as_u64().unwrap(),
+            row["recorded"]["result"].clone(),
+        );
+        observed.args = row["observed"]["args"].clone();
+        observed.graph_node_id = row["observed"]["graph_node_id"].as_u64();
+        observed
+    }
+
+    /// A clock read inside a served km call, and a uuid drawn inside a served
+    /// id seam, were not re-made because the call around them was served, not
+    /// because anything went missing. Each gets the kind that says so and names
+    /// the call. A clock read after the response stays `omitted`, and the calls
+    /// a stop cut off stay `pruned_subtree`: a served call accounts only for
+    /// what ran inside it.
+    #[test]
+    fn a_call_inside_a_served_call_is_named_apart_from_pruned_and_omitted() {
+        let rows = nested_in_served_call_fixture();
+        let row = |seq: u64| {
+            rows.iter()
+                .find(|row| row["source_event_global_sequence"] == seq)
+                .unwrap_or_else(|| panic!("fixture has {seq}"))
+        };
+        let passing = "01a0f167-bce5-74b0-8467-e3fb090f02c8";
+        let failing = "01a0f16a-7bb1-7812-a438-808d9a87eba4";
+        // (sequence, start, end). Children sit inside their parent's window;
+        // 9697 comes after everything, 8677 after the stop.
+        let windows = [
+            (9569, 100, 200),
+            (9589, 150, 151),
+            (9592, 300, 310),
+            (9593, 305, 306),
+            (9697, 900, 901),
+            (8672, 100, 200),
+            (8673, 150, 151),
+            (8677, 300, 310),
+        ];
+        let events: Vec<_> = windows
+            .iter()
+            .map(|(seq, start, end)| event_from_ledger_row(row(*seq), *start, *end))
+            .collect();
+        let entries: Vec<_> = windows
+            .iter()
+            .flat_map(|(seq, _, _)| table_entries_for_ledger_row(row(*seq)))
+            .collect();
+        // The stopped encrypt: unresolved, the request died on it.
+        let mut stopped = obs("km", Some(failing), false, None, None);
+        stopped.method_name = "call_encryption_service".to_owned();
+        stopped.args = row(8672)["observed"]["args"].clone();
+        stopped.graph_node_id = row(8672)["observed"]["graph_node_id"].as_u64();
+        stopped.outcome = deja::SubstituteOutcome::Stopped;
+        let observed = vec![
+            served_from_ledger_row(row(9569)),
+            served_from_ledger_row(row(9592)),
+            stopped,
+        ];
+        // Record side as the tape has it: the km call attaches to its caller's
+        // span and opens `call_encryption_service` beneath it; the id seam opens
+        // none. The failing side keeps the spans that bear events and drops the
+        // intermediate ones between `server_wrap_util` and `delete_key`.
+        let record = vec![
+            graph_span(32719, passing, None, 0, "server_wrap_util"),
+            graph_span(
+                32851,
+                passing,
+                Some(32719),
+                1,
+                "transfer_key_to_key_manager",
+            ),
+            graph_span(32852, passing, Some(32851), 2, "call_encryption_service"),
+            graph_span(32853, passing, Some(32852), 3, "send_encryption_request"),
+            graph_span(30746, failing, None, 0, "server_wrap_util"),
+            graph_span(30883, failing, Some(30746), 1, "encrypt_via_api"),
+            graph_span(30884, failing, Some(30883), 2, "call_encryption_service"),
+            graph_span(30885, failing, Some(30884), 3, "send_encryption_request"),
+            graph_span(
+                30904,
+                failing,
+                Some(30746),
+                4,
+                "update_profile_by_profile_id",
+            ),
+            graph_span(30907, failing, Some(30904), 5, "delete_key"),
+        ];
+        // Replay side: a served call's body opens nothing, and the stop ends the
+        // request before the update.
+        let replay = vec![
+            graph_span(2049, passing, None, 0, "server_wrap_util"),
+            graph_span(2055, passing, Some(2049), 1, "transfer_key_to_key_manager"),
+            graph_span(11600, failing, None, 0, "server_wrap_util"),
+            graph_span(11626, failing, Some(11600), 1, "encrypt_via_api"),
+        ];
+        let artifacts = with_graphs(
+            art_with_events(
+                entries,
+                observed,
+                vec![http(passing, true, vec![]), http(failing, false, vec![])],
+                events,
+            ),
+            record,
+            replay,
+        );
+        // Preconditions: both correlations are graph-scored, so structure is
+        // what labelled 9589 and 8673 `pruned_subtree` before, and the verdicts
+        // are the real runs' own.
+        let card = detect(&artifacts);
+        let outcome = |id: &str| {
+            card.per_correlation
+                .iter()
+                .find(|outcome| outcome.correlation_id == id)
+                .expect("scored")
+        };
+        for id in [passing, failing] {
+            assert_eq!(outcome(id).scoring_mode, deja_forest::ScoringMode::Graph);
+        }
+        assert!(outcome(passing).passed, "{:?}", outcome(passing));
+        assert!(!outcome(failing).passed, "{:?}", outcome(failing));
+
+        let ledger = build_ledger(&artifacts).expect("ledger builds");
+        let got = |seq: u64| {
+            ledger
+                .iter()
+                .find(|r| r.source_event_global_sequence == Some(seq) && r.observed.is_none())
+                .unwrap_or_else(|| panic!("an unclaimed row for {seq}: {ledger:?}"))
+        };
+
+        for (child, parent) in [(9589, 9569), (9593, 9592)] {
+            let emitted = got(child);
+            assert_eq!(emitted.kind, "nested_in_served_call", "{emitted:?}");
+            let ancestor = emitted.served_ancestor.as_ref().expect("names the call");
+            assert_eq!(ancestor.global_sequence, parent, "{emitted:?}");
+            assert_eq!(ancestor.method_name, row(parent)["method_name"]);
+            assert_eq!(ancestor.call_file, row(parent)["recorded"]["call_file"]);
+        }
+        assert_eq!(got(9697).kind, "omitted", "{:?}", got(9697));
+        assert_eq!(got(8673).kind, "pruned_subtree", "{:?}", got(8673));
+        assert_eq!(got(8677).kind, "pruned_subtree", "{:?}", got(8677));
+        for seq in [9697, 8673, 8677] {
+            assert!(got(seq).served_ancestor.is_none(), "{:?}", got(seq));
+        }
+
+        // Only the kind moved. Every other field of each unclaimed row, the
+        // recorded side and `blocking` included, parses equal to the row the
+        // real run wrote.
+        for seq in [9589, 9593, 9697, 8673, 8677] {
+            let mut emitted = serde_json::to_value(got(seq)).unwrap();
+            let mut real = row(seq).clone();
+            for value in [&mut emitted, &mut real] {
+                let object = value.as_object_mut().unwrap();
+                object.remove("kind");
+                object.remove("served_ancestor");
+            }
+            assert_eq!(emitted, real, "sequence {seq}");
+        }
+    }
+
     /// A bind-order swap is a SKEW and not a divergence.
     ///
     /// Two sibling spans with identical names, the recorded side attaching

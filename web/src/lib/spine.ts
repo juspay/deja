@@ -47,7 +47,8 @@ export type Mark =
   | "identity-skew"
   | "unknown"
   | "non-blocking"
-  | "matched";
+  | "matched"
+  | "inside-served";
 
 export const MARK_ORDER: Mark[] = [
   "origin",
@@ -63,7 +64,19 @@ export const MARK_ORDER: Mark[] = [
   "unknown",
   "non-blocking",
   "matched",
+  "inside-served",
 ];
+
+/**
+ * Whether a mark is something to look at. `matched` is agreement, and
+ * `inside-served` is a call that was never going to run because the call
+ * around it was served from the recording. Neither is a finding, and neither
+ * may count as one in a tab's tally or keep a path open under "only paths with
+ * a finding".
+ */
+export function isFinding(m: Mark): boolean {
+  return m !== "matched" && m !== "inside-served";
+}
 
 const RANK = new Map(MARK_ORDER.map((m, i) => [m, i]));
 
@@ -189,7 +202,7 @@ function scoredMarkOf(o: SpanShapeOutcome): Mark {
   }
 }
 
-function markOf(c: CallRecord): Mark | null {
+export function markOf(c: CallRecord): Mark | null {
   switch (c.kind) {
     case "value_diverged":
       return c.origin ? "origin" : "consequence";
@@ -204,6 +217,13 @@ function markOf(c: CallRecord): Mark | null {
       // so nothing on the replay side pairs with it. That is an absence, and it
       // is the same absence `omitted` names.
       return "omitted";
+    case "nested_in_served_call":
+      // The recording made this call inside another that the replay served, so
+      // the served call's body, and this call with it, never ran. That is what
+      // substitution does, not an absence to look into. The scorer still
+      // decides whether it counts, and a row it counts is shown as the
+      // omission it is charged as.
+      return c.blocking ? "omitted" : "inside-served";
     case "novel_subtree":
       // The mirror: a subtree the candidate produced with no recorded
       // counterpart.
@@ -610,7 +630,7 @@ export function buildSpine(
       // Children in first-seen order — the ledger's order, which follows the
       // recorded call sequence. The graph's `sequence` is per-side and cannot
       // order a merged row.
-      let w: Mark | null = n.mark === "matched" ? null : n.mark;
+      let w: Mark | null = n.mark && isFinding(n.mark) ? n.mark : null;
       for (const ch of n.children) w = worse(w, visit(ch));
       n.worst = w;
       return w;
