@@ -9,6 +9,7 @@ description = "Semantic record/replay engine for Déjà — captures trait-level
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.22"
 deja-core = { path = "../deja-core" }
 deja-context = { path = "../deja-context" }
 deja-derive = { path = "../deja-derive" }
