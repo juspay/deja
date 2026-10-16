@@ -111,6 +111,12 @@ method, args image — which the expression may name as `__deja_miss` so a host
 error enum takes it with `#[from]` and the degraded path stays attributable. No
 host error type appears in deja.
 
+When a site derives a synthetic continuation from `SubstituteMiss`, its drawn
+shapes use separate domains. Result-defining dimensions, such as a range's
+span or a word list's length, enter the seed; an index and a range are not two
+reductions of the same word at one miss. The nonrandom epoch-nanosecond count
+remains occurrence-based.
+
 Why the fail-stop default is wrong for *some* boundaries: a candidate under
 review adds boundary calls the recording never made — that is what a change is.
 Answering the first one with an unwind means actix writes nothing, the kernel
