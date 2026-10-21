@@ -1073,13 +1073,13 @@ export type CdDeploymentRow = {
 /** The newest row a version has on one environment. */
 export type CdVersionWhere = CdDeploymentRow;
 
-/** One hop replay: a version replayed against the release the next
+/** One promotion replay: a version replayed against the release the next
  *  environment runs (a pair of runs on one tape, three-way). Append-only
  *  like the deployment log: `requested` when the job starts, then `done`,
  *  `failed` or `skipped` with a reason. `run_state` and `run_delta_verdict`
  *  are the candidate run's own, read at query time; `verdict` is the word
  *  the job read when it finished. */
-export type CdHopRow = {
+export type CdPromotionReplayRow = {
   id: number;
   system: string;
   version: string;
@@ -1126,8 +1126,8 @@ export type CdEnvironment = {
   live: CdDeploymentRow | null;
   latest_version: CdVersionRow | null;
   live_version: CdVersionRow | null;
-  /** The live version's newest hop, when it has one. */
-  live_hop: CdHopRow | null;
+  /** The live version's newest promotion replay, when it has one. */
+  live_promotion_replay: CdPromotionReplayRow | null;
 };
 
 const sys = (system: string) => `system=${encodeURIComponent(system)}`;
@@ -1171,11 +1171,11 @@ export const cdApi = {
       `/api/v1/cd/environments/${encodeURIComponent(environment)}/deployments?${sys(system)}&limit=${limit}`,
     ),
   versions: (system: string, limit = 200) =>
-    request<{ system: string; versions: { version: CdVersionRow; where: CdVersionWhere[]; hop: CdHopRow | null }[] }>(
+    request<{ system: string; versions: { version: CdVersionRow; where: CdVersionWhere[]; promotion_replay: CdPromotionReplayRow | null }[] }>(
       `/api/v1/cd/versions?${sys(system)}&limit=${limit}`,
     ),
   version: (system: string, version: string) =>
-    request<{ version: CdVersionRow; deployments: CdDeploymentRow[]; hops: CdHopRow[] }>(
+    request<{ version: CdVersionRow; deployments: CdDeploymentRow[]; promotion_replays: CdPromotionReplayRow[] }>(
       `/api/v1/cd/versions/${encodeURIComponent(version)}?${sys(system)}`,
     ),
   pullRequest: (owner: string, repo: string, number: number) =>

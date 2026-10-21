@@ -71,11 +71,11 @@ pub struct CdSettings {
     /// promoting decides.
     #[serde(default)]
     pub soak_hours: Option<u32>,
-    /// What a promotion needs from the version's hop replay against the
+    /// What a promotion needs from the version's promotion replay against the
     /// release the target runs: `result` (one came back, any verdict;
     /// the default) or `none`.
     #[serde(default)]
-    pub hop_required: Option<String>,
+    pub promotion_replay_required: Option<String>,
 }
 
 /// `[auth]`: Google sign-in in front of the actions that need a person behind

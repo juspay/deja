@@ -357,7 +357,7 @@ fn app_router(state: AppState) -> Router {
     let post_cd_version = post(v1_cd_post_version).route_layer(service.clone());
     let post_cd_deployment = post(v1_cd_post_deployment).route_layer(service.clone());
     let post_cd_observed = post(v1_cd_post_observed).route_layer(service.clone());
-    let post_cd_hop = post(v1_cd_post_hop).route_layer(service);
+    let post_cd_promotion_replay = post(v1_cd_post_promotion_replay).route_layer(service);
     let session = || middleware::from_fn_with_state(state.clone(), require_session);
     let promote = post(v1_cd_promote).route_layer(session());
     let promotions = cd_read(get(v1_cd_promotions_list));
@@ -422,8 +422,8 @@ fn app_router(state: AppState) -> Router {
         )
         .route("/cd/versions/{version}", cd_read(get(v1_cd_version)))
         .route(
-            "/cd/versions/{version}/hops",
-            cd_read(get(v1_cd_version_hops)).merge(post_cd_hop),
+            "/cd/versions/{version}/promotion-replays",
+            cd_read(get(v1_cd_version_promotion_replays)).merge(post_cd_promotion_replay),
         )
         .route("/cd/deployments", post_cd_deployment)
         .route("/cd/environments", cd_read(get(v1_cd_environments)))
@@ -4452,8 +4452,8 @@ fn cd_limit(q: &std::collections::HashMap<String, String>, default: i64) -> i64 
         .min(1000)
 }
 
-const CD_HOP_STATES: [&str; 4] = ["requested", "done", "failed", "skipped"];
-const CD_HOP_VERDICTS: [&str; 5] = ["pass", "fail", "acknowledged", "inconclusive", "unknown"];
+const CD_PROMOTION_REPLAY_STATES: [&str; 4] = ["requested", "done", "failed", "skipped"];
+const CD_PROMOTION_REPLAY_VERDICTS: [&str; 5] = ["pass", "fail", "acknowledged", "inconclusive", "unknown"];
 
 const CD_DEPLOYMENT_STATES: [&str; 6] = [
     "requested",
@@ -4594,8 +4594,8 @@ async fn promotion_facts(
             .and_then(|v| v.merged_at),
         None => None,
     };
-    let hop = store
-        .cd_hops_of_version(system, version, 1)
+    let promotion_replay = store
+        .cd_promotion_replays_of_version(system, version, 1)
         .await
         .map_err(|e| e.to_string())?
         .into_iter()
@@ -4617,7 +4617,7 @@ async fn promotion_facts(
         version_merged_at: v.and_then(|v| v.merged_at),
         target_live,
         target_merged_at,
-        hop,
+        promotion_replay,
         in_flight: store
             .cd_promotion_in_flight(system, target)
             .await
@@ -4756,7 +4756,7 @@ async fn v1_cd_promote(
         "checks": checks,
         "from": facts.source,
         "target_live": facts.target_live,
-        "hop": facts.hop.map(|(state, against)| serde_json::json!({ "state": state, "against": against })),
+        "promotion_replay": facts.promotion_replay.map(|(state, against)| serde_json::json!({ "state": state, "against": against })),
     });
     let row = match store
         .cd_promotion_create(
@@ -5321,9 +5321,9 @@ async fn v1_cd_environments(
             }
         }
     }
-    let hops = match store.cd_latest_hop_per_version(&system).await {
+    let promotion_replays = match store.cd_latest_promotion_replay_per_version(&system).await {
         Ok(h) => h,
-        Err(e) => return error_resp(500, &format!("hops: {e}")),
+        Err(e) => return error_resp(500, &format!("promotion replays: {e}")),
     };
     let environments: Vec<serde_json::Value> = cd
         .environments
@@ -5337,9 +5337,9 @@ async fn v1_cd_environments(
                 "live": v,
                 "latest_version": l.and_then(|r| versions.get(&r.version)).cloned().flatten(),
                 "live_version": v.and_then(|r| versions.get(&r.version)).cloned().flatten(),
-                // The live version's newest hop: what it changes against the
+                // The live version's newest promotion replay: what it changes against the
                 // release the next environment runs.
-                "live_hop": v.and_then(|r| hops.iter().find(|h| h.version == r.version)),
+                "live_promotion_replay": v.and_then(|r| promotion_replays.iter().find(|h| h.version == r.version)),
             })
         })
         .collect();
@@ -5399,17 +5399,17 @@ async fn v1_cd_versions(State(st): State<AppState>, axum::extract::Query(q): Que
         Ok(p) => p,
         Err(e) => return error_resp(500, &format!("deployments: {e}")),
     };
-    let hops = match store.cd_latest_hop_per_version(&system).await {
+    let promotion_replays = match store.cd_latest_promotion_replay_per_version(&system).await {
         Ok(h) => h,
-        Err(e) => return error_resp(500, &format!("hops: {e}")),
+        Err(e) => return error_resp(500, &format!("promotion replays: {e}")),
     };
     let out: Vec<serde_json::Value> = versions
         .into_iter()
         .map(|v| {
             let where_: Vec<&deja_store::CdDeploymentRow> =
                 places.iter().filter(|p| p.version == v.version).collect();
-            let hop = hops.iter().find(|h| h.version == v.version);
-            serde_json::json!({ "version": v, "where": where_, "hop": hop })
+            let promotion_replay = promotion_replays.iter().find(|h| h.version == v.version);
+            serde_json::json!({ "version": v, "where": where_, "promotion_replay": promotion_replay })
         })
         .collect();
     json_ok(serde_json::json!({ "system": system, "versions": out }))
@@ -5445,15 +5445,15 @@ async fn v1_cd_version(
         Ok(rows) => rows,
         Err(e) => return error_resp(500, &format!("deployments: {e}")),
     };
-    match store.cd_hops_of_version(&system, &version, 50).await {
-        Ok(hops) => json_ok(serde_json::json!({ "version": v, "deployments": rows, "hops": hops })),
-        Err(e) => error_resp(500, &format!("hops: {e}")),
+    match store.cd_promotion_replays_of_version(&system, &version, 50).await {
+        Ok(promotion_replays) => json_ok(serde_json::json!({ "version": v, "deployments": rows, "promotion_replays": promotion_replays })),
+        Err(e) => error_resp(500, &format!("promotion replays: {e}")),
     }
 }
 
-/// `GET /api/v1/cd/versions/{version}/hops?system=`: a version's hop
+/// `GET /api/v1/cd/versions/{version}/promotion-replays?system=`: a version's promotion replays
 /// replays, newest first.
-async fn v1_cd_version_hops(
+async fn v1_cd_version_promotion_replays(
     State(st): State<AppState>,
     Path(version): Path<String>,
     axum::extract::Query(q): Query,
@@ -5471,18 +5471,18 @@ async fn v1_cd_version_hops(
         Err(r) => return r,
     };
     match store
-        .cd_hops_of_version(&system, &version, cd_limit(&q, 50))
+        .cd_promotion_replays_of_version(&system, &version, cd_limit(&q, 50))
         .await
     {
-        Ok(hops) => json_ok_ser(&hops),
-        Err(e) => error_resp(500, &format!("hops: {e}")),
+        Ok(promotion_replays) => json_ok_ser(&promotion_replays),
+        Err(e) => error_resp(500, &format!("promotion replays: {e}")),
     }
 }
 
-/// `POST /api/v1/cd/versions/{version}/hops`: the hop-replay job records
+/// `POST /api/v1/cd/versions/{version}/promotion-replays`: the promotion-replay job records
 /// that it is replaying a version against the next environment's release,
 /// and then how that went. Append-only; the version must be known.
-async fn v1_cd_post_hop(
+async fn v1_cd_post_promotion_replay(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
     Path(version): Path<String>,
@@ -5496,7 +5496,7 @@ async fn v1_cd_post_hop(
         Ok(s) => s,
         Err(r) => return r,
     };
-    let mut h: deja_store::NewCdHop = match serde_json::from_slice(&body) {
+    let mut h: deja_store::NewCdPromotionReplay = match serde_json::from_slice(&body) {
         Ok(h) => h,
         Err(e) => return error_resp(400, &format!("invalid body: {e}")),
     };
@@ -5504,17 +5504,17 @@ async fn v1_cd_post_hop(
     if !cd.knows_system(&h.system) {
         return error_resp(400, &format!("unknown system {:?}", h.system));
     }
-    if !CD_HOP_STATES.contains(&h.state.as_str()) {
+    if !CD_PROMOTION_REPLAY_STATES.contains(&h.state.as_str()) {
         return error_resp(
             400,
-            &format!("state must be one of {}", CD_HOP_STATES.join(", ")),
+            &format!("state must be one of {}", CD_PROMOTION_REPLAY_STATES.join(", ")),
         );
     }
     if let Some(v) = h.verdict.as_deref() {
-        if !CD_HOP_VERDICTS.contains(&v) {
+        if !CD_PROMOTION_REPLAY_VERDICTS.contains(&v) {
             return error_resp(
                 400,
-                &format!("verdict must be one of {}", CD_HOP_VERDICTS.join(", ")),
+                &format!("verdict must be one of {}", CD_PROMOTION_REPLAY_VERDICTS.join(", ")),
             );
         }
     }
@@ -5550,11 +5550,11 @@ async fn v1_cd_post_hop(
         }
         Err(e) => return error_resp(500, &format!("version: {e}")),
     }
-    let row = match store.cd_hop_append(&h).await {
+    let row = match store.cd_promotion_replay_append(&h).await {
         Ok(r) => r,
-        Err(e) => return error_resp(500, &format!("hop: {e}")),
+        Err(e) => return error_resp(500, &format!("promotion replay: {e}")),
     };
-    cd_audit(&store, &actor.0, "cd.hop", "version", &format!("{}/{}", h.system, h.version),
+    cd_audit(&store, &actor.0, "cd.promotion_replay", "version", &format!("{}/{}", h.system, h.version),
         &serde_json::json!({ "against_version": h.against_version, "state": h.state, "verdict": h.verdict, "candidate_run": h.candidate_run, "baseline_run": h.baseline_run, "jenkins_build": h.jenkins_build })).await;
     json_ok_ser(&row)
 }

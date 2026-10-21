@@ -26,11 +26,11 @@ import {
   type CdConfig,
   type CdDeploymentRow,
   type CdEnvironment,
-  type CdHopRow,
+  type CdPromotionReplayRow,
   type CdVersionRow,
   type CdVersionWhere,
 } from "../lib/api";
-import { ago, agoText, argoOf, carries, hopWord, howOf, inFlight, isRunning, mergesSince, placesOf, promotionCandidates, promotionProgress, pullRequestOf, stateTone, when } from "../lib/cd";
+import { ago, agoText, argoOf, carries, promotionReplayWord, howOf, inFlight, isRunning, mergesSince, placesOf, promotionCandidates, promotionProgress, pullRequestOf, stateTone, when } from "../lib/cd";
 
 // ---- shared ---------------------------------------------------------------
 
@@ -114,7 +114,7 @@ function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }
     return (
       <div className="cd-pause on" role="status">
         <div>
-          <b>Pipeline paused</b> for {system}. No merge is deployed to integ, and no hop replay, release or promotion is
+          <b>Pipeline paused</b> for {system}. No merge is deployed to integ, and no promotion replay, release or promotion is
           started, until it is resumed; one already past its first step finishes. Reconcile keeps reporting what runs.
           <div className="hint">
             by {paused.changed_by} · {when(paused.changed_at)} · {agoText(paused.changed_at)}{paused.reason ? ` · ${paused.reason}` : ""}
@@ -145,7 +145,7 @@ function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }
           }}
         >
           <label htmlFor="cd-pause-reason">
-            Why pause? integ-deploy, hop replays, releases and promotions stop before their next step; a step already running finishes.
+            Why pause? integ-deploy, promotion replays, releases and promotions stop before their next step; a step already running finishes.
           </label>
           <input
             id="cd-pause-reason"
@@ -269,11 +269,11 @@ function VersionLink({ version, system, cfg }: { version: string; system: string
   );
 }
 
-/** A hop's one word, with the reason on hover. */
-function HopChip({ hop }: { hop: CdHopRow | null | undefined }) {
-  if (!hop) return <span className="hint">—</span>;
-  const { word, tone } = hopWord(hop);
-  const title = [`against ${hop.against_version}`, hop.reason ?? ""].filter(Boolean).join(" · ");
+/** A promotion replay's one word, with the reason on hover. */
+function PromotionReplayChip({ replay }: { replay: CdPromotionReplayRow | null | undefined }) {
+  if (!replay) return <span className="hint">—</span>;
+  const { word, tone } = promotionReplayWord(replay);
+  const title = [`against ${replay.against_version}`, replay.reason ?? ""].filter(Boolean).join(" · ");
   return (
     <span className={`chip ${tone}`} title={title}>
       {word}
@@ -281,18 +281,18 @@ function HopChip({ hop }: { hop: CdHopRow | null | undefined }) {
   );
 }
 
-/** Links to the two runs of a hop, when it got as far as creating them. */
-function HopRuns({ hop }: { hop: CdHopRow }) {
-  if (!hop.candidate_run) return <span className="hint">—</span>;
+/** Links to the two runs of a promotion replay, when it got as far as creating them. */
+function PromotionReplayRuns({ replay }: { replay: CdPromotionReplayRow }) {
+  if (!replay.candidate_run) return <span className="hint">—</span>;
   return (
-    <span className="cd-hopruns">
-      <Link className="mono" to={`/runs/${hop.candidate_run}`}>
+    <span className="cd-replay-runs">
+      <Link className="mono" to={`/runs/${replay.candidate_run}`}>
         candidate
       </Link>
-      {hop.baseline_run && (
+      {replay.baseline_run && (
         <>
           {" · "}
-          <Link className="mono" to={`/runs/${hop.baseline_run}`}>
+          <Link className="mono" to={`/runs/${replay.baseline_run}`}>
             baseline
           </Link>
         </>
@@ -492,12 +492,12 @@ function EnvCard({
               <span className="l">Argo</span>
               <ArgoChip row={live} />
             </div>
-            {row?.live_hop && (
+            {row?.live_promotion_replay && (
               <div className="cd-row">
                 <span className="l" title="This version replayed against the release the next environment runs">
-                  Hop vs {row.live_hop.against_version}
+                  Promotion replay vs {row.live_promotion_replay.against_version}
                 </span>
-                <HopChip hop={row.live_hop} />
+                <PromotionReplayChip replay={row.live_promotion_replay} />
               </div>
             )}
             {live.state === "rolled_back" && (
@@ -774,12 +774,12 @@ function Versions({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
               <th>kind</th>
               <th>carries</th>
               <th>{cfg.environments.join(" · ")}</th>
-              <th>hop</th>
+              <th>promotion replay</th>
               <th>merged</th>
             </tr>
           </thead>
           <tbody>
-            {rows.map(({ version: v, where, hop }) => (
+            {rows.map(({ version: v, where, promotion_replay }) => (
               <tr key={v.version}>
                 <td>
                   <VersionLink version={v.version} system={system} cfg={cfg} />
@@ -794,7 +794,7 @@ function Versions({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
                   <WhereBar where={where} environments={cfg.environments} observed={observed} />
                 </td>
                 <td>
-                  <HopChip hop={hop} />
+                  <PromotionReplayChip replay={promotion_replay} />
                 </td>
                 <td className="hint" title={v.merged_at ?? v.created_at}>
                   {when(v.merged_at ?? v.created_at)}
@@ -979,17 +979,17 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
       </section>
 
       <section>
-        <h2>Hop replays</h2>
+        <h2>Promotion replays</h2>
         <p className="hint">
           This version replayed against the release the next environment runs, both on one recording, and judged on what it
           changes between the two.
         </p>
-        {q.data.hops.length === 0 ? (
-          <p className="hint">None yet. The hop-replay job runs one after the version goes live on the first environment.</p>
+        {q.data.promotion_replays.length === 0 ? (
+          <p className="hint">None yet. The promotion-replay job runs one after the version goes live on the first environment.</p>
         ) : (
-          // Only the newest row per release is the hop as it stands; an older
-          // `requested` row is history (the start of a hop a later row ended).
-          <table className="cd-hops">
+          // Only the newest row per release is the promotion replay as it stands; an older
+          // `requested` row is history (the start of a promotion replay a later row ended).
+          <table className="cd-promotion-replays">
             <thead>
               <tr>
                 <th>against</th>
@@ -1001,24 +1001,24 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
               </tr>
             </thead>
             <tbody>
-              {q.data.hops.map((h, i) => (
+              {q.data.promotion_replays.map((h, i) => (
                 <tr key={h.id}>
                   <td>
                     {h.against_version === "-" ? <span className="hint">—</span> : <VersionLink version={h.against_version} system={system} cfg={cfg} />}
                   </td>
                   <td>
-                    {h.state === "requested" && q.data.hops.findIndex((x) => x.against_version === h.against_version) < i ? (
+                    {h.state === "requested" && q.data.promotion_replays.findIndex((x) => x.against_version === h.against_version) < i ? (
                       <span className="chip muted">started</span>
                     ) : (
-                      <HopChip hop={h} />
+                      <PromotionReplayChip replay={h} />
                     )}
                   </td>
                   <td>
                     <span className="hint">{h.state}</span>
-                    {h.reason && <div className="hint cd-hopreason">{h.reason}</div>}
+                    {h.reason && <div className="hint cd-replay-reason">{h.reason}</div>}
                   </td>
                   <td>
-                    <HopRuns hop={h} />
+                    <PromotionReplayRuns replay={h} />
                   </td>
                   <td className="hint" title={h.at}>
                     {when(h.at)} · {ago(h.at)}

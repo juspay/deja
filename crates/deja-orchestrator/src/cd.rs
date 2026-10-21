@@ -24,8 +24,8 @@ pub struct CdConfig {
     pub environments: Vec<String>,
     pub promotable: Vec<String>,
     pub soak_hours: u32,
-    /// Whether a promotion needs the version's hop replay to have come back.
-    pub hop_required: bool,
+    /// Whether a promotion needs the version's promotion replay to have come back.
+    pub promotion_replay_required: bool,
 }
 
 impl CdConfig {
@@ -49,7 +49,7 @@ impl CdConfig {
             environments,
             promotable: cd.promotable.clone().unwrap_or_default(),
             soak_hours: cd.soak_hours.unwrap_or(0),
-            hop_required: cd.hop_required.as_deref().map(str::trim) != Some("none"),
+            promotion_replay_required: cd.promotion_replay_required.as_deref().map(str::trim) != Some("none"),
         })
     }
 
@@ -88,8 +88,8 @@ pub struct PromotionFacts {
     /// What the target runs now, and the merge time of what it carries.
     pub target_live: Option<String>,
     pub target_merged_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// The version's newest hop: (state, against).
-    pub hop: Option<(String, String)>,
+    /// The version's newest promotion replay: (state, against).
+    pub promotion_replay: Option<(String, String)>,
     /// A request for the target that has not ended.
     pub in_flight: Option<i64>,
     /// The pause switch's reason, when paused.
@@ -152,24 +152,24 @@ pub fn promotion_checks(cfg: &CdConfig, f: &PromotionFacts) -> Vec<PromotionChec
         // last word; say so rather than refuse.
         (_, _, Some(live)) => c("newer", true, format!("deja has no merge time for {live}; the promote job checks on GitHub that this comes after it")),
     });
-    out.push(if !cfg.hop_required {
-        c("hop", true, "no hop replay required".into())
+    out.push(if !cfg.promotion_replay_required {
+        c("promotion_replay", true, "no promotion replay required".into())
     } else {
-        match (&f.hop, &f.target_live) {
+        match (&f.promotion_replay, &f.target_live) {
             (_, None) => c(
-                "hop",
+                "promotion_replay",
                 true,
                 format!("{} runs nothing to replay against", f.target),
             ),
             (Some((state, against)), Some(live)) if state == "done" && against == live => {
-                c("hop", true, format!("hop replay against {live} came back"))
+                c("promotion_replay", true, format!("promotion replay against {live} came back"))
             }
             (Some((state, against)), Some(live)) if against == live => c(
-                "hop",
+                "promotion_replay",
                 false,
-                format!("hop replay against {live} is {state}"),
+                format!("promotion replay against {live} is {state}"),
             ),
-            (_, Some(live)) => c("hop", false, format!("no hop replay against {live} yet")),
+            (_, Some(live)) => c("promotion_replay", false, format!("no promotion replay against {live} yet")),
         }
     });
     out.push(match f.in_flight {
@@ -559,13 +559,13 @@ mod promotion {
     use super::*;
     use chrono::{Duration, TimeZone, Utc};
 
-    fn cfg(soak: u32, hop: bool) -> CdConfig {
+    fn cfg(soak: u32, promotion_replay: bool) -> CdConfig {
         CdConfig {
             systems: vec!["prism".into()],
             environments: vec!["integ".into(), "sandbox".into(), "prod".into()],
             promotable: vec!["sandbox".into()],
             soak_hours: soak,
-            hop_required: hop,
+            promotion_replay_required: promotion_replay,
         }
     }
 
@@ -580,7 +580,7 @@ mod promotion {
             live_on_source_since: Some(now - Duration::hours(29)),
             target_live: Some("2026.10.09.1".into()),
             target_merged_at: Some(now - Duration::days(5)),
-            hop: Some(("done".into(), "2026.10.09.1".into())),
+            promotion_replay: Some(("done".into(), "2026.10.09.1".into())),
             in_flight: None,
             paused: None,
             now,
@@ -604,7 +604,7 @@ mod promotion {
     }
 
     #[test]
-    fn a_version_that_ran_and_has_its_hop_passes_every_check() {
+    fn a_version_that_ran_and_has_its_promotion_replay_passes_every_check() {
         assert!(failing(&cfg(0, true), &good()).is_empty());
     }
 
@@ -627,14 +627,14 @@ mod promotion {
         f.version_merged_at = Some(f.now - Duration::days(9));
         assert_eq!(failing(&c, &f), vec!["newer"]);
         let mut f = good();
-        f.hop = Some(("requested".into(), "2026.10.09.1".into()));
-        assert_eq!(failing(&c, &f), vec!["hop"]);
+        f.promotion_replay = Some(("requested".into(), "2026.10.09.1".into()));
+        assert_eq!(failing(&c, &f), vec!["promotion_replay"]);
         let mut f = good();
-        f.hop = Some(("done".into(), "2026.10.01.0".into()));
+        f.promotion_replay = Some(("done".into(), "2026.10.01.0".into()));
         assert_eq!(
             failing(&c, &f),
-            vec!["hop"],
-            "a hop against another release is not this one"
+            vec!["promotion_replay"],
+            "a promotion replay against another release is not this one"
         );
         let mut f = good();
         f.in_flight = Some(7);
@@ -649,18 +649,18 @@ mod promotion {
     }
 
     #[test]
-    fn nothing_live_on_the_target_needs_no_hop_and_is_newer() {
+    fn nothing_live_on_the_target_needs_no_promotion_replay_and_is_newer() {
         let mut f = good();
         f.target_live = None;
-        f.hop = None;
+        f.promotion_replay = None;
         assert!(failing(&cfg(0, true), &f).is_empty());
     }
 
     #[test]
-    fn hop_none_and_soak_are_settings() {
+    fn promotion_replay_none_and_soak_are_settings() {
         let mut f = good();
-        f.hop = None;
-        assert_eq!(failing(&cfg(0, true), &f), vec!["hop"]);
+        f.promotion_replay = None;
+        assert_eq!(failing(&cfg(0, true), &f), vec!["promotion_replay"]);
         assert!(failing(&cfg(0, false), &f).is_empty());
         assert!(failing(&cfg(24, true), &good()).is_empty());
         assert_eq!(failing(&cfg(48, true), &good()), vec!["soak"]);
