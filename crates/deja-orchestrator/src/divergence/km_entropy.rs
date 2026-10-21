@@ -32,6 +32,10 @@ pub struct KmEvidence {
     pub semantic_digest: String,
     pub raw_body_digest: String,
     pub signature_digest: String,
+    /// False for an unsigned base64 JSON document (the profile header map);
+    /// true for the signed `{body, headers}` envelope.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signed: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub paired_serve: bool,
 }
@@ -44,24 +48,44 @@ struct Envelope {
     signature: String,
 }
 
+struct Decoded {
+    raw: Vec<u8>,
+    value: Value,
+}
+
 pub(super) fn is_km(boundary: &str, trait_name: &str, method_name: &str) -> bool {
     boundary == "km"
         && trait_name == "common_utils::keymanager"
         && method_name == "call_encryption_service"
 }
 
-fn envelope(args: &Value) -> Option<Envelope> {
+fn decoded_data(args: &Value) -> Option<Decoded> {
     let data = args.get("request")?.get("data")?.as_str()?;
     if data.len() > MAX_DATA_BYTES * 2 {
         return None;
     }
-    let decoded = base64::engine::general_purpose::STANDARD
+    let raw = base64::engine::general_purpose::STANDARD
         .decode(data)
         .ok()?;
-    if decoded.len() > MAX_DATA_BYTES {
+    if raw.len() > MAX_DATA_BYTES {
         return None;
     }
-    let wire: Value = serde_json::from_slice(&decoded).ok()?;
+    let value: Value = serde_json::from_slice(&raw).ok()?;
+    if !value.is_object() && !value.is_array() {
+        return None;
+    }
+    Some(Decoded { raw, value })
+}
+
+/// A partly formed signed envelope must not fall through to the generic JSON
+/// rule: missing or duplicate signature fields stay blocking.
+fn looks_like_envelope(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|map| map.contains_key("body") || map.contains_key("headers"))
+}
+
+fn envelope(wire: &Value) -> Option<Envelope> {
     let map = wire.as_object()?;
     if map.len() != 2 {
         return None;
@@ -150,7 +174,22 @@ pub(super) fn classify(
     if !same_except_data(recorded, observed) {
         return KmClass::Different;
     }
-    let (Some(left), Some(right)) = (envelope(recorded), envelope(observed)) else {
+    let (Some(left_wire), Some(right_wire)) = (decoded_data(recorded), decoded_data(observed))
+    else {
+        return KmClass::Different;
+    };
+    if !looks_like_envelope(&left_wire.value) && !looks_like_envelope(&right_wire.value) {
+        // The historical ProfileUpdate header map is a plain base64 JSON
+        // object, not a signed envelope. JSON object order is immaterial;
+        // arrays stay positional under Value equality.
+        return if left_wire.value == right_wire.value {
+            KmClass::Rendering
+        } else {
+            KmClass::Different
+        };
+    }
+    let (Some(left), Some(right)) = (envelope(&left_wire.value), envelope(&right_wire.value))
+    else {
         return KmClass::Different;
     };
     if left.body != right.body || left.non_signature_headers != right.non_signature_headers {
@@ -237,23 +276,38 @@ pub(super) fn evidence(
     }
     let outer = args.as_object()?;
     let request = outer.get("request")?.as_object()?;
-    let env = envelope(args)?;
+    let decoded = decoded_data(args)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"km-semantic-v1");
+    hasher.update(b"km-semantic-v2");
     hash_object_except(&mut hasher, outer, "request");
     hash_object_except(&mut hasher, request, "data");
-    hash_json(&mut hasher, &env.body);
-    hasher.update((env.non_signature_headers.len() as u64).to_be_bytes());
-    for (name, value) in &env.non_signature_headers {
-        hash_bytes(&mut hasher, name.as_bytes());
-        hash_bytes(&mut hasher, value.as_bytes());
+    if looks_like_envelope(&decoded.value) {
+        let env = envelope(&decoded.value)?;
+        hasher.update(b"signed");
+        hash_json(&mut hasher, &env.body);
+        hasher.update((env.non_signature_headers.len() as u64).to_be_bytes());
+        for (name, value) in &env.non_signature_headers {
+            hash_bytes(&mut hasher, name.as_bytes());
+            hash_bytes(&mut hasher, value.as_bytes());
+        }
+        Some(KmEvidence {
+            semantic_digest: hex::encode(hasher.finalize()),
+            raw_body_digest: digest(env.raw_body.as_bytes()),
+            signature_digest: digest(env.signature.as_bytes()),
+            signed: true,
+            paired_serve,
+        })
+    } else {
+        hasher.update(b"plain-json");
+        hash_json(&mut hasher, &decoded.value);
+        Some(KmEvidence {
+            semantic_digest: hex::encode(hasher.finalize()),
+            raw_body_digest: digest(&decoded.raw),
+            signature_digest: String::new(),
+            signed: false,
+            paired_serve,
+        })
     }
-    Some(KmEvidence {
-        semantic_digest: hex::encode(hasher.finalize()),
-        raw_body_digest: digest(env.raw_body.as_bytes()),
-        signature_digest: digest(env.signature.as_bytes()),
-        paired_serve,
-    })
 }
 
 #[cfg(test)]
@@ -276,6 +330,18 @@ mod tests {
         })
     }
 
+    fn plain_args(raw_json: &str) -> Value {
+        json!({
+            "method": "POST",
+            "endpoint": "data/encrypt",
+            "request": {
+                "data_identifier": "Merchant",
+                "key_identifier": "merchant_1",
+                "data": base64::engine::general_purpose::STANDARD.encode(raw_json)
+            }
+        })
+    }
+
     fn class(recorded: &Value, observed: &Value) -> KmClass {
         classify(
             "km",
@@ -284,6 +350,40 @@ mod tests {
             recorded,
             observed,
         )
+    }
+
+    /// Archived batch 0004 / ProfileUpdate (#14368) decoded request.data to
+    /// a plain JSON object with these three header names, not to the signed
+    /// `{body,headers}` envelope. Its only change was member order.
+    #[test]
+    fn plain_base64_json_profile_headers_ignore_only_member_order() {
+        let recorded =
+            plain_args(r#"{"X-Custom-Header":"value","X-Short":"short","X-Tiny":"tiny"}"#);
+        let reordered =
+            plain_args(r#"{"X-Tiny":"tiny","X-Custom-Header":"value","X-Short":"short"}"#);
+        assert_eq!(class(&recorded, &reordered), KmClass::Rendering);
+        let a = evidence(
+            "km",
+            "common_utils::keymanager",
+            "call_encryption_service",
+            &recorded,
+            true,
+        )
+        .expect("recorded plain JSON");
+        let b = evidence(
+            "km",
+            "common_utils::keymanager",
+            "call_encryption_service",
+            &reordered,
+            true,
+        )
+        .expect("replayed plain JSON");
+        assert!(!a.signed && !b.signed);
+        assert_eq!(a.semantic_digest, b.semantic_digest);
+        assert_ne!(a.raw_body_digest, b.raw_body_digest);
+        let changed =
+            plain_args(r#"{"X-Tiny":"changed","X-Custom-Header":"value","X-Short":"short"}"#);
+        assert_eq!(class(&recorded, &changed), KmClass::Different);
     }
 
     #[test]

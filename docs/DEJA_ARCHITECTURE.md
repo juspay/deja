@@ -353,8 +353,11 @@ The orchestrator adds cause-vs-consequence lanes: `ValueDivergedOrigin` marks th
 For a fixed Hyperswitch candidate image, the orchestrator has one narrower
 post-hoc rule for an **args-free serve** of `km::call_encryption_service`. It
 compares the observed arguments with the *recorded event actually served*:
-base64 `request.data` is decoded as a JSON envelope; header-pair permutations
-with unchanged values are rendering-only. A changed
+base64 `request.data` is decoded as JSON. A plain JSON document, including
+the ProfileUpdate webhook-header map in Hyperswitch #14368, is compared
+structurally (object-key order ignored, arrays positional) without assuming
+it is a signed envelope. For an actual `{body, headers}` envelope, header-pair
+permutations with unchanged values are rendering-only. A changed
 `X-Webhook-Signature-512` is **declared derived**, and counted as absorbed,
 only when the raw body bytes differ but the parsed JSON body, key identifiers,
 other arguments and non-signature headers agree. A signature change with

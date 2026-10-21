@@ -21006,6 +21006,19 @@ mod tests {
         })
     }
 
+    fn km_plain_args(raw_json: &str) -> serde_json::Value {
+        use base64::Engine as _;
+        serde_json::json!({
+            "method": "POST",
+            "endpoint": "data/encrypt",
+            "request": {
+                "data_identifier": "Merchant",
+                "key_identifier": "merchant_1",
+                "data": base64::engine::general_purpose::STANDARD.encode(raw_json)
+            }
+        })
+    }
+
     fn km_served_artifacts(
         recorded: serde_json::Value,
         observed: serde_json::Value,
@@ -21073,6 +21086,33 @@ mod tests {
                         && entry.km_entropy.is_some()
                 }), "{tier}");
             }
+        }
+    }
+
+    #[test]
+    fn profile_header_map_order_from_batch_0004_is_absorbed_without_a_signed_envelope() {
+        let recorded =
+            km_plain_args(r#"{"X-Custom-Header":"value","X-Short":"short","X-Tiny":"tiny"}"#);
+        let observed =
+            km_plain_args(r#"{"X-Tiny":"tiny","X-Custom-Header":"value","X-Short":"short"}"#);
+        for (tier, art) in
+            in_both_tiers(|| km_served_artifacts(recorded.clone(), observed.clone(), UPSTREAM_CALL))
+        {
+            let card = detect(&art);
+            assert_eq!(card.summary.value_divergences, 0, "{tier}");
+            assert_eq!(kind_count(&card, "km", "KmRenderingAbsorbed"), 1, "{tier}");
+            let rows = build_ledger(&art).expect("ledger builds");
+            let row = rows.iter().find(|r| r.boundary == "km").expect("km row");
+            assert_eq!(row.kind, "km_rendering_absorbed", "{tier}");
+            assert!(!row.blocking, "{tier}");
+            let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
+            let km = tree
+                .entries
+                .iter()
+                .find(|entry| matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "km"))
+                .expect("km tree entry");
+            assert!(matches!(km.value, behaviour_tree::Value::Reproduced));
+            assert_eq!(km.km_entropy.as_ref().map(|e| e.signed), Some(false));
         }
     }
 

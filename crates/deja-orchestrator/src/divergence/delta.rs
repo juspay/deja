@@ -274,12 +274,13 @@ fn km_sides(
     let (Some(a), Some(b)) = (&m.km_entropy, &y.km_entropy) else {
         return (raw_m, raw_y, false);
     };
-    if a.semantic_digest != b.semantic_digest {
+    if a.signed != b.signed || a.semantic_digest != b.semantic_digest {
         return (raw_m, raw_y, false);
     }
     let body_moved = a.raw_body_digest != b.raw_body_digest;
     let signature_moved = a.signature_digest != b.signature_digest;
-    if body_moved != signature_moved
+    if a.signed
+        && body_moved != signature_moved
         && ((matches!(m.value, Value::Reproduced) && matches!(y.value, Value::Reproduced))
             || (matches!(m.value, Value::Diverged { .. })
                 && matches!(y.value, Value::Diverged { .. })))
@@ -994,6 +995,7 @@ mod tests {
             semantic_digest: "same-signed-content".into(),
             raw_body_digest: raw.into(),
             signature_digest: sig.into(),
+            signed: true,
             paired_serve,
         };
         main.entries[0].km_entropy = Some(evidence("raw-main", "sig-main", true));
@@ -1028,6 +1030,37 @@ mod tests {
     }
 
     #[test]
+    fn plain_base64_json_order_has_a_stable_main_candidate_delta() {
+        let at = Address::Call {
+            correlation: "c".into(),
+            span_path: SPAN.into(),
+            boundary: "km".into(),
+            operation: "call_encryption_service".into(),
+            recorded_event: Some(7),
+            occurrence: 0,
+        };
+        let mut main = tree("m", vec![(at.clone(), div("raw-main-map-order"))]);
+        let mut candidate = tree("y", vec![(at, div("raw-candidate-map-order"))]);
+        let evidence = |raw: &str, paired_serve| super::super::km_entropy::KmEvidence {
+            semantic_digest: "same-plain-json-map".into(),
+            raw_body_digest: raw.into(),
+            signature_digest: String::new(),
+            signed: false,
+            paired_serve,
+        };
+        main.entries[0].km_entropy = Some(evidence("raw-main", true));
+        candidate.entries[0].km_entropy = Some(evidence("raw-candidate", true));
+        let inherited = three_way(&main, &candidate).unwrap();
+        assert!(inherited.verdict.pass);
+        assert_eq!(inherited.rows[0].bucket, Bucket::Inherited);
+
+        candidate.entries[0].km_entropy = Some(evidence("raw-candidate", false));
+        let untrusted = three_way(&main, &candidate).unwrap();
+        assert!(!untrusted.verdict.pass);
+        assert_eq!(untrusted.rows[0].bucket, Bucket::Changed);
+    }
+
+    #[test]
     fn km_signature_only_change_blocks_even_when_both_tape_rows_were_absorbed() {
         let at = Address::Call {
             correlation: "c".into(),
@@ -1043,6 +1076,7 @@ mod tests {
             semantic_digest: "same-signed-content".into(),
             raw_body_digest: "identical-body-bytes".into(),
             signature_digest: sig.into(),
+            signed: true,
             paired_serve: true,
         };
         main.entries[0].km_entropy = Some(evidence("sig-main"));
