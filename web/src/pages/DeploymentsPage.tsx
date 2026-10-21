@@ -273,7 +273,10 @@ function VersionLink({ version, system, cfg }: { version: string; system: string
 function PromotionReplayChip({ replay }: { replay: CdPromotionReplayRow | null | undefined }) {
   if (!replay) return <span className="hint">—</span>;
   const { word, tone } = promotionReplayWord(replay);
-  const title = [`against ${replay.against_version}`, replay.reason ?? ""].filter(Boolean).join(" · ");
+  const repointed = replay.run_delta_against && replay.baseline_run && replay.run_delta_against !== replay.baseline_run
+    ? `candidate run since re-pointed at ${replay.run_delta_against}; the recorded verdict stands`
+    : "";
+  const title = [`against ${replay.against_version}`, replay.reason ?? "", repointed].filter(Boolean).join(" · ");
   return (
     <span className={`chip ${tone}`} title={title}>
       {word}
@@ -494,7 +497,7 @@ function EnvCard({
             </div>
             {row?.live_promotion_replay && (
               <div className="cd-row">
-                <span className="l" title="This version replayed against the release the next environment runs">
+                <span className="l" title={`This version replayed against what ${row.next_environment ?? "the next environment"} runs now`}>
                   Promotion replay vs {row.live_promotion_replay.against_version}
                 </span>
                 <PromotionReplayChip replay={row.live_promotion_replay} />

@@ -131,6 +131,15 @@ describe("promotionReplayWord", () => {
     expect(promotionReplayWord(h({ state: "skipped" }))).toEqual({ word: "skipped", tone: "muted" });
     expect(promotionReplayWord(h({ state: "failed" }))).toEqual({ word: "failed", tone: "failed" });
   });
+  test("a replay that failed, was skipped or is still running never borrows the candidate run's verdict", () => {
+    expect(promotionReplayWord(h({ state: "failed", verdict: "unknown", run_delta_verdict: "pass" }))).toEqual({ word: "failed", tone: "failed" });
+    expect(promotionReplayWord(h({ state: "skipped", run_delta_verdict: "pass" }))).toEqual({ word: "skipped", tone: "muted" });
+    expect(promotionReplayWord(h({ state: "requested", run_delta_verdict: "pass" }))).toEqual({ word: "running", tone: "pending" });
+    expect(promotionReplayWord(h({ state: "requested", run_state: "failed", run_delta_verdict: "pass" }))).toEqual({ word: "failed", tone: "failed" });
+  });
+  test("a finished replay whose run was re-pointed keeps its recorded verdict (the store sends no live one)", () => {
+    expect(promotionReplayWord(h({ state: "done", verdict: "fail", run_delta_verdict: null }))).toEqual({ word: "fail", tone: "failed" });
+  });
   test("a done promotion replay without a run word falls back to what the job read", () => {
     expect(promotionReplayWord(h({ state: "done", verdict: "pass", run_delta_verdict: "pending" }))).toEqual({ word: "pass", tone: "ok" });
     expect(promotionReplayWord(h({ state: "done", verdict: "inconclusive" }))).toEqual({ word: "inconclusive", tone: "inconclusive" });
