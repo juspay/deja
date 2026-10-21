@@ -318,6 +318,93 @@ pub struct CdControlRow {
     pub changed_at: DateTime<Utc>,
 }
 
+/// Where a promotion replay stands. `requested` when the job starts it;
+/// then exactly one of `done` (with the run pair and a verdict), `failed`
+/// (the job could not run it) or `skipped` (nothing to measure against).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromotionReplayState {
+    Requested,
+    Done,
+    Failed,
+    Skipped,
+}
+
+impl PromotionReplayState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+impl std::str::FromStr for PromotionReplayState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "requested" => Ok(Self::Requested),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
+            other => Err(format!("not a promotion replay state: {other:?}")),
+        }
+    }
+}
+
+impl std::fmt::Display for PromotionReplayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a finished promotion replay said, as the job read the candidate
+/// run's delta verdict when it ended. The run's own verdict is read live
+/// afterwards and can move (an acknowledgement); this is the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromotionReplayVerdict {
+    Pass,
+    Fail,
+    Acknowledged,
+    Inconclusive,
+    Unknown,
+}
+
+impl PromotionReplayVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Acknowledged => "acknowledged",
+            Self::Inconclusive => "inconclusive",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::str::FromStr for PromotionReplayVerdict {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "pass" => Ok(Self::Pass),
+            "fail" => Ok(Self::Fail),
+            "acknowledged" => Ok(Self::Acknowledged),
+            "inconclusive" => Ok(Self::Inconclusive),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!("not a promotion replay verdict: {other:?}")),
+        }
+    }
+}
+
+impl std::fmt::Display for PromotionReplayVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// One promotion replay of a version against the release the next environment
 /// runs; see migration 0012. `run_state` and `run_delta_verdict` are read
 /// from the candidate run's row at query time: the run's word is current
@@ -330,10 +417,10 @@ pub struct CdPromotionReplayRow {
     pub version: String,
     pub against_version: String,
     pub against_commit: Option<String>,
-    pub state: String,
+    pub state: PromotionReplayState,
     pub candidate_run: Option<String>,
     pub baseline_run: Option<String>,
-    pub verdict: Option<String>,
+    pub verdict: Option<PromotionReplayVerdict>,
     pub reason: Option<String>,
     pub requested_by: String,
     pub jenkins_build: Option<String>,
@@ -359,13 +446,13 @@ pub struct NewCdPromotionReplay {
     pub against_version: String,
     #[serde(default)]
     pub against_commit: Option<String>,
-    pub state: String,
+    pub state: PromotionReplayState,
     #[serde(default)]
     pub candidate_run: Option<String>,
     #[serde(default)]
     pub baseline_run: Option<String>,
     #[serde(default)]
-    pub verdict: Option<String>,
+    pub verdict: Option<PromotionReplayVerdict>,
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
@@ -1091,10 +1178,10 @@ impl Store {
         .bind(&h.version)
         .bind(&h.against_version)
         .bind(&h.against_commit)
-        .bind(&h.state)
+        .bind(h.state.as_str())
         .bind(&h.candidate_run)
         .bind(&h.baseline_run)
-        .bind(&h.verdict)
+        .bind(h.verdict.map(PromotionReplayVerdict::as_str))
         .bind(&h.reason)
         .bind(&h.requested_by)
         .bind(&h.jenkins_build)
@@ -1105,7 +1192,7 @@ impl Store {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        Ok(cd_promotion_replay_row(row))
+        cd_promotion_replay_row(row)
     }
 
     /// A version's promotion replays, newest first.
@@ -1124,7 +1211,7 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(cd_promotion_replay_row).collect())
+        rows.into_iter().map(cd_promotion_replay_row).collect()
     }
 
     /// The newest row of one pair: `version` replayed against `against`. An
@@ -1146,7 +1233,7 @@ impl Store {
         .bind(against)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(cd_promotion_replay_row))
+        row.map(cd_promotion_replay_row).transpose()
     }
 
     /// The newest promotion replay row of every version that has one: where each stands.
@@ -1161,7 +1248,7 @@ impl Store {
         .bind(system)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(cd_promotion_replay_row).collect())
+        rows.into_iter().map(cd_promotion_replay_row).collect()
     }
 
     // -- cd promotion requests ------------------------------------------------
@@ -1896,17 +1983,26 @@ const CD_PROMOTION_REPLAY_SELECT: &str = "SELECT h.id, h.system, h.version, h.ag
      h.detail, h.at, r.state, r.delta_verdict, r.params ->> 'delta_against' \
      FROM cd_promotion_replays h LEFT JOIN replay_runs r ON r.run_id = h.candidate_run";
 
-fn cd_promotion_replay_row(r: sqlx::postgres::PgRow) -> CdPromotionReplayRow {
+fn cd_promotion_replay_row(r: sqlx::postgres::PgRow) -> Result<CdPromotionReplayRow, sqlx::Error> {
+    // The words are checked on the way in (the API deserialises the enums),
+    // so a row that fails to parse is corrupt, and says so, rather than
+    // being shown as something it is not.
+    let decode = |e: String| sqlx::Error::Decode(e.into());
+    let state: PromotionReplayState = r.get::<String, _>(5).parse().map_err(decode)?;
+    let verdict: Option<PromotionReplayVerdict> = r
+        .get::<Option<String>, _>(8)
+        .map(|v| v.parse().map_err(decode))
+        .transpose()?;
     let mut row = CdPromotionReplayRow {
         id: r.get(0),
         system: r.get(1),
         version: r.get(2),
         against_version: r.get(3),
         against_commit: r.get(4),
-        state: r.get(5),
+        state,
         candidate_run: r.get(6),
         baseline_run: r.get(7),
-        verdict: r.get(8),
+        verdict,
         reason: r.get(9),
         requested_by: r.get(10),
         jenkins_build: r.get(11),
@@ -1923,7 +2019,7 @@ fn cd_promotion_replay_row(r: sqlx::postgres::PgRow) -> CdPromotionReplayRow {
     if !same_pair {
         row.run_delta_verdict = None;
     }
-    row
+    Ok(row)
 }
 
 const CD_PROMOTION_COLUMNS: &str = "id, system, environment, from_version, release, state, \
@@ -2347,7 +2443,7 @@ mod tests {
         against: &str,
         candidate: &str,
         baseline: &str,
-        verdict: &str,
+        verdict: super::PromotionReplayVerdict,
     ) -> super::CdPromotionReplayRow {
         store
             .cd_promotion_replay_append(&super::NewCdPromotionReplay {
@@ -2355,10 +2451,10 @@ mod tests {
                 version: version.into(),
                 against_version: against.into(),
                 against_commit: None,
-                state: "done".into(),
+                state: super::PromotionReplayState::Done,
                 candidate_run: Some(candidate.into()),
                 baseline_run: Some(baseline.into()),
-                verdict: Some(verdict.into()),
+                verdict: Some(verdict),
                 reason: None,
                 requested_by: "test".into(),
                 jenkins_build: None,
@@ -2385,7 +2481,16 @@ mod tests {
         completed_run(&store, &cand, &b1).await;
         assert!(store.set_delta_verdict(&cand, &b1, "fail").await.unwrap());
 
-        let row = promotion_replay(&store, &system, &v, &r1, &cand, &b1, "fail").await;
+        let row = promotion_replay(
+            &store,
+            &system,
+            &v,
+            &r1,
+            &cand,
+            &b1,
+            super::PromotionReplayVerdict::Fail,
+        )
+        .await;
         assert_eq!(row.run_delta_verdict.as_deref(), Some("fail"));
         assert_eq!(row.run_delta_against.as_deref(), Some(b1.as_str()));
 
@@ -2403,13 +2508,22 @@ mod tests {
         );
         assert_eq!(rows[0].run_delta_against.as_deref(), Some(b2.as_str()));
         assert_eq!(
-            rows[0].verdict.as_deref(),
-            Some("fail"),
+            rows[0].verdict,
+            Some(super::PromotionReplayVerdict::Fail),
             "the recorded verdict stands"
         );
 
         // A new row for the new pair reads the live verdict again.
-        let row2 = promotion_replay(&store, &system, &v, &r2, &cand, &b2, "pass").await;
+        let row2 = promotion_replay(
+            &store,
+            &system,
+            &v,
+            &r2,
+            &cand,
+            &b2,
+            super::PromotionReplayVerdict::Pass,
+        )
+        .await;
         assert_eq!(row2.run_delta_verdict.as_deref(), Some("pass"));
 
         // The pair lookup: only the row against the asked-for version, newest first.
