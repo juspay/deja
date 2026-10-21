@@ -633,14 +633,27 @@ async fn require_cd_reader(
     if !cfg.domain_allowed(&session.email) {
         return error_resp(401, "this account is no longer allowed to sign in");
     }
-    if !cfg.has_role(&session.email, deja_orchestrator::auth::ROLE_MAINTAINER) {
-        return error_resp(403, "Deployments is in beta for maintainers only");
+    if !reads_deployments(&cfg, &session.email) {
+        return error_resp(
+            403,
+            "Deployments is in beta for maintainers and environment upgraders only",
+        );
     }
     req.extensions_mut()
         .insert(AuthenticatedActor(session.email));
     req.extensions_mut()
         .insert(ActorSubject(Some(session.sub).filter(|s| !s.is_empty())));
     next.run(req).await
+}
+
+/// Who reads Deployments while it is in beta: a maintainer, or anyone who may
+/// promote to some environment (`<environment>_upgrader`). An upgrader has to
+/// see what runs where and the checks before pressing Promote; what they may
+/// change is decided per action (`promote_refusal`, `pause_refusal`), not here.
+fn reads_deployments(cfg: &deja_orchestrator::auth::AuthConfig, email: &str) -> bool {
+    cfg.roles_for(email)
+        .iter()
+        .any(|r| r == deja_orchestrator::auth::ROLE_MAINTAINER || r.ends_with("_upgrader"))
 }
 
 /// Why a pause or resume is refused, or None. A person's act: a signed-in
@@ -4960,8 +4973,10 @@ struct MarkFailed {
 }
 
 /// `POST /api/v1/cd/promotion-requests/{id}/fail` `{reason}`: a maintainer
-/// ends a request the job will not finish (its build died), so it no longer
-/// holds the environment.
+/// ends a request the job has started but will not finish (its build died),
+/// so it no longer holds the environment. A request still `pending` has no
+/// job behind it: that one is cancelled (`DELETE`), not marked failed, so
+/// the two outcomes keep their meaning in the history.
 async fn v1_cd_promotion_mark_failed(
     State(st): State<AppState>,
     Extension(actor): Extension<AuthenticatedActor>,
@@ -4986,6 +5001,17 @@ async fn v1_cd_promotion_mark_failed(
     };
     if b.reason.trim().is_empty() {
         return error_resp(400, "say why");
+    }
+    match store.cd_promotion_get(id).await {
+        Ok(Some(row)) if row.state == "pending" => {
+            return error_resp(
+                409,
+                "this request is still pending, no job has picked it up: cancel it instead",
+            )
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return error_resp(404, "no such promotion request"),
+        Err(e) => return error_resp(500, &format!("promotion request: {e}")),
     }
     let detail = serde_json::json!({ "reason": b.reason.trim(), "by": actor.0, "at": chrono::Utc::now(), "marked_by_person": true });
     match store
@@ -7804,6 +7830,14 @@ mod sign_in {
     }
 
     fn enabled(maintainers: &[&str]) -> (Arc<AuthState>, session::Signer) {
+        enabled_with(maintainers, &[])
+    }
+
+    /// Sign-in on, with the maintainer list and any other role lists.
+    fn enabled_with(
+        maintainers: &[&str],
+        roles: &[(&str, &[&str])],
+    ) -> (Arc<AuthState>, session::Signer) {
         let mut cfg = AuthConfig {
             enabled: true,
             client_id: "cid".into(),
@@ -7814,6 +7848,12 @@ mod sign_in {
             auth::ROLE_MAINTAINER.to_owned(),
             maintainers.iter().map(|m| m.to_string()).collect(),
         );
+        for (role, members) in roles {
+            cfg.roles.insert(
+                (*role).to_owned(),
+                members.iter().map(|m| m.to_string()).collect(),
+            );
+        }
         let state = AuthState::with_parts(
             cfg,
             session::Signer::new(b"test-key"),
@@ -7915,6 +7955,37 @@ mod sign_in {
         .await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
     }
+    /// The person who presses Promote is an environment's upgrader, often not a
+    /// maintainer; the dialog's reads must answer them, and nobody else who is
+    /// merely signed in.
+    #[tokio::test]
+    async fn an_upgrader_reads_deployments_without_being_a_maintainer() {
+        let (auth, signer) = enabled_with(
+            &["ravi@juspay.in"],
+            &[("sandbox_upgrader", &["qa-1@juspay.in"])],
+        );
+        let st = state(auth, Some("tok"));
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "qa-1@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((code, body.as_str()), (StatusCode::OK, "qa-1@juspay.in"));
+        let (code, body) = call(
+            cd_reader_router(st),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("upgraders"), "{body}");
+    }
+
     #[tokio::test]
     async fn absent_service_token_rejects_bearer_but_allows_maintainer_cookie() {
         let (auth, signer) = enabled(&["ravi@juspay.in"]);

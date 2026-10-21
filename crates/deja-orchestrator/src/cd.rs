@@ -49,7 +49,8 @@ impl CdConfig {
             environments,
             promotable: cd.promotable.clone().unwrap_or_default(),
             soak_hours: cd.soak_hours.unwrap_or(0),
-            promotion_replay_required: cd.promotion_replay_required.as_deref().map(str::trim) != Some("none"),
+            promotion_replay_required: cd.promotion_replay_required.as_deref().map(str::trim)
+                != Some("none"),
         })
     }
 
@@ -153,7 +154,11 @@ pub fn promotion_checks(cfg: &CdConfig, f: &PromotionFacts) -> Vec<PromotionChec
         (_, _, Some(live)) => c("newer", true, format!("deja has no merge time for {live}; the promote job checks on GitHub that this comes after it")),
     });
     out.push(if !cfg.promotion_replay_required {
-        c("promotion_replay", true, "no promotion replay required".into())
+        c(
+            "promotion_replay",
+            true,
+            "no promotion replay required".into(),
+        )
     } else {
         match (&f.promotion_replay, &f.target_live) {
             (_, None) => c(
@@ -161,15 +166,21 @@ pub fn promotion_checks(cfg: &CdConfig, f: &PromotionFacts) -> Vec<PromotionChec
                 true,
                 format!("{} runs nothing to replay against", f.target),
             ),
-            (Some((state, against)), Some(live)) if state == "done" && against == live => {
-                c("promotion_replay", true, format!("promotion replay against {live} came back"))
-            }
+            (Some((state, against)), Some(live)) if state == "done" && against == live => c(
+                "promotion_replay",
+                true,
+                format!("promotion replay against {live} came back"),
+            ),
             (Some((state, against)), Some(live)) if against == live => c(
                 "promotion_replay",
                 false,
                 format!("promotion replay against {live} is {state}"),
             ),
-            (_, Some(live)) => c("promotion_replay", false, format!("no promotion replay against {live} yet")),
+            (_, Some(live)) => c(
+                "promotion_replay",
+                false,
+                format!("no promotion replay against {live} yet"),
+            ),
         }
     });
     out.push(match f.in_flight {

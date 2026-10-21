@@ -4,8 +4,9 @@
 // Promotion (phase 5) is not here yet, and no control for it is drawn until
 // it is. The one control is the pause switch.
 //
-// BETA, for maintainers: the API answers a signed-in maintainer (or the
-// pipeline's token) only, and the tab is drawn for maintainers only.
+// BETA, for maintainers and environment upgraders: the API answers a signed-in
+// maintainer or upgrader (or the pipeline's token) only, and the tab is drawn
+// for them only.
 //
 // Five views under /deployments, all keyed by `?system=` so a link carries
 // the system it was read from:
@@ -70,7 +71,7 @@ function Off({ why }: { why?: string }) {
   );
 }
 
-/** What someone who is not a maintainer sees: the reason, and the way in. */
+/** What someone who is neither a maintainer nor an upgrader sees: the reason, and the way in. */
 function MaintainersOnly({ err }: { err: ApiError }) {
   const signIn = err.status === 401 && !String(err.message).includes("not configured");
   return (
@@ -79,11 +80,11 @@ function MaintainersOnly({ err }: { err: ApiError }) {
         Deployments <span className="beta">beta</span>
       </div>
       <p className="hint">
-        Deployments is in beta and open to maintainers only.{" "}
+        Deployments is in beta and open to maintainers and environment upgraders only.{" "}
         {err.status === 403
-          ? "Your account is not on the maintainer list; ask to be added to it in the déjà configuration."
+          ? "Your account is on neither list; ask to be added to one in the déjà configuration."
           : signIn
-            ? "Sign in with a maintainer account."
+            ? "Sign in with a maintainer or upgrader account."
             : "Sign-in is not configured on this deployment, so no one can open it here."}
       </p>
       {signIn && (
@@ -95,9 +96,13 @@ function MaintainersOnly({ err }: { err: ApiError }) {
   );
 }
 
-/** The pipeline's pause switch: a banner while paused, a control either way.
- *  The API takes it from a signed-in maintainer only. */
+/** The pipeline's pause switch: a banner while paused for everyone who reads
+ *  the page; the control for a maintainer only, as the API takes it. */
 function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; system: string }) {
+  const me = useMe();
+  // Drawn for a maintainer only: the API refuses the flip from anyone else,
+  // and an upgrader reading the page should not be offered a button that fails.
+  const maintainer = (me.data?.roles ?? []).includes("maintainer");
   const qc = useQueryClient();
   const paused = cfg.paused?.[system];
   const [asking, setAsking] = React.useState(false);
@@ -121,9 +126,11 @@ function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }
           </div>
           {flip.error && <div className="err">{String(flip.error)}</div>}
         </div>
-        <button className="btn primary" disabled={flip.isPending} onClick={() => flip.mutate(false)}>
-          Resume
-        </button>
+        {maintainer && (
+          <button className="btn primary" disabled={flip.isPending} onClick={() => flip.mutate(false)}>
+            Resume
+          </button>
+        )}
       </div>
     );
   }
@@ -132,9 +139,11 @@ function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }
       {!asking ? (
         <>
           <span className="hint">Pipeline running for {system}.</span>
-          <button className="btn" onClick={() => setAsking(true)}>
-            Pause pipeline
-          </button>
+          {maintainer && (
+            <button className="btn" onClick={() => setAsking(true)}>
+              Pause pipeline
+            </button>
+          )}
         </>
       ) : (
         <form
