@@ -90,7 +90,7 @@ pub struct PromotionFacts {
     pub target_live: Option<String>,
     pub target_merged_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The version's newest promotion replay: (state, against).
-    pub promotion_replay: Option<(String, String)>,
+    pub promotion_replay: Option<(deja_store::PromotionReplayState, String)>,
     /// A request for the target that has not ended.
     pub in_flight: Option<i64>,
     /// The pause switch's reason, when paused.
@@ -166,11 +166,15 @@ pub fn promotion_checks(cfg: &CdConfig, f: &PromotionFacts) -> Vec<PromotionChec
                 true,
                 format!("{} runs nothing to replay against", f.target),
             ),
-            (Some((state, against)), Some(live)) if state == "done" && against == live => c(
-                "promotion_replay",
-                true,
-                format!("promotion replay against {live} came back"),
-            ),
+            (Some((state, against)), Some(live))
+                if *state == deja_store::PromotionReplayState::Done && against == live =>
+            {
+                c(
+                    "promotion_replay",
+                    true,
+                    format!("promotion replay against {live} came back"),
+                )
+            }
             (Some((state, against)), Some(live)) if against == live => c(
                 "promotion_replay",
                 false,
@@ -591,7 +595,10 @@ mod promotion {
             live_on_source_since: Some(now - Duration::hours(29)),
             target_live: Some("2026.10.09.1".into()),
             target_merged_at: Some(now - Duration::days(5)),
-            promotion_replay: Some(("done".into(), "2026.10.09.1".into())),
+            promotion_replay: Some((
+                deja_store::PromotionReplayState::Done,
+                "2026.10.09.1".into(),
+            )),
             in_flight: None,
             paused: None,
             now,
@@ -638,10 +645,16 @@ mod promotion {
         f.version_merged_at = Some(f.now - Duration::days(9));
         assert_eq!(failing(&c, &f), vec!["newer"]);
         let mut f = good();
-        f.promotion_replay = Some(("requested".into(), "2026.10.09.1".into()));
+        f.promotion_replay = Some((
+            deja_store::PromotionReplayState::Requested,
+            "2026.10.09.1".into(),
+        ));
         assert_eq!(failing(&c, &f), vec!["promotion_replay"]);
         let mut f = good();
-        f.promotion_replay = Some(("done".into(), "2026.10.01.0".into()));
+        f.promotion_replay = Some((
+            deja_store::PromotionReplayState::Done,
+            "2026.10.01.0".into(),
+        ));
         assert_eq!(
             failing(&c, &f),
             vec!["promotion_replay"],
