@@ -350,6 +350,31 @@ After the replay run, the observed and shadow boundary calls are compared agains
 
 The orchestrator adds cause-vs-consequence lanes: `ValueDivergedOrigin` marks the originating read so downstream consequences are attributed to it, alongside omitted/novel/environmental/`inconclusive_race` lanes.
 
+For a fixed Hyperswitch candidate image, the orchestrator has one narrower
+post-hoc rule for an **args-free serve** of `km::call_encryption_service`. It
+compares the observed arguments with the *recorded event actually served*:
+base64 `request.data` is decoded as a JSON envelope; header-pair permutations
+with unchanged values are rendering-only. A changed
+`X-Webhook-Signature-512` is **declared derived**, and counted as absorbed,
+only when the raw body bytes differ but the parsed JSON body, key identifiers,
+other arguments and non-signature headers agree. A signature change with
+identical raw body bytes, changed raw bytes with an unchanged signature, a
+changed JSON value, a non-signature header change, repeated header names with
+distinct values, malformed input, or a serve paired to a different recorded
+event still blocks. Deja does not possess or verify the HMAC key:
+`KmDerivedAbsorbed` is a declared dependency, **not** cryptographic proof.
+The raw args remain in the call ledger; the behavior tree carries only
+digests. The three-way delta compares matching semantic digests for separately
+signed main/candidate runs only when both served the same recorded event
+without an independent call-order mismatch. Reusing one signature for
+different raw body renderings, or changing a signature for identical raw
+bytes, still charges the delta; a candidate restoring the tape stays
+`Resolved`. This rule changes neither the candidate lookup/runtime nor
+recording; unrelated omitted or novel calls keep their own verdicts. A
+previously published scorecard/ledger is not silently re-scored: new replay
+runs apply the rule, while a tree rebuilt from an old ledger still reflects
+that ledger's original classification.
+
 The blocking-vs-drift policy is **built, declared, and judged** — not open. Boundaries declare canonicalization presets applied by the scorer before judging (never by runtime routing): `final_state`, `absent_after`, `project{include,exclude}`. Volatile columns are declared `project:!created_at,!last_synced,!modified_at` on the DB row seams with a matching `reply_canon` on `http_incoming`. Blocking vs non-blocking is explicit in the verdict: seed gaps, order-nondeterminism, and idempotent-delete lines are non-blocking; evidence-gated `inconclusive_race` rows (recognized only when the run's HTTP layer is clean) make the verdict `inconclusive` with an auto-rerun recommendation — a race-only run can never pass.
 
 The comparator produces a `ReplayReport` and a scorecard containing a Summary (matched/total correlations, side-effect and value divergences, inconclusive races/seed gaps), per-boundary and per-correlation breakdowns, warnings, and a three-state `Verdict {pass, inconclusive, reason}`. Latency/resource scoring does not exist today; if added it would be future work.

@@ -106,10 +106,16 @@ pub struct CallRecord {
     /// `source_event_global_sequence` is the twin the pairing judged it against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_event_global_sequence: Option<u64>,
+    /// This KM args-free serve was judged against the same event it served
+    /// without an independent call-order mismatch. Only such paired rows may
+    /// collapse common semantic drift in the three-way delta.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub km_semantic_pair: bool,
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
-    /// matched | recovered | served_recorded_error | novel | novel_absorbed | inconclusive_seed_gap |
+    /// matched | km_rendering_absorbed | km_derived_absorbed | recovered |
+    /// served_recorded_error | novel | novel_absorbed | inconclusive_seed_gap |
     /// inconclusive_tail_gap | omitted | environmental | deterministic |
     /// value_diverged | idempotent_delete | inconclusive_race | schema_default |
     /// identity_skew | pruned_subtree | novel_subtree
@@ -482,6 +488,7 @@ pub(crate) fn build_with_inconclusive_into(
                 correlation_id: obs.correlation_id.clone(),
                 source_event_global_sequence: obs.source_event_global_sequence,
                 served_event_global_sequence: None,
+                km_semantic_pair: false,
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
@@ -534,6 +541,21 @@ pub(crate) fn build_with_inconclusive_into(
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded_result, obs, twin_event);
             let value_diverged = paired_value_diverged(obs, observed_index, &by_seq, &pairing);
+            let km_class = (!value_diverged
+                && obs.arg_divergent
+                && obs.served_event_global_sequence == Some(twin_seq))
+            .then(|| {
+                twin_event.map(|ev| {
+                    super::km_entropy::classify(
+                        &obs.boundary,
+                        &obs.trait_name,
+                        &obs.method_name,
+                        &ev.args,
+                        &obs.args,
+                    )
+                })
+            })
+            .flatten();
             let race_downstream = !twin.order_mismatch
                 && !obs.arg_divergent
                 && value_diverged
@@ -565,12 +587,24 @@ pub(crate) fn build_with_inconclusive_into(
                 // The recorded event the candidate served, where it served one
                 // by address alone: auditable against the twin paired here.
                 served_event_global_sequence: obs.served_event_global_sequence,
+                km_semantic_pair: obs.arg_divergent
+                    && !twin.order_mismatch
+                    && obs.served_event_global_sequence == Some(twin_seq)
+                    && super::km_entropy::is_km(&obs.boundary, &obs.trait_name, &obs.method_name),
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
                 kind: match &schema_default {
                     Some(kind) => kind.clone(),
-                    None if !value_diverged => "matched".to_owned(),
+                    None if !value_diverged => match km_class {
+                        Some(super::km_entropy::KmClass::Rendering) => {
+                            "km_rendering_absorbed".to_owned()
+                        }
+                        Some(super::km_entropy::KmClass::DeclaredDerived) => {
+                            "km_derived_absorbed".to_owned()
+                        }
+                        _ => "matched".to_owned(),
+                    },
                     None if race_downstream => "inconclusive_race".to_owned(),
                     None => "value_diverged".to_owned(),
                 },
@@ -692,6 +726,7 @@ pub(crate) fn build_with_inconclusive_into(
             } else {
                 obs.served_event_global_sequence
             },
+            km_semantic_pair: false,
             boundary: obs.boundary.clone(),
             trait_name: obs.trait_name.clone(),
             method_name: obs.method_name.clone(),
@@ -734,6 +769,7 @@ pub(crate) fn build_with_inconclusive_into(
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),
             served_event_global_sequence: None,
+            km_semantic_pair: false,
             boundary: ev.boundary.clone(),
             trait_name: ev.trait_name.clone(),
             method_name: ev.method_name.clone(),

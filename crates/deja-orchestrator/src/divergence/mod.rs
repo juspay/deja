@@ -47,6 +47,7 @@ use crate::HarnessRoot;
 pub mod acknowledgement;
 pub mod behaviour_tree;
 pub mod delta;
+pub(crate) mod km_entropy;
 pub mod ledger;
 pub mod span_shape;
 pub mod tape;
@@ -2559,6 +2560,13 @@ enum ValueAbsorption {
     /// A paired request whose args have the recorded call's identity: an array
     /// in another order, or an embedded document written in another order.
     ArgsIdentity,
+    /// An args-free KM serve whose request differs only by an encoded JSON
+    /// rendering (including a permutation of identical header pairs).
+    KmRendering,
+    /// An args-free KM serve whose only other change is the signature declared
+    /// derived from equivalent JSON rendered into different body bytes. This
+    /// is a declaration, not cryptographic HMAC verification.
+    KmDerived,
     /// A value holding a JSON document in a string written differently: the
     /// document is the recording's, its text is not. With the source of any
     /// ordering beside it.
@@ -2581,19 +2589,32 @@ enum ValueVerdict {
 /// it — so a pair whose arguments agree missed its address by position alone,
 /// and is a match whatever it got back.
 ///
-/// Order is judged by the identity the lookup address uses
-/// ([`deja::identity`]), so the diff and the address cannot disagree: a request
-/// whose identity is the recording's is absorbed and counted, and one whose
-/// identity differs is never forgiven as order by the diff alone. A
-/// recorder-declared clause and replay-local database infrastructure are
-/// absorbed as they are anywhere else ([`value_verdict`]).
+/// Order-only KM encryption args can miss the fixed candidate's lookup and
+/// receive its recorded result via the args-free arm. The scorer alone may
+/// demote that serve, but only when it was paired to the event it actually
+/// served, and only after the narrow classifier proves that all other inputs
+/// remained the same. An unpaired serve or a different value stays blocking.
 fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
-    // A call served by its address alone had its arguments rejected by every
-    // rank of the candidate's own lookup, the exact key and the identity both,
-    // and it ran on a value recorded for other arguments. Nothing may forgive
-    // that: not the replay-local id rule, and not a clause.
     if call.arg_divergent {
-        return ValueVerdict::Diverged;
+        let Some(event) = twin else {
+            return ValueVerdict::Diverged;
+        };
+        if call.served_event_global_sequence != Some(event.global_sequence) {
+            return ValueVerdict::Diverged;
+        }
+        return match km_entropy::classify(
+            &call.boundary,
+            &call.trait_name,
+            &call.method_name,
+            &event.args,
+            &call.args,
+        ) {
+            km_entropy::KmClass::Rendering => ValueVerdict::Absorbed(ValueAbsorption::KmRendering),
+            km_entropy::KmClass::DeclaredDerived => {
+                ValueVerdict::Absorbed(ValueAbsorption::KmDerived)
+            }
+            _ => ValueVerdict::Diverged,
+        };
     }
     request_verdict(call, twin)
 }
@@ -2746,6 +2767,12 @@ fn account_lookups(
 /// Why a served call's arguments would otherwise have passed, for its warning.
 fn args_served_reason(verdict: ValueVerdict) -> &'static str {
     match verdict {
+        ValueVerdict::Absorbed(ValueAbsorption::KmRendering) => {
+            "the key-manager request differs only by encoded JSON rendering"
+        }
+        ValueVerdict::Absorbed(ValueAbsorption::KmDerived) => {
+            "the signature is declared derived from equivalent JSON rendered into different body bytes; HMAC correctness was not verified"
+        }
         ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure) => {
             "its arguments differ only where replay-local database infrastructure is \
              forgiven, which cannot be confirmed for a value recorded against other arguments"
@@ -6002,7 +6029,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // meaning. One kind (`ValueCanonAbsorbed`) with the source as a dimension,
     // exactly as the HTTP reply path keys `ReplyCanonAbsorbed` below.
     let mut value_canon_absorbed_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
-    let mut args_served_seen: BTreeMap<(String, &'static str), u64> = BTreeMap::new();
+    let mut args_served_seen: BTreeMap<(String, &'static str, bool), u64> = BTreeMap::new();
     let mut pairing_disagreements: BTreeMap<String, (u64, u64, u64)> = BTreeMap::new();
     let mut value_document_absorbed_seen: BTreeMap<String, u64> = BTreeMap::new();
     // Resolved calls whose args were read by identity to find their recording,
@@ -6344,23 +6371,17 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .or_insert((0, served, twin_seq))
                     .0 += 1;
             }
-            if obs.arg_divergent {
-                // The kind is not noted here. `summary.arg_divergent_serves` is documented as
-                // the projection of this kind, and the reach pass notes it once per serve in
-                // lockstep with that counter. Noting it again here would count every serve
-                // twice and break the fold that checks the projection.
-                *args_served_seen
-                    .entry((
-                        call_site_label(obs),
-                        args_served_reason(request_verdict(obs, twin_event)),
-                    ))
-                    .or_insert(0) += 1;
-            }
             if let ValueVerdict::Absorbed(ValueAbsorption::Canon(source)) = verdict {
                 stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
+            }
+            if let ValueVerdict::Absorbed(ValueAbsorption::KmRendering) = verdict {
+                stats.note_kind("KmRenderingAbsorbed");
+            }
+            if let ValueVerdict::Absorbed(ValueAbsorption::KmDerived) = verdict {
+                stats.note_kind("KmDerivedAbsorbed");
             }
             if let ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity) = verdict {
                 let recorded = twin_event.map_or(serde_json::Value::Null, |e| e.args.to_value());
@@ -6375,6 +6396,24 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 matches!(verdict, ValueVerdict::Diverged),
                 order_mismatch,
             );
+            if obs.arg_divergent {
+                // The serve stays visible even when the scorer can absorb its
+                // request: the recorded result was returned for moved args.
+                // An independent order mismatch may still block.
+                let reason = if matches!(
+                    verdict,
+                    ValueVerdict::Absorbed(
+                        ValueAbsorption::KmRendering | ValueAbsorption::KmDerived
+                    )
+                ) {
+                    args_served_reason(verdict)
+                } else {
+                    args_served_reason(request_verdict(obs, twin_event))
+                };
+                *args_served_seen
+                    .entry((call_site_label(obs), reason, value_diverged))
+                    .or_insert(0) += 1;
+            }
             if value_diverged {
                 if let (Some(correlation_id), Some(node_id)) =
                     (obs.correlation_id.as_ref(), obs.graph_node_id)
@@ -6456,6 +6495,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 .entry((
                     call_site_label(obs),
                     "no recorded call was left to pair it with",
+                    true,
                 ))
                 .or_insert(0) += 1;
             value_divergences += 1;
@@ -7306,10 +7346,15 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
              the candidate picks by site and the scorer by order, and here they differ"
         ));
     }
-    for ((call_site, reason), calls) in &args_served_seen {
+    for ((call_site, reason, blocks), calls) in &args_served_seen {
+        let outcome = if *blocks {
+            "and it blocks"
+        } else {
+            "and it is absorbed"
+        };
         warnings.push(format!(
             "call {call_site} was served the recording's value for its address on {calls} \
-             call(s) although its arguments differed, and it blocks: {reason}"
+             call(s) although its arguments differed, {outcome}: {reason}"
         ));
     }
     for ((call_site, source), calls) in &value_canon_absorbed_seen {
@@ -20939,5 +20984,121 @@ mod tests {
             "{}",
             card.verdict.reason
         );
+    }
+    fn km_args(body: &str, signature: &str, reversed_headers: bool) -> serde_json::Value {
+        use base64::Engine as _;
+        let mut headers = vec![
+            serde_json::json!(["content-type", "application/json"]),
+            serde_json::json!(["X-Webhook-Signature-512", signature]),
+        ];
+        if reversed_headers {
+            headers.reverse();
+        }
+        let data = serde_json::json!({"body": body, "headers": headers}).to_string();
+        serde_json::json!({
+            "method": "POST",
+            "endpoint": "data/encrypt",
+            "request": {
+                "data_identifier": "Merchant",
+                "key_identifier": "merchant_1",
+                "data": base64::engine::general_purpose::STANDARD.encode(data)
+            }
+        })
+    }
+
+    fn km_served_artifacts(
+        recorded: serde_json::Value,
+        observed: serde_json::Value,
+        served_from: u64,
+    ) -> RunArtifacts {
+        let mut call = added_draw(
+            "km",
+            "call_encryption_service",
+            deja::SubstituteOutcome::Substituted,
+        );
+        call.trait_name = "common_utils::keymanager".to_owned();
+        call.args = observed;
+        call.resolved = false;
+        call.arg_divergent = true;
+        call.source_event_global_sequence = None;
+        call.served_event_global_sequence = Some(served_from);
+        let mut artifacts = one_span_recording(("km", "call_encryption_service"), recorded, call);
+        artifacts.events[0].trait_name = "common_utils::keymanager".to_owned();
+        artifacts.http_diffs[0].status_match = true;
+        artifacts
+    }
+
+    #[test]
+    fn km_args_free_serve_is_absorbed_only_for_rendering_or_declared_derivation() {
+        let recorded = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);
+        for (observed, kind, row_kind) in [
+            (
+                km_args(r#"{"a":1,"b":2}"#, "sig-a", true),
+                "KmRenderingAbsorbed",
+                "km_rendering_absorbed",
+            ),
+            (
+                km_args(r#"{"b":2,"a":1}"#, "sig-b", true),
+                "KmDerivedAbsorbed",
+                "km_derived_absorbed",
+            ),
+        ] {
+            for (tier, art) in in_both_tiers(|| {
+                km_served_artifacts(recorded.clone(), observed.clone(), UPSTREAM_CALL)
+            }) {
+                let card = detect(&art);
+                assert_eq!(
+                    card.summary.value_divergences, 0,
+                    "{tier}: {}",
+                    card.verdict.reason
+                );
+                assert_eq!(kind_count(&card, "km", kind), 1, "{tier}");
+                assert_eq!(card.summary.arg_divergent_serves, 1, "{tier}");
+                assert!(card.counter_disagreements().is_empty(), "{tier}");
+                let rows = build_ledger(&art).expect("ledger builds");
+                let km: Vec<_> = rows.iter().filter(|r| r.boundary == "km").collect();
+                assert_eq!(km.len(), 1, "{tier}");
+                assert_eq!(km[0].kind, row_kind, "{tier}");
+                assert!(!km[0].blocking, "{tier}");
+                assert_eq!(km[0].source_event_global_sequence, Some(UPSTREAM_CALL));
+                assert_eq!(km[0].served_event_global_sequence, Some(UPSTREAM_CALL));
+                assert!(
+                    km[0].km_semantic_pair,
+                    "{tier}: pair is safe for semantic delta"
+                );
+                let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
+                assert!(tree.entries.iter().any(|entry| {
+                    matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "km")
+                        && matches!(entry.value, behaviour_tree::Value::Reproduced)
+                        && entry.km_entropy.is_some()
+                }), "{tier}");
+            }
+        }
+    }
+
+    #[test]
+    fn km_semantic_signature_and_pairing_changes_still_block() {
+        let recorded = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);
+        let mut changed_key = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);
+        changed_key["request"]["key_identifier"] = serde_json::json!("merchant_2");
+        for observed in [
+            km_args(r#"{"a":1,"b":2}"#, "sig-b", false),
+            km_args(r#"{"a":1,"b":2,"enable_avs_check":true}"#, "sig-b", false),
+            changed_key,
+        ] {
+            let art = km_served_artifacts(recorded.clone(), observed, UPSTREAM_CALL);
+            let card = detect(&art);
+            assert_eq!(card.summary.value_divergences, 1);
+            let rows = build_ledger(&art).expect("ledger builds");
+            let row = rows.iter().find(|r| r.boundary == "km").expect("km row");
+            assert_eq!(row.kind, "value_diverged");
+            assert!(row.blocking);
+        }
+        let wrong_twin = km_served_artifacts(
+            recorded,
+            km_args(r#"{"b":2,"a":1}"#, "sig-b", false),
+            UPSTREAM_CALL + 1,
+        );
+        assert_eq!(detect(&wrong_twin).summary.value_divergences, 1);
     }
 }

@@ -240,6 +240,77 @@ fn classify(tape_has: bool, m: &Side, y: &Side) -> Bucket {
         (Tape, Hash(_)) => Bucket::Introduced,
     }
 }
+/// Compare a pair of km calls only where the scorer's ledger paired both to
+/// this tape address. A raw signature is not a stable delta key when body JSON
+/// was rendered in different member orders on two replays. The tree carries
+/// only digests, never the recorded key or webhook payload.
+///
+/// A signature and the raw body must move together under this declared
+/// raw-byte signing rule. If exactly one moved, it is NOT rendering entropy:
+/// force a blocking difference when both tape-relative states would otherwise
+/// conceal it. When one side reproduces the tape and the other diverges,
+/// three-way already says introduced/resolved and must keep that verdict.
+fn km_sides(
+    m: Option<&super::behaviour_tree::Entry>,
+    y: Option<&super::behaviour_tree::Entry>,
+    tape_has: bool,
+) -> (Side, Side, bool) {
+    let raw_m = side_of(m.map(|entry| &entry.value), tape_has);
+    let raw_y = side_of(y.map(|entry| &entry.value), tape_has);
+    let (Some(m), Some(y)) = (m, y) else {
+        return (raw_m, raw_y, false);
+    };
+    if !matches!(
+        m.address,
+        Address::Call {
+            boundary: ref b,
+            operation: ref op,
+            recorded_event: Some(_),
+            ..
+        } if b == "km" && op == "call_encryption_service"
+    ) {
+        return (raw_m, raw_y, false);
+    }
+    let (Some(a), Some(b)) = (&m.km_entropy, &y.km_entropy) else {
+        return (raw_m, raw_y, false);
+    };
+    if a.semantic_digest != b.semantic_digest {
+        return (raw_m, raw_y, false);
+    }
+    let body_moved = a.raw_body_digest != b.raw_body_digest;
+    let signature_moved = a.signature_digest != b.signature_digest;
+    if body_moved != signature_moved
+        && ((matches!(m.value, Value::Reproduced) && matches!(y.value, Value::Reproduced))
+            || (matches!(m.value, Value::Diverged { .. })
+                && matches!(y.value, Value::Diverged { .. })))
+    {
+        // Different raw bytes with one reused signature, or identical bytes
+        // with different signatures: neither is a proved derived rendering.
+        return (
+            Side::Hash(format!(
+                "km-signing:{}:{}",
+                a.raw_body_digest, a.signature_digest
+            )),
+            Side::Hash(format!(
+                "km-signing:{}:{}",
+                b.raw_body_digest, b.signature_digest
+            )),
+            true,
+        );
+    }
+    if a.paired_serve
+        && b.paired_serve
+        && matches!(m.value, Value::Diverged { .. })
+        && matches!(y.value, Value::Diverged { .. })
+    {
+        // Both made the same semantic change from the tape. Their separately
+        // computed signatures are derived from their own raw body bytes; only
+        // the signed content is the candidate-vs-main delta.
+        let hash = Side::Hash(format!("km-semantic:{}", a.semantic_digest));
+        return (hash.clone(), hash, false);
+    }
+    (raw_m, raw_y, false)
+}
 
 /// Whether a cached delta document is the one a request for `(y, m)` would
 /// compute now: the same two runs, built under the current rules, having
@@ -324,11 +395,15 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             .iter()
             .flatten()
             .any(|e| !matches!(e.value, Value::Novel { .. }));
-        let m_side = side_of(me.map(|e| &e.value), tape_has);
-        let y_side = side_of(ye.map(|e| &e.value), tape_has);
-        let bucket = classify(tape_has, &m_side, &y_side);
-        let blocking =
-            me.map(|e| e.blocking).unwrap_or(false) || ye.map(|e| e.blocking).unwrap_or(false);
+        let (m_side, y_side, signature_only) = km_sides(me, ye, tape_has);
+        let bucket = if signature_only {
+            Bucket::Changed
+        } else {
+            classify(tape_has, &m_side, &y_side)
+        };
+        let blocking = signature_only
+            || me.map(|e| e.blocking).unwrap_or(false)
+            || ye.map(|e| e.blocking).unwrap_or(false);
         let lane = y
             .lanes
             .get(address.correlation())
@@ -569,6 +644,7 @@ mod tests {
                     address,
                     value,
                     blocking: true,
+                    km_entropy: None,
                 })
                 .collect(),
             // one lane for every request, so per-lane request counts are one row
@@ -901,5 +977,119 @@ mod tests {
         bumped.event_schema_versions = [11].into_iter().collect();
         let why = three_way(&m, &bumped).err().unwrap();
         assert!(why.contains("different event schemas"), "{why}");
+    }
+    #[test]
+    fn km_semantic_drift_shared_by_main_and_candidate_is_inherited() {
+        let at = Address::Call {
+            correlation: "c".into(),
+            span_path: SPAN.into(),
+            boundary: "km".into(),
+            operation: "call_encryption_service".into(),
+            recorded_event: Some(7),
+            occurrence: 0,
+        };
+        let mut main = tree("m", vec![(at.clone(), div("raw-main-signature"))]);
+        let mut candidate = tree("y", vec![(at.clone(), div("raw-candidate-signature"))]);
+        let evidence = |raw: &str, sig: &str, paired_serve| super::super::km_entropy::KmEvidence {
+            semantic_digest: "same-signed-content".into(),
+            raw_body_digest: raw.into(),
+            signature_digest: sig.into(),
+            paired_serve,
+        };
+        main.entries[0].km_entropy = Some(evidence("raw-main", "sig-main", true));
+        candidate.entries[0].km_entropy = Some(evidence("raw-candidate", "sig-candidate", true));
+        let delta = three_way(&main, &candidate).unwrap();
+        assert!(delta.verdict.pass, "the same semantic move is inherited");
+        assert_eq!(delta.rows[0].bucket, Bucket::Inherited);
+
+        // A structural difference is still changed, not folded into the
+        // common drift merely because both calls were served.
+        candidate.entries[0]
+            .km_entropy
+            .as_mut()
+            .unwrap()
+            .semantic_digest = "different-body".into();
+        let changed = three_way(&main, &candidate).unwrap();
+        assert!(!changed.verdict.pass);
+        assert_eq!(changed.rows[0].bucket, Bucket::Changed);
+
+        // An untrusted pair, or absent evidence, cannot normalize the raw
+        // signatures into a fabricated common value.
+        candidate.entries[0].km_entropy = Some(evidence("raw-candidate", "sig-candidate", false));
+        assert_eq!(
+            three_way(&main, &candidate).unwrap().rows[0].bucket,
+            Bucket::Changed
+        );
+        candidate.entries[0].km_entropy = None;
+        assert_eq!(
+            three_way(&main, &candidate).unwrap().rows[0].bucket,
+            Bucket::Changed
+        );
+    }
+
+    #[test]
+    fn km_signature_only_change_blocks_even_when_both_tape_rows_were_absorbed() {
+        let at = Address::Call {
+            correlation: "c".into(),
+            span_path: SPAN.into(),
+            boundary: "km".into(),
+            operation: "call_encryption_service".into(),
+            recorded_event: Some(7),
+            occurrence: 0,
+        };
+        let mut main = tree("m", vec![(at.clone(), Value::Reproduced)]);
+        let mut candidate = tree("y", vec![(at, Value::Reproduced)]);
+        let evidence = |sig: &str| super::super::km_entropy::KmEvidence {
+            semantic_digest: "same-signed-content".into(),
+            raw_body_digest: "identical-body-bytes".into(),
+            signature_digest: sig.into(),
+            paired_serve: true,
+        };
+        main.entries[0].km_entropy = Some(evidence("sig-main"));
+        candidate.entries[0].km_entropy = Some(evidence("sig-candidate"));
+        let delta = three_way(&main, &candidate).unwrap();
+        assert!(!delta.verdict.pass);
+        assert_eq!(delta.verdict.changed, 1);
+        assert!(delta.rows[0].blocking);
+        assert_eq!(delta.rows[0].bucket, Bucket::Changed);
+
+        // A candidate that restores the tape's signature is a resolution,
+        // not a conflict; the pairwise check must not override three-way's
+        // tape-relative classification when one side already diverged.
+        main.entries[0].value = div("main-signature-only");
+        let fixed = three_way(&main, &candidate).unwrap();
+        assert!(fixed.verdict.pass);
+        assert_eq!(fixed.rows[0].bucket, Bucket::Resolved);
+
+        main.entries[0].value = Value::Reproduced;
+        candidate.entries[0].value = div("candidate-signature-only");
+        let introduced = three_way(&main, &candidate).unwrap();
+        assert!(!introduced.verdict.pass);
+        assert_eq!(introduced.rows[0].bucket, Bucket::Introduced);
+
+        // Reusing one signature for two different raw body renderings is no
+        // more proof of derivation than changing a signature for identical
+        // bytes. Do not normalize the shared semantic digest in either case.
+        main.entries[0].value = div("main-raw-body");
+        candidate.entries[0].value = div("candidate-raw-body");
+        main.entries[0].km_entropy.as_mut().unwrap().raw_body_digest = "raw-main".into();
+        candidate.entries[0]
+            .km_entropy
+            .as_mut()
+            .unwrap()
+            .raw_body_digest = "raw-candidate".into();
+        main.entries[0]
+            .km_entropy
+            .as_mut()
+            .unwrap()
+            .signature_digest = "reused".into();
+        candidate.entries[0]
+            .km_entropy
+            .as_mut()
+            .unwrap()
+            .signature_digest = "reused".into();
+        let reused = three_way(&main, &candidate).unwrap();
+        assert!(!reused.verdict.pass);
+        assert_eq!(reused.rows[0].bucket, Bucket::Changed);
     }
 }
