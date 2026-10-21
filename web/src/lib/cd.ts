@@ -4,7 +4,7 @@
 // them -- "live since", "six merges not yet on sandbox", "made outside déjà"
 // -- is decided here.
 
-import type { CdDeploymentRow, CdHopRow, CdVersionRow, CdVersionWhere } from "./api";
+import type { CdDeploymentRow, CdPromotionReplayRow, CdVersionRow, CdVersionWhere } from "./api";
 
 /** A deployment-log state that means the version is what the environment runs. */
 export function isRunning(state: string): boolean {
@@ -137,14 +137,14 @@ export function stateTone(state: string): string {
 }
 
 /**
- * What a hop replay says, as one word and a chip tone. The candidate run's
+ * What a promotion replay says, as one word and a chip tone. The candidate run's
  * own delta verdict wins when it has one (`pass`, `fail`, `acknowledged`):
  * it is current, an acknowledgement given after the job finished counts.
- * Otherwise the row's state speaks: a hop still `requested` is running (or
+ * Otherwise the row's state speaks: a promotion replay still `requested` is running (or
  * never came back), a `skipped` or `failed` one says so, and a `done` one
  * without a run word falls back to what the job read.
  */
-export function hopWord(h: Pick<CdHopRow, "state" | "verdict" | "run_state" | "run_delta_verdict">): { word: string; tone: string } {
+export function promotionReplayWord(h: Pick<CdPromotionReplayRow, "state" | "verdict" | "run_state" | "run_delta_verdict">): { word: string; tone: string } {
   const live = h.run_delta_verdict;
   if (live === "pass" || live === "acknowledged") return { word: live, tone: "ok" };
   if (live === "fail") return { word: "fail", tone: "failed" };

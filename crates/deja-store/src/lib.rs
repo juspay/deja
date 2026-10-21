@@ -318,13 +318,13 @@ pub struct CdControlRow {
     pub changed_at: DateTime<Utc>,
 }
 
-/// One hop replay of a version against the release the next environment
+/// One promotion replay of a version against the release the next environment
 /// runs; see migration 0012. `run_state` and `run_delta_verdict` are read
 /// from the candidate run's row at query time: the run's word is current
 /// (an acknowledgement changes it), the copy in `verdict` is what the job
 /// read when it finished.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CdHopRow {
+pub struct CdPromotionReplayRow {
     pub id: i64,
     pub system: String,
     pub version: String,
@@ -343,10 +343,10 @@ pub struct CdHopRow {
     pub run_delta_verdict: Option<String>,
 }
 
-/// A hop row to append: everything but what the database fills in. The
+/// A promotion replay row to append: everything but what the database fills in. The
 /// version is the path of the request; the body names the rest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NewCdHop {
+pub struct NewCdPromotionReplay {
     pub system: String,
     #[serde(default)]
     pub version: String,
@@ -1017,11 +1017,11 @@ impl Store {
         Ok(cd_control_row(row))
     }
 
-    // -- cd hops -------------------------------------------------------------
+    // -- cd promotion replays ---------------------------------------------------------------
 
-    pub async fn cd_hop_append(&self, h: &NewCdHop) -> Result<CdHopRow, sqlx::Error> {
+    pub async fn cd_promotion_replay_append(&self, h: &NewCdPromotionReplay) -> Result<CdPromotionReplayRow, sqlx::Error> {
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO cd_hops
+            "INSERT INTO cd_promotion_replays
                (system, version, against_version, against_commit, state, candidate_run,
                 baseline_run, verdict, reason, requested_by, jenkins_build, detail)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
@@ -1041,22 +1041,22 @@ impl Store {
         .bind(&h.detail)
         .fetch_one(&self.pool)
         .await?;
-        let row = sqlx::query(&format!("{CD_HOP_SELECT} WHERE h.id = $1"))
+        let row = sqlx::query(&format!("{CD_PROMOTION_REPLAY_SELECT} WHERE h.id = $1"))
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        Ok(cd_hop_row(row))
+        Ok(cd_promotion_replay_row(row))
     }
 
-    /// A version's hops, newest first.
-    pub async fn cd_hops_of_version(
+    /// A version's promotion replays, newest first.
+    pub async fn cd_promotion_replays_of_version(
         &self,
         system: &str,
         version: &str,
         limit: i64,
-    ) -> Result<Vec<CdHopRow>, sqlx::Error> {
+    ) -> Result<Vec<CdPromotionReplayRow>, sqlx::Error> {
         let rows = sqlx::query(&format!(
-            "{CD_HOP_SELECT} WHERE h.system = $1 AND h.version = $2
+            "{CD_PROMOTION_REPLAY_SELECT} WHERE h.system = $1 AND h.version = $2
              ORDER BY h.id DESC LIMIT $3"
         ))
         .bind(system)
@@ -1064,22 +1064,22 @@ impl Store {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(cd_hop_row).collect())
+        Ok(rows.into_iter().map(cd_promotion_replay_row).collect())
     }
 
-    /// The newest hop row of every version that has one: where each stands.
-    pub async fn cd_latest_hop_per_version(
+    /// The newest promotion replay row of every version that has one: where each stands.
+    pub async fn cd_latest_promotion_replay_per_version(
         &self,
         system: &str,
-    ) -> Result<Vec<CdHopRow>, sqlx::Error> {
+    ) -> Result<Vec<CdPromotionReplayRow>, sqlx::Error> {
         let rows = sqlx::query(&format!(
-            "{CD_HOP_SELECT} WHERE h.id IN
-               (SELECT max(id) FROM cd_hops WHERE system = $1 GROUP BY version)"
+            "{CD_PROMOTION_REPLAY_SELECT} WHERE h.id IN
+               (SELECT max(id) FROM cd_promotion_replays WHERE system = $1 GROUP BY version)"
         ))
         .bind(system)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(cd_hop_row).collect())
+        Ok(rows.into_iter().map(cd_promotion_replay_row).collect())
     }
 
     // -- recordings ----------------------------------------------------------
@@ -1659,13 +1659,13 @@ fn cd_control_row(r: sqlx::postgres::PgRow) -> CdControlRow {
     }
 }
 
-const CD_HOP_SELECT: &str = "SELECT h.id, h.system, h.version, h.against_version, h.against_commit, \
+const CD_PROMOTION_REPLAY_SELECT: &str = "SELECT h.id, h.system, h.version, h.against_version, h.against_commit, \
      h.state, h.candidate_run, h.baseline_run, h.verdict, h.reason, h.requested_by, h.jenkins_build, \
      h.detail, h.at, r.state, r.delta_verdict \
-     FROM cd_hops h LEFT JOIN replay_runs r ON r.run_id = h.candidate_run";
+     FROM cd_promotion_replays h LEFT JOIN replay_runs r ON r.run_id = h.candidate_run";
 
-fn cd_hop_row(r: sqlx::postgres::PgRow) -> CdHopRow {
-    CdHopRow {
+fn cd_promotion_replay_row(r: sqlx::postgres::PgRow) -> CdPromotionReplayRow {
+    CdPromotionReplayRow {
         id: r.get(0),
         system: r.get(1),
         version: r.get(2),
