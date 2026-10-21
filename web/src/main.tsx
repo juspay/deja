@@ -126,9 +126,12 @@ function ActorBox() {
 function Shell() {
   const loc = useLocation();
   const me = useMe();
-  // Deployments is in beta for maintainers: the tab is drawn for a signed-in
-  // maintainer only (the API refuses everyone else anyway).
-  const maintainer = !!me.data?.configured && !!me.data.authenticated && (me.data.roles ?? []).includes("maintainer");
+  // Deployments is in beta: the tab is drawn for a signed-in maintainer or an
+  // environment's upgrader, the people who press Promote (the API refuses
+  // everyone else anyway).
+  const roles = me.data?.roles ?? [];
+  const maintainer =
+    !!me.data?.configured && !!me.data.authenticated && roles.some((r) => r === "maintainer" || r.endsWith("_upgrader"));
   const tab = (path: string, label: string, exact = false, beta = false) => {
     const on = exact ? loc.pathname === path : loc.pathname.startsWith(path);
     return (

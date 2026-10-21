@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { ago, argoOf, carries, promotionReplayWord, howOf, mergesSince, placesOf, stateTone } from "./cd";
+import { ago, agoText, argoOf, carries, promotionReplayWord, howOf, inFlight, mergesSince, placesOf, promotionCandidates, promotionProgress, stateTone } from "./cd";
 import type { CdVersionRow } from "./api";
 
 function v(partial: Partial<CdVersionRow> & { version: string; kind: string }): CdVersionRow {
@@ -106,6 +106,8 @@ describe("carries / placesOf / tone / ago", () => {
     expect(ago("2026-10-12T11:19:00Z", now)).toBe("41 min");
     expect(ago("2026-10-12T07:00:00Z", now)).toBe("5 h");
     expect(ago("2026-10-09T12:00:00Z", now)).toBe("3 days");
+    expect(agoText("2026-10-12T11:59:40Z", now)).toBe("just now");
+    expect(agoText("2026-10-12T07:00:00Z", now)).toBe("5 h ago");
   });
 });
 
@@ -142,5 +144,28 @@ describe("promotionReplayWord", () => {
     expect(promotionReplayWord(h({ state: "done", verdict: "pass", run_delta_verdict: "pending" }))).toEqual({ word: "pass", tone: "ok" });
     expect(promotionReplayWord(h({ state: "done", verdict: "inconclusive" }))).toEqual({ word: "inconclusive", tone: "inconclusive" });
     expect(promotionReplayWord(h({ state: "done" }))).toEqual({ word: "unknown", tone: "muted" });
+  });
+});
+
+describe("promotion", () => {
+  const w = (environment: string, state: string, version: string) => ({ id: 1, system: "prism", environment, version, state, requested_by: "x", request_id: null, jenkins_build: null, detail: {}, at: "2026-10-12T00:00:00Z" });
+  const rows = [
+    { version: merge("9d8050b234", "2026-10-12T10:35:28Z", 2501), where: [w("integ", "committed", "9d8050b234")] },
+    { version: merge("8eaddb0b85", "2026-10-12T06:54:18Z", 2488), where: [w("integ", "live", "8eaddb0b85")] },
+    { version: v({ version: "2026.10.09.1", kind: "release", released_from: "6aa4b50944", merged_at: "2026-10-09T13:00:00Z" }), where: [w("sandbox", "live", "2026.10.09.1")] },
+    { version: merge("efdd705fea", "2026-10-10T09:36:40Z", 2490), where: [w("integ", "live", "efdd705fea")] },
+    { version: merge("6aa4b50944", "2026-10-09T13:00:00Z", 2480), where: [w("integ", "live", "6aa4b50944")] },
+  ];
+  test("candidates: merges that reached integ after what sandbox runs, newest first", () => {
+    expect(promotionCandidates(rows, "integ", rows[2].version).map((x) => x.version)).toEqual(["9d8050b234", "8eaddb0b85", "efdd705fea"]);
+  });
+  test("candidates when sandbox's base is unknown: every merge that reached integ", () => {
+    expect(promotionCandidates(rows, "integ", null).map((x) => x.version)).toEqual(["9d8050b234", "8eaddb0b85", "efdd705fea", "6aa4b50944"]);
+  });
+  test("progress and in flight", () => {
+    expect(promotionProgress({ state: "built" }).map((s) => s.at)).toEqual(["done", "done", "done", "now", "todo", "todo"]);
+    expect(promotionProgress({ state: "live" }).every((s) => s.at === "done")).toBe(true);
+    expect(inFlight({ state: "picked" })).toBe(true);
+    expect(inFlight({ state: "cancelled" })).toBe(false);
   });
 });
