@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { ago, argoOf, carries, howOf, mergesSince, placesOf, stateTone } from "./cd";
+import { ago, argoOf, carries, promotionReplayWord, howOf, mergesSince, placesOf, stateTone } from "./cd";
 import type { CdVersionRow } from "./api";
 
 function v(partial: Partial<CdVersionRow> & { version: string; kind: string }): CdVersionRow {
@@ -106,5 +106,41 @@ describe("carries / placesOf / tone / ago", () => {
     expect(ago("2026-10-12T11:19:00Z", now)).toBe("41 min");
     expect(ago("2026-10-12T07:00:00Z", now)).toBe("5 h");
     expect(ago("2026-10-09T12:00:00Z", now)).toBe("3 days");
+  });
+});
+
+describe("promotionReplayWord", () => {
+  const h = (p: { state: string; verdict?: string | null; run_state?: string | null; run_delta_verdict?: string | null }) => ({
+    verdict: null,
+    run_state: null,
+    run_delta_verdict: null,
+    ...p,
+  });
+  test("the candidate run's own word is current and wins", () => {
+    expect(promotionReplayWord(h({ state: "done", verdict: "fail", run_delta_verdict: "acknowledged" }))).toEqual({ word: "acknowledged", tone: "ok" });
+    expect(promotionReplayWord(h({ state: "done", verdict: "pass", run_delta_verdict: "fail" }))).toEqual({ word: "fail", tone: "failed" });
+  });
+  test("a promotion replay still requested is running, unless its run died", () => {
+    expect(promotionReplayWord(h({ state: "requested", run_state: "running" }))).toEqual({ word: "running", tone: "pending" });
+    expect(promotionReplayWord(h({ state: "requested" }))).toEqual({ word: "running", tone: "pending" });
+    expect(promotionReplayWord(h({ state: "requested", run_state: "failed" }))).toEqual({ word: "failed", tone: "failed" });
+  });
+  test("skipped and failed say so", () => {
+    expect(promotionReplayWord(h({ state: "skipped" }))).toEqual({ word: "skipped", tone: "muted" });
+    expect(promotionReplayWord(h({ state: "failed" }))).toEqual({ word: "failed", tone: "failed" });
+  });
+  test("a replay that failed, was skipped or is still running never borrows the candidate run's verdict", () => {
+    expect(promotionReplayWord(h({ state: "failed", verdict: "unknown", run_delta_verdict: "pass" }))).toEqual({ word: "failed", tone: "failed" });
+    expect(promotionReplayWord(h({ state: "skipped", run_delta_verdict: "pass" }))).toEqual({ word: "skipped", tone: "muted" });
+    expect(promotionReplayWord(h({ state: "requested", run_delta_verdict: "pass" }))).toEqual({ word: "running", tone: "pending" });
+    expect(promotionReplayWord(h({ state: "requested", run_state: "failed", run_delta_verdict: "pass" }))).toEqual({ word: "failed", tone: "failed" });
+  });
+  test("a finished replay whose run was re-pointed keeps its recorded verdict (the store sends no live one)", () => {
+    expect(promotionReplayWord(h({ state: "done", verdict: "fail", run_delta_verdict: null }))).toEqual({ word: "fail", tone: "failed" });
+  });
+  test("a done promotion replay without a run word falls back to what the job read", () => {
+    expect(promotionReplayWord(h({ state: "done", verdict: "pass", run_delta_verdict: "pending" }))).toEqual({ word: "pass", tone: "ok" });
+    expect(promotionReplayWord(h({ state: "done", verdict: "inconclusive" }))).toEqual({ word: "inconclusive", tone: "inconclusive" });
+    expect(promotionReplayWord(h({ state: "done" }))).toEqual({ word: "unknown", tone: "muted" });
   });
 });

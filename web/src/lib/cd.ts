@@ -4,7 +4,7 @@
 // them -- "live since", "six merges not yet on sandbox", "made outside déjà"
 // -- is decided here.
 
-import type { CdDeploymentRow, CdVersionRow, CdVersionWhere } from "./api";
+import type { CdDeploymentRow, CdPromotionReplayRow, CdVersionRow, CdVersionWhere } from "./api";
 
 /** A deployment-log state that means the version is what the environment runs. */
 export function isRunning(state: string): boolean {
@@ -133,5 +133,40 @@ export function stateTone(state: string): string {
       return "pending";
     default:
       return "muted";
+  }
+}
+
+/**
+ * What a promotion replay says, as one word and a chip tone. The candidate run's
+ * own delta verdict wins when it has one (`pass`, `fail`, `acknowledged`):
+ * it is current, an acknowledgement given after the job finished counts.
+ * Otherwise the row's state speaks: a promotion replay still `requested` is running (or
+ * never came back), a `skipped` or `failed` one says so, and a `done` one
+ * without a run word falls back to what the job read.
+ */
+export function promotionReplayWord(h: Pick<CdPromotionReplayRow, "state" | "verdict" | "run_state" | "run_delta_verdict">): { word: string; tone: string } {
+  // The row's state comes first: a replay that failed, was skipped or has not
+  // finished has no verdict, whatever its candidate run says today. Only a
+  // finished replay reads the candidate run's live verdict (the store hands it
+  // over only while the run is still measured against this row's baseline),
+  // which can turn a recorded fail into an acknowledgement.
+  if (h.state === "requested") {
+    return h.run_state === "failed" ? { word: "failed", tone: "failed" } : { word: "running", tone: "pending" };
+  }
+  if (h.state === "skipped") return { word: "skipped", tone: "muted" };
+  if (h.state === "failed") return { word: "failed", tone: "failed" };
+  const live = h.run_delta_verdict;
+  if (live === "pass" || live === "acknowledged") return { word: live, tone: "ok" };
+  if (live === "fail") return { word: "fail", tone: "failed" };
+  switch (h.verdict) {
+    case "pass":
+    case "acknowledged":
+      return { word: h.verdict, tone: "ok" };
+    case "fail":
+      return { word: "fail", tone: "failed" };
+    case "inconclusive":
+      return { word: "inconclusive", tone: "inconclusive" };
+    default:
+      return { word: "unknown", tone: "muted" };
   }
 }
