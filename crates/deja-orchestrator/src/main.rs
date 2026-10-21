@@ -4434,10 +4434,6 @@ fn cd_limit(q: &std::collections::HashMap<String, String>, default: i64) -> i64 
         .min(1000)
 }
 
-const CD_PROMOTION_REPLAY_STATES: [&str; 4] = ["requested", "done", "failed", "skipped"];
-const CD_PROMOTION_REPLAY_VERDICTS: [&str; 5] =
-    ["pass", "fail", "acknowledged", "inconclusive", "unknown"];
-
 const CD_DEPLOYMENT_STATES: [&str; 6] = [
     "requested",
     "committed",
@@ -5032,26 +5028,6 @@ async fn v1_cd_post_promotion_replay(
     h.version = version;
     if !cd.knows_system(&h.system) {
         return error_resp(400, &format!("unknown system {:?}", h.system));
-    }
-    if !CD_PROMOTION_REPLAY_STATES.contains(&h.state.as_str()) {
-        return error_resp(
-            400,
-            &format!(
-                "state must be one of {}",
-                CD_PROMOTION_REPLAY_STATES.join(", ")
-            ),
-        );
-    }
-    if let Some(v) = h.verdict.as_deref() {
-        if !CD_PROMOTION_REPLAY_VERDICTS.contains(&v) {
-            return error_resp(
-                400,
-                &format!(
-                    "verdict must be one of {}",
-                    CD_PROMOTION_REPLAY_VERDICTS.join(", ")
-                ),
-            );
-        }
     }
     if h.against_version.trim().is_empty() {
         return error_resp(400, "against_version is required");
