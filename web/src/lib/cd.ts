@@ -145,14 +145,19 @@ export function stateTone(state: string): string {
  * without a run word falls back to what the job read.
  */
 export function promotionReplayWord(h: Pick<CdPromotionReplayRow, "state" | "verdict" | "run_state" | "run_delta_verdict">): { word: string; tone: string } {
-  const live = h.run_delta_verdict;
-  if (live === "pass" || live === "acknowledged") return { word: live, tone: "ok" };
-  if (live === "fail") return { word: "fail", tone: "failed" };
+  // The row's state comes first: a replay that failed, was skipped or has not
+  // finished has no verdict, whatever its candidate run says today. Only a
+  // finished replay reads the candidate run's live verdict (the store hands it
+  // over only while the run is still measured against this row's baseline),
+  // which can turn a recorded fail into an acknowledgement.
   if (h.state === "requested") {
     return h.run_state === "failed" ? { word: "failed", tone: "failed" } : { word: "running", tone: "pending" };
   }
   if (h.state === "skipped") return { word: "skipped", tone: "muted" };
   if (h.state === "failed") return { word: "failed", tone: "failed" };
+  const live = h.run_delta_verdict;
+  if (live === "pass" || live === "acknowledged") return { word: live, tone: "ok" };
+  if (live === "fail") return { word: "fail", tone: "failed" };
   switch (h.verdict) {
     case "pass":
     case "acknowledged":

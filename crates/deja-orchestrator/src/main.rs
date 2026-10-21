@@ -4435,7 +4435,8 @@ fn cd_limit(q: &std::collections::HashMap<String, String>, default: i64) -> i64 
 }
 
 const CD_PROMOTION_REPLAY_STATES: [&str; 4] = ["requested", "done", "failed", "skipped"];
-const CD_PROMOTION_REPLAY_VERDICTS: [&str; 5] = ["pass", "fail", "acknowledged", "inconclusive", "unknown"];
+const CD_PROMOTION_REPLAY_VERDICTS: [&str; 5] =
+    ["pass", "fail", "acknowledged", "inconclusive", "unknown"];
 
 const CD_DEPLOYMENT_STATES: [&str; 6] = [
     "requested",
@@ -4833,28 +4834,39 @@ async fn v1_cd_environments(
             }
         }
     }
-    let promotion_replays = match store.cd_latest_promotion_replay_per_version(&system).await {
-        Ok(h) => h,
-        Err(e) => return error_resp(500, &format!("promotion replays: {e}")),
-    };
-    let environments: Vec<serde_json::Value> = cd
-        .environments
-        .iter()
-        .map(|env| {
-            let l = latest.iter().find(|r| &r.environment == env);
-            let v = live.iter().find(|r| &r.environment == env);
-            serde_json::json!({
-                "environment": env,
-                "latest": l,
-                "live": v,
-                "latest_version": l.and_then(|r| versions.get(&r.version)).cloned().flatten(),
-                "live_version": v.and_then(|r| versions.get(&r.version)).cloned().flatten(),
-                // The live version's newest promotion replay: what it changes against the
-                // release the next environment runs.
-                "live_promotion_replay": v.and_then(|r| promotion_replays.iter().find(|h| h.version == r.version)),
-            })
-        })
-        .collect();
+    // Each environment's card carries the promotion replay of its live version
+    // against what the NEXT environment runs now: the pair the card is about.
+    // A replay against an older release of that environment is history, shown
+    // on the version page, not current evidence; the last environment has
+    // nothing to be promoted to, so no replay.
+    let mut environments: Vec<serde_json::Value> = Vec::with_capacity(cd.environments.len());
+    for (i, env) in cd.environments.iter().enumerate() {
+        let l = latest.iter().find(|r| &r.environment == env);
+        let v = live.iter().find(|r| &r.environment == env);
+        let next_live = cd
+            .environments
+            .get(i + 1)
+            .and_then(|n| live.iter().find(|r| &r.environment == n));
+        let live_promotion_replay = match (v, next_live) {
+            (Some(v), Some(n)) => match store
+                .cd_promotion_replay_of_pair(&system, &v.version, &n.version)
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => return error_resp(500, &format!("promotion replays: {e}")),
+            },
+            _ => None,
+        };
+        environments.push(serde_json::json!({
+            "environment": env,
+            "next_environment": cd.environments.get(i + 1),
+            "latest": l,
+            "live": v,
+            "latest_version": l.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+            "live_version": v.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+            "live_promotion_replay": live_promotion_replay,
+        }));
+    }
     json_ok(serde_json::json!({ "system": system, "environments": environments }))
 }
 
@@ -4957,8 +4969,13 @@ async fn v1_cd_version(
         Ok(rows) => rows,
         Err(e) => return error_resp(500, &format!("deployments: {e}")),
     };
-    match store.cd_promotion_replays_of_version(&system, &version, 50).await {
-        Ok(promotion_replays) => json_ok(serde_json::json!({ "version": v, "deployments": rows, "promotion_replays": promotion_replays })),
+    match store
+        .cd_promotion_replays_of_version(&system, &version, 50)
+        .await
+    {
+        Ok(promotion_replays) => json_ok(
+            serde_json::json!({ "version": v, "deployments": rows, "promotion_replays": promotion_replays }),
+        ),
         Err(e) => error_resp(500, &format!("promotion replays: {e}")),
     }
 }
@@ -5019,14 +5036,20 @@ async fn v1_cd_post_promotion_replay(
     if !CD_PROMOTION_REPLAY_STATES.contains(&h.state.as_str()) {
         return error_resp(
             400,
-            &format!("state must be one of {}", CD_PROMOTION_REPLAY_STATES.join(", ")),
+            &format!(
+                "state must be one of {}",
+                CD_PROMOTION_REPLAY_STATES.join(", ")
+            ),
         );
     }
     if let Some(v) = h.verdict.as_deref() {
         if !CD_PROMOTION_REPLAY_VERDICTS.contains(&v) {
             return error_resp(
                 400,
-                &format!("verdict must be one of {}", CD_PROMOTION_REPLAY_VERDICTS.join(", ")),
+                &format!(
+                    "verdict must be one of {}",
+                    CD_PROMOTION_REPLAY_VERDICTS.join(", ")
+                ),
             );
         }
     }

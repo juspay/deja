@@ -340,7 +340,13 @@ pub struct CdPromotionReplayRow {
     pub detail: serde_json::Value,
     pub at: DateTime<Utc>,
     pub run_state: Option<String>,
+    /// The candidate run's own delta verdict, only while that run is still
+    /// measured against this row's baseline run. A maintainer may re-point a
+    /// run at another baseline, after which its verdict speaks for a different
+    /// pair; then this is `None` and the recorded `verdict` stands.
     pub run_delta_verdict: Option<String>,
+    /// What the candidate run is measured against now (`params.delta_against`).
+    pub run_delta_against: Option<String>,
 }
 
 /// A promotion replay row to append: everything but what the database fills in. The
@@ -1019,7 +1025,10 @@ impl Store {
 
     // -- cd promotion replays ---------------------------------------------------------------
 
-    pub async fn cd_promotion_replay_append(&self, h: &NewCdPromotionReplay) -> Result<CdPromotionReplayRow, sqlx::Error> {
+    pub async fn cd_promotion_replay_append(
+        &self,
+        h: &NewCdPromotionReplay,
+    ) -> Result<CdPromotionReplayRow, sqlx::Error> {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO cd_promotion_replays
                (system, version, against_version, against_commit, state, candidate_run,
@@ -1065,6 +1074,28 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(cd_promotion_replay_row).collect())
+    }
+
+    /// The newest row of one pair: `version` replayed against `against`. An
+    /// environment's card asks for its live version against what the next
+    /// environment runs now, so a replay against an older release is never
+    /// shown as current.
+    pub async fn cd_promotion_replay_of_pair(
+        &self,
+        system: &str,
+        version: &str,
+        against: &str,
+    ) -> Result<Option<CdPromotionReplayRow>, sqlx::Error> {
+        let row = sqlx::query(&format!(
+            "{CD_PROMOTION_REPLAY_SELECT} WHERE h.system = $1 AND h.version = $2 AND h.against_version = $3
+             ORDER BY h.id DESC LIMIT 1"
+        ))
+        .bind(system)
+        .bind(version)
+        .bind(against)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(cd_promotion_replay_row))
     }
 
     /// The newest promotion replay row of every version that has one: where each stands.
@@ -1661,11 +1692,11 @@ fn cd_control_row(r: sqlx::postgres::PgRow) -> CdControlRow {
 
 const CD_PROMOTION_REPLAY_SELECT: &str = "SELECT h.id, h.system, h.version, h.against_version, h.against_commit, \
      h.state, h.candidate_run, h.baseline_run, h.verdict, h.reason, h.requested_by, h.jenkins_build, \
-     h.detail, h.at, r.state, r.delta_verdict \
+     h.detail, h.at, r.state, r.delta_verdict, r.params ->> 'delta_against' \
      FROM cd_promotion_replays h LEFT JOIN replay_runs r ON r.run_id = h.candidate_run";
 
 fn cd_promotion_replay_row(r: sqlx::postgres::PgRow) -> CdPromotionReplayRow {
-    CdPromotionReplayRow {
+    let mut row = CdPromotionReplayRow {
         id: r.get(0),
         system: r.get(1),
         version: r.get(2),
@@ -1682,7 +1713,16 @@ fn cd_promotion_replay_row(r: sqlx::postgres::PgRow) -> CdPromotionReplayRow {
         at: r.get(13),
         run_state: r.get(14),
         run_delta_verdict: r.get(15),
+        run_delta_against: r.get(16),
+    };
+    let same_pair = match (&row.run_delta_against, &row.baseline_run) {
+        (Some(now), Some(then)) => now == then,
+        _ => false,
+    };
+    if !same_pair {
+        row.run_delta_verdict = None;
     }
+    row
 }
 
 const RUN_SELECT: &str =
@@ -2073,6 +2113,101 @@ mod tests {
             .execute(&store.pool)
             .await
             .unwrap();
+    }
+
+    async fn promotion_replay(
+        store: &super::Store,
+        system: &str,
+        version: &str,
+        against: &str,
+        candidate: &str,
+        baseline: &str,
+        verdict: &str,
+    ) -> super::CdPromotionReplayRow {
+        store
+            .cd_promotion_replay_append(&super::NewCdPromotionReplay {
+                system: system.into(),
+                version: version.into(),
+                against_version: against.into(),
+                against_commit: None,
+                state: "done".into(),
+                candidate_run: Some(candidate.into()),
+                baseline_run: Some(baseline.into()),
+                verdict: Some(verdict.into()),
+                reason: None,
+                requested_by: "test".into(),
+                jenkins_build: None,
+                detail: serde_json::json!({}),
+            })
+            .await
+            .unwrap()
+    }
+
+    /// The candidate run's live verdict belongs to the pair it is measured
+    /// against. Once a maintainer re-points the run at another baseline, the
+    /// row must fall back to the verdict recorded when it finished.
+    #[tokio::test]
+    async fn a_repointed_candidate_run_lends_no_verdict_to_an_old_promotion_replay() {
+        let Some(store) = store_under_test().await else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let (system, v, r1, r2) = (unique("cd-system"), unique("v"), unique("r1"), unique("r2"));
+        let (cand, b1, b2) = (unique("run-cand"), unique("run-b1"), unique("run-b2"));
+        store.cd_version_ensure(&system, &v, "merge").await.unwrap();
+        completed_run(&store, &b1, "none").await;
+        completed_run(&store, &b2, "none").await;
+        completed_run(&store, &cand, &b1).await;
+        assert!(store.set_delta_verdict(&cand, &b1, "fail").await.unwrap());
+
+        let row = promotion_replay(&store, &system, &v, &r1, &cand, &b1, "fail").await;
+        assert_eq!(row.run_delta_verdict.as_deref(), Some("fail"));
+        assert_eq!(row.run_delta_against.as_deref(), Some(b1.as_str()));
+
+        // Re-pointed at b2 and settled there as a pass: that pass is b2's.
+        assert!(store.set_run_delta_against(&cand, &b2).await.unwrap());
+        assert!(store.set_delta_verdict(&cand, &b2, "pass").await.unwrap());
+        let rows = store
+            .cd_promotion_replays_of_version(&system, &v, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].run_delta_verdict, None,
+            "a pass against b2 is not a pass against b1"
+        );
+        assert_eq!(rows[0].run_delta_against.as_deref(), Some(b2.as_str()));
+        assert_eq!(
+            rows[0].verdict.as_deref(),
+            Some("fail"),
+            "the recorded verdict stands"
+        );
+
+        // A new row for the new pair reads the live verdict again.
+        let row2 = promotion_replay(&store, &system, &v, &r2, &cand, &b2, "pass").await;
+        assert_eq!(row2.run_delta_verdict.as_deref(), Some("pass"));
+
+        // The pair lookup: only the row against the asked-for version, newest first.
+        let pair = store
+            .cd_promotion_replay_of_pair(&system, &v, &r1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pair.id, rows[0].id);
+        assert_eq!(
+            store
+                .cd_promotion_replay_of_pair(&system, &v, &r2)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            row2.id
+        );
+        assert!(store
+            .cd_promotion_replay_of_pair(&system, &v, &unique("r3"))
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

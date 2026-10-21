@@ -1095,7 +1095,11 @@ export type CdPromotionReplayRow = {
   detail: Record<string, unknown>;
   at: string;
   run_state: string | null;
+  /** The candidate run's own delta verdict, only while that run is still measured against
+   *  this row's baseline run; null once a maintainer re-pointed it elsewhere. */
   run_delta_verdict: string | null;
+  /** What the candidate run is measured against now. */
+  run_delta_against: string | null;
 };
 
 export type CdEnvironment = {
@@ -1106,7 +1110,10 @@ export type CdEnvironment = {
   live: CdDeploymentRow | null;
   latest_version: CdVersionRow | null;
   live_version: CdVersionRow | null;
-  /** The live version's newest promotion replay, when it has one. */
+  /** The environment this one promotes to; null for the last one. */
+  next_environment: string | null;
+  /** The live version's promotion replay against what the next environment
+   *  runs now, when there is one. */
   live_promotion_replay: CdPromotionReplayRow | null;
 };
 
