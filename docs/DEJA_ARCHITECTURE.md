@@ -369,14 +369,16 @@ event still blocks. Deja does not possess or verify the HMAC key:
 The raw args remain in the call ledger; the behavior tree carries only
 digests. The three-way delta compares matching semantic digests for separately
 signed main/candidate runs only when both served the same recorded event
-without an independent call-order mismatch. Reusing one signature for
-different raw body renderings, or changing a signature for identical raw
-bytes, still charges the delta; a candidate restoring the tape stays
-`Resolved`. This rule changes neither the candidate lookup/runtime nor
-recording; unrelated omitted or novel calls keep their own verdicts. A
-previously published scorecard/ledger is not silently re-scored: new replay
-runs apply the rule, while a tree rebuilt from an old ledger still reflects
-that ledger's original classification.
+without an independent call-order mismatch. If only one run is eligible
+for semantic normalization, the delta flags a change even when its raw
+argument hash matches the other's: an order regression is not inherited
+entropy. Reusing one signature for different raw body renderings, or
+changing a signature for identical raw bytes, still charges the delta;
+a candidate restoring the tape stays `Resolved`. This rule changes neither
+the candidate lookup/runtime nor recording; unrelated omitted or novel
+calls keep their own verdicts. A previously published scorecard/ledger is
+not silently re-scored: new replay runs apply the rule, while a tree rebuilt
+from an old ledger still reflects that ledger's original classification.
 
 The blocking-vs-drift policy is **built, declared, and judged** — not open. Boundaries declare canonicalization presets applied by the scorer before judging (never by runtime routing): `final_state`, `absent_after`, `project{include,exclude}`. Volatile columns are declared `project:!created_at,!last_synced,!modified_at` on the DB row seams with a matching `reply_canon` on `http_incoming`. Blocking vs non-blocking is explicit in the verdict: seed gaps, order-nondeterminism, and idempotent-delete lines are non-blocking; evidence-gated `inconclusive_race` rows (recognized only when the run's HTTP layer is clean) make the verdict `inconclusive` with an auto-rerun recommendation — a race-only run can never pass.
 

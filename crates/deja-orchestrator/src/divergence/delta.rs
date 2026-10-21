@@ -299,6 +299,21 @@ fn km_sides(
             true,
         );
     }
+    if a.paired_serve != b.paired_serve
+        && matches!(m.value, Value::Diverged { .. })
+        && matches!(y.value, Value::Diverged { .. })
+    {
+        // One run has an independently changed call order (or another
+        // untrusted pairing), while the other has the same served event
+        // without that fault. Raw argument hashes can be identical: refusing
+        // semantic normalization is not enough, because raw equality would
+        // still incorrectly call this inherited.
+        return (
+            Side::Hash(format!("km-pair-eligible:{}", a.paired_serve)),
+            Side::Hash(format!("km-pair-eligible:{}", b.paired_serve)),
+            true,
+        );
+    }
     if a.paired_serve
         && b.paired_serve
         && matches!(m.value, Value::Diverged { .. })
@@ -1054,6 +1069,10 @@ mod tests {
         assert!(inherited.verdict.pass);
         assert_eq!(inherited.rows[0].bucket, Bucket::Inherited);
 
+        // A candidate-only call-order fault can leave the raw args identical
+        // to main. The eligibility bit must prevent an inherited pass even
+        // when the old raw-hash fallback would find equal hashes.
+        candidate.entries[0].value = div("raw-main-map-order");
         candidate.entries[0].km_entropy = Some(evidence("raw-candidate", false));
         let untrusted = three_way(&main, &candidate).unwrap();
         assert!(!untrusted.verdict.pass);
