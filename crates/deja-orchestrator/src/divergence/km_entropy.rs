@@ -45,7 +45,7 @@ struct Envelope {
     raw_body: String,
     body: Value,
     non_signature_headers: Vec<(String, String)>,
-    signature: String,
+    signature: Option<String>,
 }
 
 struct Decoded {
@@ -87,7 +87,14 @@ fn looks_like_envelope(value: &Value) -> bool {
 
 fn envelope(wire: &Value) -> Option<Envelope> {
     let map = wire.as_object()?;
-    if map.len() != 2 {
+    // KM's response image also carries status_code/error_message. Compare and
+    // hash them separately; any other member is an unsupported wire shape.
+    if !map.keys().all(|key| {
+        matches!(
+            key.as_str(),
+            "body" | "headers" | "status_code" | "error_message"
+        )
+    }) {
         return None;
     }
     let raw_body = map.get("body")?.as_str()?;
@@ -112,25 +119,29 @@ fn envelope(wire: &Value) -> Option<Envelope> {
                 return None;
             }
         } else {
-            // Repeated header names with DISTINCT values can be order-sensitive
-            // (e.g. forwarding chains). Identical pairs keep their multiplicity
-            // and can still be safely permuted with other headers.
-            if non_signature_headers
-                .iter()
-                .any(|(seen_name, seen_value)| seen_name == &name && seen_value != value)
-            {
-                return None;
-            }
             non_signature_headers.push((name, value.to_owned()));
         }
     }
-    non_signature_headers.sort_unstable();
+    // Header-name groups are unordered, but values within one repeated name
+    // can be order-sensitive (notably Set-Cookie). A stable name-only sort
+    // moves groups without permuting values inside them.
+    non_signature_headers.sort_by(|a, b| a.0.cmp(&b.0));
     Some(Envelope {
         raw_body: raw_body.to_owned(),
         body,
         non_signature_headers,
-        signature: signature?,
+        signature,
     })
+}
+
+fn same_envelope_extras(left: &Value, right: &Value) -> bool {
+    let (Some(l), Some(r)) = (left.as_object(), right.as_object()) else {
+        return false;
+    };
+    l.len() == r.len()
+        && l.iter()
+            .filter(|(key, _)| key.as_str() != "body" && key.as_str() != "headers")
+            .all(|(key, value)| r.get(key) == Some(value))
 }
 
 fn same_except_data(left: &Value, right: &Value) -> bool {
@@ -192,21 +203,23 @@ pub(super) fn classify(
     else {
         return KmClass::Different;
     };
-    if left.body != right.body || left.non_signature_headers != right.non_signature_headers {
+    if !same_envelope_extras(&left_wire.value, &right_wire.value)
+        || left.body != right.body
+        || left.non_signature_headers != right.non_signature_headers
+    {
         return KmClass::Different;
     }
-    if left.raw_body == right.raw_body {
-        if left.signature != right.signature {
-            KmClass::Different // Same signed bytes: a signature change is NOT rendering entropy.
-        } else {
-            KmClass::Rendering // Header-pair order or envelope JSON rendering moved.
+    match (&left.signature, &right.signature) {
+        (None, None) => KmClass::Rendering, // Unsigned HTTP response image.
+        (Some(a), Some(b)) if left.raw_body == right.raw_body => {
+            if a == b {
+                KmClass::Rendering // Header-pair order or envelope JSON rendering moved.
+            } else {
+                KmClass::Different // Same signed bytes: not signing entropy.
+            }
         }
-    } else if left.signature != right.signature {
-        KmClass::DeclaredDerived
-    } else {
-        // Under the declared raw-byte signing rule, changed body bytes with
-        // an unchanged signature are not a proved rendering equivalence.
-        KmClass::Different
+        (Some(a), Some(b)) if a != b => KmClass::DeclaredDerived,
+        _ => KmClass::Different, // Signature added/removed or reused on changed bytes.
     }
 }
 
@@ -260,6 +273,19 @@ fn hash_object_except(hasher: &mut Sha256, map: &Map<String, Value>, skip: &str)
     }
 }
 
+fn hash_envelope_extras(hasher: &mut Sha256, map: &Map<String, Value>) {
+    let mut keys: Vec<&String> = map
+        .keys()
+        .filter(|key| key.as_str() != "body" && key.as_str() != "headers")
+        .collect();
+    keys.sort_unstable();
+    hasher.update((keys.len() as u64).to_be_bytes());
+    for key in keys {
+        hash_bytes(hasher, key.as_bytes());
+        hash_json(hasher, &map[key]);
+    }
+}
+
 fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -283,8 +309,14 @@ pub(super) fn evidence(
     hash_object_except(&mut hasher, request, "data");
     if looks_like_envelope(&decoded.value) {
         let env = envelope(&decoded.value)?;
-        hasher.update(b"signed");
+        let extras = decoded.value.as_object()?;
+        hasher.update(if env.signature.is_some() {
+            b"signed-envelope".as_slice()
+        } else {
+            b"response-envelope".as_slice()
+        });
         hash_json(&mut hasher, &env.body);
+        hash_envelope_extras(&mut hasher, extras);
         hasher.update((env.non_signature_headers.len() as u64).to_be_bytes());
         for (name, value) in &env.non_signature_headers {
             hash_bytes(&mut hasher, name.as_bytes());
@@ -293,8 +325,11 @@ pub(super) fn evidence(
         Some(KmEvidence {
             semantic_digest: hex::encode(hasher.finalize()),
             raw_body_digest: digest(env.raw_body.as_bytes()),
-            signature_digest: digest(env.signature.as_bytes()),
-            signed: true,
+            signature_digest: env
+                .signature
+                .as_deref()
+                .map_or_else(String::new, |s| digest(s.as_bytes())),
+            signed: env.signature.is_some(),
             paired_serve,
         })
     } else {
@@ -342,6 +377,20 @@ mod tests {
         })
     }
 
+    fn response_args(body: &str, status: u16, headers: &[(&str, &str)]) -> Value {
+        let pairs: Vec<Value> = headers
+            .iter()
+            .map(|(name, value)| json!([name, value]))
+            .collect();
+        let wire = json!({
+            "body": body,
+            "headers": pairs,
+            "status_code": status,
+            "error_message": null
+        });
+        plain_args(&wire.to_string())
+    }
+
     fn class(recorded: &Value, observed: &Value) -> KmClass {
         classify(
             "km",
@@ -384,6 +433,75 @@ mod tests {
         let changed =
             plain_args(r#"{"X-Tiny":"changed","X-Custom-Header":"value","X-Short":"short"}"#);
         assert_eq!(class(&recorded, &changed), KmClass::Different);
+    }
+
+    /// The latest sandbox KM row is an HTTP response image, not the signed
+    /// webhook request: status/error fields are part of its semantics, and
+    /// Set-Cookie's repeated values keep their relative order.
+    #[test]
+    fn response_envelope_reorders_header_groups_but_not_repeated_values() {
+        let recorded = response_args(
+            r#"{"success":true}"#,
+            200,
+            &[
+                ("date", "today"),
+                ("set-cookie", "a=1"),
+                ("set-cookie", "b=2"),
+                ("content-type", "application/json"),
+            ],
+        );
+        let reordered = response_args(
+            r#"{"success":true}"#,
+            200,
+            &[
+                ("content-type", "application/json"),
+                ("set-cookie", "a=1"),
+                ("set-cookie", "b=2"),
+                ("date", "today"),
+            ],
+        );
+        assert_eq!(class(&recorded, &reordered), KmClass::Rendering);
+        let a = evidence(
+            "km",
+            "common_utils::keymanager",
+            "call_encryption_service",
+            &recorded,
+            true,
+        )
+        .expect("recorded response");
+        let b = evidence(
+            "km",
+            "common_utils::keymanager",
+            "call_encryption_service",
+            &reordered,
+            true,
+        )
+        .expect("replayed response");
+        assert!(!a.signed && !b.signed);
+        assert_eq!(a.semantic_digest, b.semantic_digest);
+
+        let reversed_cookies = response_args(
+            r#"{"success":true}"#,
+            200,
+            &[
+                ("date", "today"),
+                ("set-cookie", "b=2"),
+                ("set-cookie", "a=1"),
+                ("content-type", "application/json"),
+            ],
+        );
+        assert_eq!(class(&recorded, &reversed_cookies), KmClass::Different);
+        let changed_status = response_args(
+            r#"{"success":true}"#,
+            500,
+            &[
+                ("date", "today"),
+                ("set-cookie", "a=1"),
+                ("set-cookie", "b=2"),
+                ("content-type", "application/json"),
+            ],
+        );
+        assert_eq!(class(&recorded, &changed_status), KmClass::Different);
     }
 
     #[test]
@@ -531,14 +649,26 @@ mod tests {
             &[("X-Forwarded-For", "proxy"), ("X-Forwarded-For", "client")],
         );
         assert_eq!(class(&forwarded, &reversed), KmClass::Different);
-        assert!(evidence(
+        let forwarded_evidence = evidence(
             "km",
             "common_utils::keymanager",
             "call_encryption_service",
             &forwarded,
             true,
         )
-        .is_none());
+        .expect("forwarded headers");
+        let reversed_evidence = evidence(
+            "km",
+            "common_utils::keymanager",
+            "call_encryption_service",
+            &reversed,
+            true,
+        )
+        .expect("reversed headers");
+        assert_ne!(
+            forwarded_evidence.semantic_digest,
+            reversed_evidence.semantic_digest
+        );
         let repeated_a = args(
             r#"{"a":1}"#,
             "sig-a",

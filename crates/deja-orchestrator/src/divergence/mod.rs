@@ -21117,6 +21117,40 @@ mod tests {
     }
 
     #[test]
+    fn response_header_group_order_from_latest_run_is_absorbed() {
+        let recorded = km_plain_args(
+            &serde_json::json!({
+                "body": r#"{"success":true}"#,
+                "headers": [["date", "today"], ["set-cookie", "a=1"], ["set-cookie", "b=2"], ["content-type", "application/json"]],
+                "status_code": 200,
+                "error_message": null
+            })
+            .to_string(),
+        );
+        let observed = km_plain_args(
+            &serde_json::json!({
+                "body": r#"{"success":true}"#,
+                "headers": [["content-type", "application/json"], ["set-cookie", "a=1"], ["set-cookie", "b=2"], ["date", "today"]],
+                "status_code": 200,
+                "error_message": null
+            })
+            .to_string(),
+        );
+        let art = km_served_artifacts(recorded, observed, UPSTREAM_CALL);
+        let card = detect(&art);
+        assert_eq!(card.summary.value_divergences, 0);
+        assert_eq!(kind_count(&card, "km", "KmRenderingAbsorbed"), 1);
+        let rows = build_ledger(&art).expect("ledger builds");
+        let row = rows.iter().find(|r| r.boundary == "km").expect("km row");
+        assert_eq!(row.kind, "km_rendering_absorbed");
+        assert!(!row.blocking);
+        let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
+        let km = tree.entries.iter().find(|entry| matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "km")).expect("km tree entry");
+        assert!(matches!(km.value, behaviour_tree::Value::Reproduced));
+        assert_eq!(km.km_entropy.as_ref().map(|e| e.signed), Some(false));
+    }
+
+    #[test]
     fn km_semantic_signature_and_pairing_changes_still_block() {
         let recorded = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);
         let mut changed_key = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);

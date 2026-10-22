@@ -356,15 +356,19 @@ compares the observed arguments with the *recorded event actually served*:
 base64 `request.data` is decoded as JSON. A plain JSON document, including
 the ProfileUpdate webhook-header map in Hyperswitch #14368, is compared
 structurally (object-key order ignored, arrays positional) without assuming
-it is a signed envelope. For an actual `{body, headers}` envelope, header-pair
-permutations with unchanged values are rendering-only. A changed
-`X-Webhook-Signature-512` is **declared derived**, and counted as absorbed,
-only when the raw body bytes differ but the parsed JSON body, key identifiers,
-other arguments and non-signature headers agree. A signature change with
-identical raw body bytes, changed raw bytes with an unchanged signature, a
-changed JSON value, a non-signature header change, repeated header names with
-distinct values, malformed input, or a serve paired to a different recorded
-event still blocks. Deja does not possess or verify the HMAC key:
+it is a signed envelope. An envelope with `{body, headers}` may also carry
+`status_code` and `error_message` (the latest sandbox KM response image);
+those fields are compared exactly. Header-name groups may move, but values
+within a repeated name keep their relative order (notably `Set-Cookie`).
+Without a signature, equivalent body JSON and header groups are an absorbed
+rendering difference. With `X-Webhook-Signature-512`, a changed signature is
+declared derived and counted as absorbed only when the raw body bytes differ but
+the parsed JSON body, key identifiers, other arguments and non-signature
+headers agree. A signature change with identical raw body bytes, changed
+raw bytes with an unchanged signature, a changed JSON value, changed
+status/error field, a non-signature header change, reversed values within
+one repeated header name, malformed input, or a serve paired to a different
+recorded event still blocks. Deja does not possess or verify the HMAC key:
 `KmDerivedAbsorbed` is a declared dependency, **not** cryptographic proof.
 The raw args remain in the call ledger; the behavior tree carries only
 digests. The three-way delta compares matching semantic digests for separately
