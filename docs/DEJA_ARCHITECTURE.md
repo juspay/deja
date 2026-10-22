@@ -381,8 +381,9 @@ Deja has no signing key. Different JSON values, mismatched non-signature
 headers, malformed arguments, unrelated call/serve pairing, and mismatched
 status/error fields still block. An already-published ledger or scorecard
 is never rewritten; preview streams a historical run's call ledger and
-reports bounded classification counts without raw payloads, but only a new
-replay proves the policy's full effect.
+counts a row as absorbable only if its ledger semantic-pair evidence excludes
+an independent call-order mismatch. It reports bounded counts without raw
+payloads, but only a new replay proves the policy's full effect.
 
 The scorecard and cached behavior tree carry the pinned policy digest.
 Three-way delta refuses to compare runs with different digests (including

@@ -4665,7 +4665,10 @@ fn preview_boundary_policy_file(
             continue; // Exact match is neither an allowance nor a blocker.
         }
         total += 1;
-        let class = if row.source_event_global_sequence.is_some()
+        // The ledger withholds semantic equivalence when a separate call-order
+        // mismatch exists, even if this row's source and served ids agree.
+        let class = if row.km_semantic_pair
+            && row.source_event_global_sequence.is_some()
             && row.served_event_global_sequence == row.source_event_global_sequence
             && !row.stopped
         {
@@ -5824,6 +5827,7 @@ mod tests {
             "blocking": true,
             "source_event_global_sequence": 7,
             "served_event_global_sequence": 7,
+            "km_semantic_pair": true,
             "recorded": {"args": args(r#"{"X-A":"a","X-B":"b"}"#)},
             "observed": {"args": args(r#"{"X-B":"b","X-A":"a"}"#)}
         });
@@ -5850,7 +5854,8 @@ mod tests {
             },
             treatments: vec![Treatment::PlainBase64JsonOrder],
         };
-        let allowed = preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule])).unwrap();
+        let allowed =
+            preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule.clone()])).unwrap();
         assert_eq!(allowed["would_absorb"], 1);
         assert_eq!(allowed["would_remain_blocking"], 0);
         assert_eq!(
@@ -5862,6 +5867,14 @@ mod tests {
             !allowed.to_string().contains("X-A"),
             "preview does not expose raw args"
         );
+        let mut order_mismatch = row;
+        order_mismatch["km_semantic_pair"] = serde_json::json!(false);
+        std::fs::write(&path, format!("{order_mismatch}\n")).unwrap();
+        let preview = preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule])).unwrap();
+        assert_eq!(preview["total_km_rows"], 1);
+        assert_eq!(preview["would_absorb"], 0);
+        assert_eq!(preview["would_remain_blocking"], 1);
+        assert_eq!(preview["examples"][0]["classification"], "untrusted_pair");
     }
 
     /// A compose run in `status`, with `ledger` as its call ledger if given.
