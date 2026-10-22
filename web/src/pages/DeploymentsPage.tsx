@@ -39,6 +39,7 @@ import {
   ago,
   agoText,
   argoOf,
+  buildLink,
   carriedBy,
   carries,
   howOf,
@@ -56,6 +57,7 @@ import {
   promotionReplayWord,
   pullRequestOf,
   releaseStrip,
+  releaseTagOf,
   stateTone,
   when,
   type RailStep,
@@ -298,15 +300,48 @@ function HowCell({ row }: { row: CdDeploymentRow }) {
   return (
     <>
       {how.by}
-      {how.build && (
-        <>
-          {" · "}
-          <a href={how.build} target="_blank" rel="noreferrer">
-            build
-          </a>
-        </>
+      <BuildRef build={how.build} />
+    </>
+  );
+}
+
+/** ` · <job> #<n>` as the row names the build (never by URL, D10); an older
+ *  row's URL stays a link. */
+function BuildRef({ build }: { build: string | null | undefined }) {
+  const b = buildLink(build);
+  if (!b) return null;
+  return (
+    <>
+      {" · "}
+      {b.href ? (
+        <a href={b.href} target="_blank" rel="noreferrer">
+          {b.name}
+        </a>
+      ) : (
+        <span className="mono cd-build">{b.name}</span>
       )}
     </>
+  );
+}
+
+/** The `cd-` tag integ-deploy cut as the merge landed, whose image and
+ *  chart build in the background for the promotion (D8, D15). */
+function ReleaseTagRow({ rows }: { rows: (CdDeploymentRow | null | undefined)[] }) {
+  const c = releaseTagOf(rows);
+  if (!c) return null;
+  return (
+    <div className="cd-row">
+      <span className="l">Release tag</span>
+      {c.tag ? (
+        <span className="mono" title="Cut as the merge landed; its image and chart build in the background, so a promotion finds them ready">
+          {c.tag}
+        </span>
+      ) : (
+        <span className="err" title={c.error ?? ""}>
+          not tagged
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -533,6 +568,7 @@ function EnvCard({
                 <VersionLink version={lv.released_from} system={system} cfg={cfg} />
               </div>
             )}
+            <ReleaseTagRow rows={[latest, live]} />
             <div className="cd-row">
               <span className="l">Last confirmed live</span>
               <span title={live.at}>
@@ -1415,6 +1451,24 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
           <dt>merged</dt>
           <dd>{v.merged_at ? when(v.merged_at) : "—"}</dd>
         </div>
+        {v.kind === "merge" && releaseTagOf(rows) && (
+          <div>
+            <dt>release tag</dt>
+            <dd>
+              {releaseTagOf(rows)!.tag ? (
+                <>
+                  <span className="mono">{releaseTagOf(rows)!.tag}</span>
+                  <div className="hint">cut as the merge landed; its image and chart build in the background</div>
+                </>
+              ) : (
+                <>
+                  <span className="err">not tagged</span>
+                  <div className="hint">{releaseTagOf(rows)!.error}</div>
+                </>
+              )}
+            </dd>
+          </div>
+        )}
       </dl>
 
       <section>
@@ -1537,14 +1591,7 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
                   </td>
                   <td>
                     {h.requested_by}
-                    {h.jenkins_build && (
-                      <>
-                        {" · "}
-                        <a href={h.jenkins_build} target="_blank" rel="noreferrer">
-                          build
-                        </a>
-                      </>
-                    )}
+                    <BuildRef build={h.jenkins_build} />
                   </td>
                 </tr>
               ))}

@@ -1340,6 +1340,7 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 .cd-place-promoting .cd-placehead { color: var(--amber-fg); }
 .cd-place-next .cd-placebody { color: var(--text-subtle); }
 .cd-promotions td { vertical-align: middle; }
+.cd-build { font-size: var(--fs-12); color: var(--text-subtle); }
 
 .cd-prom { display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: var(--s5); align-items: start; }
 .cd-srail { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); display: grid; gap: var(--s3); padding: var(--s3); position: sticky; top: var(--s3); }

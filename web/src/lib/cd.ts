@@ -215,8 +215,8 @@ export function agoText(iso: string, now: number = Date.now()): string {
 export const PROMOTION_STEP_LABELS: Record<(typeof PROMOTION_STEPS)[number], string> = {
   pending: "Requested",
   picked: "Picked by the job",
-  tagged: "Tag cut",
-  built: "Release image and chart",
+  tagged: "Release tag",
+  built: "Image and chart",
   committed: "Chart version committed",
   live: "Live",
 };
@@ -232,8 +232,8 @@ export const PROMOTION_STEP_GROUPS: { title: string; steps: (typeof PROMOTION_ST
 export const PROMOTION_STEP_RUNNING: Record<(typeof PROMOTION_STEPS)[number], string> = {
   pending: "requested",
   picked: "waiting for the job",
-  tagged: "cutting the tag",
-  built: "building the image and chart",
+  tagged: "finding the tag",
+  built: "confirming the image and chart",
   committed: "committing the chart version",
   live: "syncing",
 };
@@ -304,7 +304,7 @@ export function promotionActivity(p: Pick<CdPromotion, "state" | "step_detail" |
   ];
   const said: Record<string, string> = {
     picked: "picked the request",
-    tagged: p.release ? `cut ${p.release} on ${p.from_version}` : "cut the release tag",
+    tagged: p.release ? `took ${p.release}, the tag on ${p.from_version}` : "took the release tag",
     built: p.release ? `confirmed the image and chart of ${p.release}` : "confirmed the image and chart",
     committed: `committed the chart version for ${p.environment}`,
     live: `${p.release ?? p.from_version} live on ${p.environment}`,
@@ -422,4 +422,29 @@ export function releaseStrip(
       : { role: "promoting", version: null, request: null, row: null, from: null, merges: null, note: "nothing moving" },
     next,
   ];
+}
+
+/**
+ * A build as a row names it. The pipeline names builds `<job> #<n>` (D10),
+ * never by URL; rows written before that carry a URL, which stays a link.
+ */
+export function buildLink(build: string | null | undefined): { name: string; href: string | null } | null {
+  if (!build) return null;
+  return /^https?:\/\//.test(build) ? { name: "build", href: build } : { name: build, href: null };
+}
+
+/**
+ * The release tag integ-deploy cut as a merge landed, from the merge's
+ * deployment rows: `detail.tag` on the request row, or `detail.candidate_error`
+ * when it could not. The image and chart under that tag are built in the
+ * background, so a promotion finds them ready (D8, D15).
+ */
+export function releaseTagOf(rows: (Pick<CdDeploymentRow, "detail"> | null | undefined)[]): { tag: string | null; error: string | null } | null {
+  for (const r of rows) {
+    const d = r?.detail as { tag?: unknown; candidate_error?: unknown } | null | undefined;
+    const tag = typeof d?.tag === "string" && d.tag ? d.tag : null;
+    const error = typeof d?.candidate_error === "string" && d.candidate_error ? d.candidate_error : null;
+    if (tag || error) return { tag, error };
+  }
+  return null;
 }

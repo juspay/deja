@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { ago, agoText, argoOf, carriedBy, carries, promotionReplayWord, howOf, inFlight, mergesSince, placesOf, promotionActivity, promotionCandidates, promotionFocus, promotionProgress, promotionRail, releaseStrip, stateTone } from "./cd";
+import { ago, agoText, argoOf, buildLink, carriedBy, carries, promotionReplayWord, howOf, inFlight, mergesSince, placesOf, promotionActivity, promotionCandidates, promotionFocus, promotionProgress, promotionRail, releaseStrip, releaseTagOf, stateTone } from "./cd";
 import type { CdDeploymentRow, CdPromotion, CdVersionRow } from "./api";
 
 function v(partial: Partial<CdVersionRow> & { version: string; kind: string }): CdVersionRow {
@@ -244,7 +244,7 @@ describe("promotionActivity", () => {
       step_detail: { picked: { at: "2026-10-12T07:53:30Z", jenkins_build: "prism-cd-promote #14" }, tagged: { at: "2026-10-12T07:54:00Z" }, failed: { at: "2026-10-12T09:30:00Z", reason: "tagged: image missing" } },
     });
     const lines = promotionActivity(p);
-    expect(lines.map((l) => l.what)).toEqual(["ended the request as failed: tagged: image missing", "cut cd-2026.10.12.1 on 8eaddb0b85", "picked the request", "requested 8eaddb0b85 → sandbox"]);
+    expect(lines.map((l) => l.what)).toEqual(["ended the request as failed: tagged: image missing", "took cd-2026.10.12.1, the tag on 8eaddb0b85", "picked the request", "requested 8eaddb0b85 → sandbox"]);
     expect(lines[2].by).toBe("prism-cd-promote #14");
     expect(lines[3].by).toBe("qa-reviewer");
   });
@@ -305,7 +305,7 @@ describe("releaseStrip", () => {
   test("a request in flight takes the moving place and the next waits for a merge after it", () => {
     const moving = req({ state: "tagged", release: "cd-2026.10.12.1", step_detail: { picked: { at: "2026-10-12T07:53:30Z" }, tagged: { at: "2026-10-12T07:54:00Z" } } });
     const cells = releaseStrip(history, versions, [moving, req({ id: 13, state: "live" })], "integ");
-    expect(cells[3]).toMatchObject({ role: "promoting", version: "cd-2026.10.12.1", from: "8eaddb0b85", note: "building the image and chart" });
+    expect(cells[3]).toMatchObject({ role: "promoting", version: "cd-2026.10.12.1", from: "8eaddb0b85", note: "confirming the image and chart" });
     expect(cells[3].request?.id).toBe(14);
     expect(cells[4]).toMatchObject({ role: "next", version: null, note: "any merge after 8eaddb0b85, once it runs on integ" });
   });
@@ -320,5 +320,22 @@ describe("releaseStrip", () => {
   test("an empty log is five empty places", () => {
     expect(releaseStrip([], versions, [], "integ").map((c) => c.version)).toEqual([null, null, null, null, null]);
     expect(releaseStrip([], versions, [], "integ")[4].note).toBe("nothing live yet");
+  });
+});
+
+describe("buildLink", () => {
+  test("a build named by the pipeline is text; an older URL stays a link", () => {
+    expect(buildLink("prism-cd-promote #14")).toEqual({ name: "prism-cd-promote #14", href: null });
+    expect(buildLink("https://jenkins.example/job/x/3/")).toEqual({ name: "build", href: "https://jenkins.example/job/x/3/" });
+    expect(buildLink(null)).toBeNull();
+  });
+});
+
+describe("releaseTagOf", () => {
+  test("the tag integ-deploy cut, from the request row, or why it could not", () => {
+    const rows = [row({ id: 2, version: "8eaddb0b85", state: "live", at: "2026-10-12T07:20:00Z", detail: {} }), row({ id: 1, version: "8eaddb0b85", state: "requested", at: "2026-10-12T07:12:00Z", detail: { commit: "8eaddb0b85f00", tag: "cd-2026.10.12.1" } })];
+    expect(releaseTagOf(rows)).toEqual({ tag: "cd-2026.10.12.1", error: null });
+    expect(releaseTagOf([row({ id: 1, version: "x", state: "requested", at: "2026-10-12T07:12:00Z", detail: { candidate_error: "tag: could not tag" } })])).toEqual({ tag: null, error: "tag: could not tag" });
+    expect(releaseTagOf([row({ id: 1, version: "x", state: "live", at: "2026-10-12T07:12:00Z" }), null])).toBeNull();
   });
 });
