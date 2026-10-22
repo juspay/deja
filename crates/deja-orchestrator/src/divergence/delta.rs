@@ -351,6 +351,12 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             m.canon_version, y.canon_version
         ));
     }
+    if m.policy_digest != y.policy_digest {
+        return Err(format!(
+            "the candidates use different boundary policies ({:?} and {:?}); read each run's tape verdict instead",
+            m.policy_digest, y.policy_digest
+        ));
+    }
     // The trees hash what each candidate captured, in the encoding of the
     // deja it links. Across two encodings every affected address would read
     // as changed behaviour, so the tape verdict is the one to read there.
@@ -678,6 +684,7 @@ mod tests {
                 .collect(),
             correlations,
             event_schema_versions: [10].into_iter().collect(),
+            policy_digest: None,
         }
     }
     fn div(h: &str) -> Value {
@@ -687,6 +694,25 @@ mod tests {
         Value::Novel { hash: h.into() }
     }
 
+    #[test]
+    fn policy_mismatch_rejects_comparison_even_when_one_digest_is_absent() {
+        let m = tree("m", vec![(call("c", 0), Value::Reproduced)]);
+        let mut y = tree("y", vec![(call("c", 0), Value::Reproduced)]);
+        y.policy_digest = Some("policy-b".into());
+        assert!(three_way(&m, &y)
+            .unwrap_err()
+            .contains("different boundary policies"));
+    }
+
+    #[test]
+    fn same_policy_comparison_retains_existing_semantics() {
+        let mut m = tree("m", vec![(call("c", 0), Value::Reproduced)]);
+        let mut y = tree("y", vec![(call("c", 0), Value::Reproduced)]);
+        m.policy_digest = Some("policy-a".into());
+        y.policy_digest = Some("policy-a".into());
+        let delta = three_way(&m, &y).unwrap();
+        assert_eq!(delta.clean, 1);
+    }
     #[test]
     fn every_row_of_the_bucket_table() {
         let m = tree(

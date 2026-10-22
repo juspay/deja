@@ -18,6 +18,7 @@ import "json-diff-kit/dist/viewer.css";
 import "./styles.css";
 import { SIGN_IN_EVENT, actor, api, setActor } from "./lib/api";
 import { loginUrl, useMe } from "./lib/me";
+import { useSystems } from "./lib/systems";
 import RecordingsPage from "./pages/RecordingsPage";
 import NewRunPage from "./pages/NewRunPage";
 import RunsPage from "./pages/RunsPage";
@@ -34,6 +35,7 @@ import DeploymentsPage, {
 } from "./pages/DeploymentsPage";
 import LoginPage from "./pages/LoginPage";
 
+import BoundaryPolicyPage from "./pages/BoundaryPolicyPage";
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
 });
@@ -126,6 +128,7 @@ function ActorBox() {
 function Shell() {
   const loc = useLocation();
   const me = useMe();
+  const systems = useSystems();
   // Deployments is in beta for maintainers: the tab is drawn for a signed-in
   // maintainer only (the API refuses everyone else anyway).
   const maintainer = !!me.data?.configured && !!me.data.authenticated && (me.data.roles ?? []).includes("maintainer");
@@ -147,6 +150,7 @@ function Shell() {
           {tab("/runs", "Runs")}
           {tab("/recordings", "Recordings")}
           {maintainer && tab("/deployments", "Deployments", false, true)}
+          {maintainer && <Link className={loc.pathname.startsWith("/systems/") ? "tab active" : "tab"} to={systems.defaultSystem ? `/systems/${encodeURIComponent(systems.defaultSystem.name)}/boundary-policy` : "/"}>Boundary policy<span className="beta">beta</span></Link>}
           {tab("/audit", "Audit")}
         </nav>
         <Identity />
@@ -186,6 +190,7 @@ const router = createBrowserRouter([
       { path: "/runs/:runId", element: <LegacyRunRedirect /> },
       { path: "/runs/:runId/scorecard", element: <LegacyRunRedirect /> },
       { path: "/recordings", element: <RecordingsPage /> },
+      { path: "/systems/:system/boundary-policy", element: <BoundaryPolicyPage /> },
       { path: "/audit", element: <AuditPage /> },
       { path: "/deployments", element: <DeploymentsPage /> },
       { path: "/deployments/versions", element: <VersionsPage /> },

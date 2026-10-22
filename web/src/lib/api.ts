@@ -38,6 +38,8 @@ export type RunParams = {
    *  ancestor: main at the merge-base on the same recording. Set by the
    *  pipeline that created both runs. */
   delta_against?: string;
+  /** Immutable system policy selected at admission; absent only on legacy runs. */
+  boundary_policy?: BoundaryPolicySnapshot;
   /** Why the run exists when it is not a candidate under test: `baseline`. */
   purpose?: string;
   /** What the candidate is, in the creator's words: a PR number and title,
@@ -203,6 +205,7 @@ export type AuditRow = {
 
 export type Scorecard = {
   verdict: { pass: boolean; inconclusive: boolean; reason: string };
+  policy_digest?: string;
   summary: {
     matched_correlations: number;
     total_correlations: number;
@@ -607,6 +610,64 @@ export const api = {
       headers: { "X-Deja-Actor": who },
     });
   },
+};
+export type BoundaryTreatment =
+  | "plain_base64_json_order"
+  | "http_response_header_groups"
+  | "signed_body_derived_signature";
+
+export type BoundaryRule = {
+  boundary: "km";
+  trait_name: "common_utils::keymanager";
+  method_name: "call_encryption_service";
+  treatments: BoundaryTreatment[];
+};
+
+export type BoundaryPolicySnapshot = {
+  revision_id: number | null;
+  digest: string;
+  rules: BoundaryRule[];
+};
+
+export type BoundaryPolicyRevision = {
+  id: number;
+  system: string;
+  snapshot: BoundaryPolicySnapshot;
+  reason: string;
+  proposed_by: string;
+  confirmed_by?: string | null;
+  created_at: string;
+  activated_at?: string | null;
+};
+
+export type BoundaryPolicyPreview = {
+  run_id: string;
+  total_km_rows: number;
+  would_absorb: number;
+  would_remain_blocking: number;
+  examples: { correlation_id: string | null; classification: string }[];
+};
+
+export const boundaryPolicyApi = {
+  get: (system: string) =>
+    request<{ active: BoundaryPolicyRevision | null; revisions: BoundaryPolicyRevision[] }>(
+      `/api/v1/systems/${encodeURIComponent(system)}/boundary-policy`,
+    ),
+  preview: (system: string, run_id: string, rules: BoundaryRule[]) =>
+    request<BoundaryPolicyPreview>(
+      `/api/v1/systems/${encodeURIComponent(system)}/boundary-policy/preview`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ run_id, rules }) },
+    ),
+  propose: (system: string, rules: BoundaryRule[], reason: string, expected_active_revision: number | null) =>
+    request<BoundaryPolicyRevision>(
+      `/api/v1/systems/${encodeURIComponent(system)}/boundary-policy/revisions`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rules, reason, expected_active_revision }) },
+    ),
+  activate: (system: string, id: number, expected_active_revision: number | null) =>
+    request<BoundaryPolicyRevision>(
+      `/api/v1/systems/${encodeURIComponent(system)}/boundary-policy/revisions/${id}/activate`,
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ expected_active_revision }) },
+    ),
 };
 
 // ===========================================================================

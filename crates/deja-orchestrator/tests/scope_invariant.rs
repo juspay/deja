@@ -133,6 +133,7 @@ fn write_run(root: &HarnessRoot, run_id: &str, recording_id: &str, filter: Optio
             label: None,
             github: None,
             delta_against: None,
+            boundary_policy: None,
             purpose: None,
             scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,

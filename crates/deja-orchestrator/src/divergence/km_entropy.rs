@@ -7,6 +7,7 @@
 //! cryptographic verification. The raw arguments stay in the call ledger;
 //! only digests of observed arguments reach the behaviour tree.
 
+use crate::policy::{BoundaryPolicySnapshot, Treatment};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -169,57 +170,100 @@ fn same_members_except(l: &Map<String, Value>, r: &Map<String, Value>, skip: &st
         .all(|(key, value)| r.get(key) == Some(value))
 }
 
-pub(super) fn classify(
+/// Return both the semantic result and the exact treatment proved by the
+/// decoded arguments. Scoring must not decode/base64-parse the same KM payload
+/// again merely to decide whether the pinned policy enables that treatment.
+fn classify_and_treatment(
+    boundary: &str,
+    trait_name: &str,
+    method_name: &str,
+    recorded: &Value,
+    observed: &Value,
+) -> (KmClass, Option<Treatment>) {
+    if !is_km(boundary, trait_name, method_name) {
+        return (KmClass::NotApplicable, None);
+    }
+    if recorded == observed {
+        return (KmClass::Equal, None);
+    }
+    if !same_except_data(recorded, observed) {
+        return (KmClass::Different, None);
+    }
+    let (Some(left_wire), Some(right_wire)) = (decoded_data(recorded), decoded_data(observed))
+    else {
+        return (KmClass::Different, None);
+    };
+    if !looks_like_envelope(&left_wire.value) && !looks_like_envelope(&right_wire.value) {
+        // Plain JSON header maps: object keys are unordered, arrays positional.
+        return if left_wire.value == right_wire.value {
+            (KmClass::Rendering, Some(Treatment::PlainBase64JsonOrder))
+        } else {
+            (KmClass::Different, None)
+        };
+    }
+    let (Some(left), Some(right)) = (envelope(&left_wire.value), envelope(&right_wire.value))
+    else {
+        return (KmClass::Different, None);
+    };
+    if !same_envelope_extras(&left_wire.value, &right_wire.value)
+        || left.body != right.body
+        || left.non_signature_headers != right.non_signature_headers
+    {
+        return (KmClass::Different, None);
+    }
+    match (&left.signature, &right.signature) {
+        (None, None) => (
+            KmClass::Rendering,
+            Some(Treatment::HttpResponseHeaderGroups),
+        ),
+        (Some(a), Some(b)) if left.raw_body == right.raw_body => {
+            if a == b {
+                (
+                    KmClass::Rendering,
+                    Some(Treatment::HttpResponseHeaderGroups),
+                )
+            } else {
+                (KmClass::Different, None) // Same signed bytes: not signing entropy.
+            }
+        }
+        (Some(a), Some(b)) if a != b => (
+            KmClass::DeclaredDerived,
+            Some(Treatment::SignedBodyDerivedSignature),
+        ),
+        _ => (KmClass::Different, None), // Signature added/removed or reused on changed bytes.
+    }
+}
+
+#[cfg(test)]
+fn classify(
     boundary: &str,
     trait_name: &str,
     method_name: &str,
     recorded: &Value,
     observed: &Value,
 ) -> KmClass {
-    if !is_km(boundary, trait_name, method_name) {
-        return KmClass::NotApplicable;
-    }
-    if recorded == observed {
-        return KmClass::Equal;
-    }
-    if !same_except_data(recorded, observed) {
-        return KmClass::Different;
-    }
-    let (Some(left_wire), Some(right_wire)) = (decoded_data(recorded), decoded_data(observed))
-    else {
-        return KmClass::Different;
+    classify_and_treatment(boundary, trait_name, method_name, recorded, observed).0
+}
+
+/// The run's pinned policy controls which proved equivalences are non-blocking.
+/// `None` retains the legacy #286 rule; an explicit empty snapshot is strict.
+pub(super) fn classify_with_policy(
+    boundary: &str,
+    trait_name: &str,
+    method_name: &str,
+    recorded: &Value,
+    observed: &Value,
+    snapshot: Option<&BoundaryPolicySnapshot>,
+) -> KmClass {
+    let (class, treatment) =
+        classify_and_treatment(boundary, trait_name, method_name, recorded, observed);
+    let (Some(snapshot), Some(treatment)) = (snapshot, treatment) else {
+        return class;
     };
-    if !looks_like_envelope(&left_wire.value) && !looks_like_envelope(&right_wire.value) {
-        // The historical ProfileUpdate header map is a plain base64 JSON
-        // object, not a signed envelope. JSON object order is immaterial;
-        // arrays stay positional under Value equality.
-        return if left_wire.value == right_wire.value {
-            KmClass::Rendering
-        } else {
-            KmClass::Different
-        };
-    }
-    let (Some(left), Some(right)) = (envelope(&left_wire.value), envelope(&right_wire.value))
-    else {
-        return KmClass::Different;
-    };
-    if !same_envelope_extras(&left_wire.value, &right_wire.value)
-        || left.body != right.body
-        || left.non_signature_headers != right.non_signature_headers
-    {
-        return KmClass::Different;
-    }
-    match (&left.signature, &right.signature) {
-        (None, None) => KmClass::Rendering, // Unsigned HTTP response image.
-        (Some(a), Some(b)) if left.raw_body == right.raw_body => {
-            if a == b {
-                KmClass::Rendering // Header-pair order or envelope JSON rendering moved.
-            } else {
-                KmClass::Different // Same signed bytes: not signing entropy.
-            }
-        }
-        (Some(a), Some(b)) if a != b => KmClass::DeclaredDerived,
-        _ => KmClass::Different, // Signature added/removed or reused on changed bytes.
+    if snapshot.allows(boundary, trait_name, method_name, treatment) {
+        class
+    } else {
+        KmClass::Different
     }
 }
 
@@ -706,5 +750,82 @@ mod tests {
             false
         )
         .is_none());
+    }
+    #[test]
+    fn pinned_policy_selectively_enables_rendering_not_semantic_drift() {
+        use crate::policy::{BoundaryPolicyDocument, BoundaryRule, BoundarySelector};
+
+        let snapshot = |treatments: Vec<Treatment>| {
+            let doc = BoundaryPolicyDocument {
+                rules: if treatments.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![BoundaryRule {
+                        selector: BoundarySelector {
+                            boundary: "km".into(),
+                            trait_name: "common_utils::keymanager".into(),
+                            method_name: "call_encryption_service".into(),
+                        },
+                        treatments,
+                    }]
+                },
+            };
+            BoundaryPolicySnapshot {
+                revision_id: None,
+                digest: doc.canonical_digest().expect("valid KM policy"),
+                rules: doc.rules,
+            }
+        };
+        let classify_under =
+            |recorded: &Value, observed: &Value, policy: &BoundaryPolicySnapshot| {
+                classify_with_policy(
+                    "km",
+                    "common_utils::keymanager",
+                    "call_encryption_service",
+                    recorded,
+                    observed,
+                    Some(policy),
+                )
+            };
+        let plain = plain_args(r#"{"a":1,"b":2}"#);
+        let plain_reordered = plain_args(r#"{"b":2,"a":1}"#);
+        let changed_value = plain_args(r#"{"b":3,"a":1}"#);
+        let strict = snapshot(vec![]);
+        assert_eq!(
+            classify_under(&plain, &plain_reordered, &strict),
+            KmClass::Different
+        );
+        let plain_allowed = snapshot(vec![Treatment::PlainBase64JsonOrder]);
+        assert_eq!(
+            classify_under(&plain, &plain_reordered, &plain_allowed),
+            KmClass::Rendering
+        );
+        assert_eq!(
+            classify_under(&plain, &changed_value, &plain_allowed),
+            KmClass::Different
+        );
+
+        let signed = args(r#"{"a":1,"b":2}"#, "sig-a", &[]);
+        let signed_reordered = args(r#"{"b":2,"a":1}"#, "sig-b", &[]);
+        assert_eq!(
+            classify_under(&signed, &signed_reordered, &plain_allowed),
+            KmClass::Different
+        );
+        let derived_allowed = snapshot(vec![Treatment::SignedBodyDerivedSignature]);
+        assert_eq!(
+            classify_under(&signed, &signed_reordered, &derived_allowed),
+            KmClass::DeclaredDerived
+        );
+        assert_eq!(
+            classify_with_policy(
+                "db",
+                "common_utils::keymanager",
+                "call_encryption_service",
+                &plain,
+                &plain_reordered,
+                Some(&plain_allowed),
+            ),
+            KmClass::NotApplicable
+        );
     }
 }

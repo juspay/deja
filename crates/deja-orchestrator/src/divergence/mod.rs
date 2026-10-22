@@ -53,6 +53,33 @@ pub mod span_shape;
 pub mod tape;
 pub use ledger::CallRecord;
 
+/// Preview one recorded/observed KM argument pair under a proposed policy.
+/// This returns only a class, never the captured payload; the API bounds its
+/// example list and leaves the published run's scorecard unchanged.
+pub fn classify_km_args_with_policy(
+    boundary: &str,
+    trait_name: &str,
+    method_name: &str,
+    recorded: &serde_json::Value,
+    observed: &serde_json::Value,
+    snapshot: Option<&crate::policy::BoundaryPolicySnapshot>,
+) -> &'static str {
+    match km_entropy::classify_with_policy(
+        boundary,
+        trait_name,
+        method_name,
+        recorded,
+        observed,
+        snapshot,
+    ) {
+        km_entropy::KmClass::NotApplicable => "not_applicable",
+        km_entropy::KmClass::Equal => "equal",
+        km_entropy::KmClass::Rendering => "rendering_absorbed",
+        km_entropy::KmClass::DeclaredDerived => "derived_absorbed",
+        km_entropy::KmClass::Different => "different",
+    }
+}
+
 /// Boundaries whose live calls cannot run in the harness (egress is blocked).
 /// A *novel* call here is an `EnvironmentalMiss`, never a candidate bug.
 fn tier_for(boundary: &str) -> Tier {
@@ -246,6 +273,11 @@ pub struct Scorecard {
     pub r#type: String,
     pub run_id: String,
     pub recording_id: Option<String>,
+    /// Immutable maintainer policy the run was scored under; absent on a
+    /// legacy run. A dashboard never reinterprets this from today's active
+    /// revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_digest: Option<String>,
     pub summary: Summary,
     pub per_boundary: BTreeMap<String, BoundaryStats>,
     pub per_correlation: Vec<CorrelationOutcome>,
@@ -602,6 +634,7 @@ impl Scorecard {
             r#type: "replay-scorecard".to_owned(),
             run_id,
             recording_id: None,
+            policy_digest: None,
             summary: Summary {
                 uncorrelated_events_tolerated: true,
                 ..Summary::default()
@@ -1071,6 +1104,9 @@ pub struct RunArtifacts {
     /// declaration at load. Empty = the recorder's declaration is the whole
     /// canon, which is the behaviour for a system that declares nothing.
     pub reply_canons: std::collections::BTreeMap<String, String>,
+    /// Immutable maintainer policy pinned in the run spec at admission.
+    /// `None` preserves legacy scoring; `Some` is validated before use.
+    pub boundary_policy: Option<crate::policy::BoundaryPolicySnapshot>,
     pub warnings: Vec<String>,
     /// Lookups the candidate dropped before they finished. They close the
     /// lookup count and are not scored: the call never completed.
@@ -2594,7 +2630,11 @@ enum ValueVerdict {
 /// demote that serve, but only when it was paired to the event it actually
 /// served, and only after the narrow classifier proves that all other inputs
 /// remained the same. An unpaired serve or a different value stays blocking.
-fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
+fn pair_request_verdict(
+    call: &ObservedCall,
+    twin: Option<&deja::BoundaryEvent>,
+    policy: Option<&crate::policy::BoundaryPolicySnapshot>,
+) -> ValueVerdict {
     if call.arg_divergent {
         let Some(event) = twin else {
             return ValueVerdict::Diverged;
@@ -2602,12 +2642,13 @@ fn pair_request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>)
         if call.served_event_global_sequence != Some(event.global_sequence) {
             return ValueVerdict::Diverged;
         }
-        return match km_entropy::classify(
+        return match km_entropy::classify_with_policy(
             &call.boundary,
             &call.trait_name,
             &call.method_name,
             &event.args,
             &call.args,
+            policy,
         ) {
             km_entropy::KmClass::Rendering => ValueVerdict::Absorbed(ValueAbsorption::KmRendering),
             km_entropy::KmClass::DeclaredDerived => {
@@ -3363,6 +3404,7 @@ impl CallPairing {
         events: &[deja::BoundaryEvent],
         observed: &[ObservedCall],
         provenance: &CorrelationColumnProvenance,
+        policy: Option<&crate::policy::BoundaryPolicySnapshot>,
     ) -> Self {
         // Resolved claims first: an exact hit IS its recorded event, and nothing
         // below may take that event from it.
@@ -3455,7 +3497,7 @@ impl CallPairing {
             };
             let same_request = requests.iter().position(|event| {
                 !matches!(
-                    pair_request_verdict(call, Some(event)),
+                    pair_request_verdict(call, Some(event), policy),
                     ValueVerdict::Diverged
                 )
             });
@@ -6011,7 +6053,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     // pairing shapes and can absorb same-correlation response leaves. It never
     // classifies inherited returned-row state or infers provenance.
     let column_provenance = correlation_column_provenance(&art.events, &art.observed);
-    let pairing = CallPairing::build(&art.table, &art.events, &art.observed, &column_provenance);
+    let pairing = CallPairing::build(
+        &art.table,
+        &art.events,
+        &art.observed,
+        &column_provenance,
+        art.boundary_policy.as_ref(),
+    );
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
@@ -6355,7 +6403,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let twin_event = events_by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
-            let verdict = pair_request_verdict(obs, twin_event);
+            let verdict = pair_request_verdict(obs, twin_event, art.boundary_policy.as_ref());
             if obs.arg_divergent
                 && obs
                     .served_event_global_sequence
@@ -7473,6 +7521,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         r#type: "replay-scorecard".to_owned(),
         run_id: art.run_id.clone(),
         recording_id: art.recording_id.clone(),
+        policy_digest: art.boundary_policy.as_ref().map(|p| p.digest.clone()),
         summary: Summary {
             total_correlations,
             matched_correlations,
@@ -7570,7 +7619,19 @@ impl LoadCost {
 }
 
 pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifacts> {
-    let run = crate::read_json::<crate::Run>(&root.run_path(run_id)).ok();
+    let run = match crate::read_json::<crate::Run>(&root.run_path(run_id)) {
+        Ok(run) => Some(run),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let boundary_policy = run
+        .as_ref()
+        .and_then(|run| run.spec.boundary_policy.clone());
+    if let Some(snapshot) = &boundary_policy {
+        snapshot
+            .validate()
+            .map_err(|why| io::Error::new(io::ErrorKind::InvalidData, why))?;
+    }
     let recording_id = run.as_ref().and_then(|run| {
         run.recording_id
             .clone()
@@ -7789,6 +7850,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
         correlation_scope,
         scored_span_namespaces,
         reply_canons,
+        boundary_policy,
         warnings,
         cancelled_lookups,
     })
@@ -7894,6 +7956,7 @@ pub(crate) fn build_ledger_into(
         &tail_gap,
         &art.unplanted_presence,
         &SeedGapCascade::build(art),
+        art.boundary_policy.as_ref(),
         graph_plan,
         sink,
     )
@@ -8508,6 +8571,7 @@ mod tests {
             label: None,
             github: None,
             delta_against: None,
+            boundary_policy: None,
             purpose: None,
             scored_span_namespaces: namespaces,
             mode: crate::RunMode::Replay,
@@ -8600,6 +8664,7 @@ mod tests {
                     label: None,
                     github: None,
                     delta_against: None,
+                    boundary_policy: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
@@ -8726,6 +8791,7 @@ mod tests {
                     label: None,
                     github: None,
                     delta_against: None,
+                    boundary_policy: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
@@ -8927,6 +8993,7 @@ mod tests {
                     label: None,
                     github: None,
                     delta_against: None,
+                    boundary_policy: None,
                     purpose: None,
                     scored_span_namespaces: Vec::new(),
                     mode: crate::RunMode::Replay,
@@ -9169,6 +9236,7 @@ mod tests {
             unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
+            boundary_policy: None,
             run_id: "run-1".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -11406,6 +11474,7 @@ mod tests {
             unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
+            boundary_policy: None,
             run_id: "run-db-volatile-canon-ledger".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table: LookupTable {
@@ -13570,6 +13639,7 @@ mod tests {
             unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
+            boundary_policy: None,
             run_id: run_id.to_owned(),
             recording_id: Some(recording_id.to_owned()),
             table,

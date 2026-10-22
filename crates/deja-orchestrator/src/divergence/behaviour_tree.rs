@@ -42,9 +42,8 @@ use super::ledger::CallRecord;
 /// 5: a whole-body difference the kernel could only report as raw bytes is
 ///    hashed by the candidate's decoded body, so the map order serialised
 ///    into those bytes is not behaviour either.
-/// 6: paired KM args-free serves retain only short semantic/raw-body/signature
-///    digests for the main-versus-candidate comparison, never raw arguments.
-pub const CANON_VERSION: u32 = 6;
+/// 7: a run's immutable boundary policy is part of its comparison identity.
+pub const CANON_VERSION: u32 = 7;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -144,6 +143,9 @@ pub struct BehaviourTree {
     /// when these agree; otherwise an encoding change reads as behaviour.
     #[serde(default)]
     pub event_schema_versions: BTreeSet<u32>,
+    /// Immutable boundary policy used for this run; absent on legacy runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_digest: Option<String>,
 }
 
 /// The event schema versions named in an observed stream. Every event carries
@@ -454,6 +456,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
         lanes,
         correlations,
         event_schema_versions: BTreeSet::new(),
+        policy_digest: None,
     }
 }
 
@@ -499,6 +502,7 @@ impl BehaviourTree {
                 "lanes": self.lanes,
                 "correlations": self.correlations,
                 "event_schema_versions": self.event_schema_versions,
+                "policy_digest": self.policy_digest,
             })
             .to_string(),
         );
@@ -537,6 +541,10 @@ impl BehaviourTree {
                 head.get("event_schema_versions")?.clone(),
             )
             .ok()?,
+            policy_digest: head
+                .get("policy_digest")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
         })
     }
 
@@ -550,6 +558,22 @@ impl BehaviourTree {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn policy_digest_roundtrips_in_tree_header_and_legacy_header_defaults_none() {
+        let mut tree = build("run", &[], &[]);
+        tree.policy_digest = Some("policy-sha256".into());
+        let encoded = tree.to_jsonl();
+        assert_eq!(
+            BehaviourTree::from_jsonl(&encoded).unwrap().policy_digest,
+            tree.policy_digest
+        );
+
+        let legacy = encoded.replace(",\"policy_digest\":\"policy-sha256\"", "");
+        assert_eq!(
+            BehaviourTree::from_jsonl(&legacy).unwrap().policy_digest,
+            None
+        );
+    }
     use super::*;
     use crate::divergence::ledger::CallSide;
 

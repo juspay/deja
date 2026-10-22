@@ -350,39 +350,42 @@ After the replay run, the observed and shadow boundary calls are compared agains
 
 The orchestrator adds cause-vs-consequence lanes: `ValueDivergedOrigin` marks the originating read so downstream consequences are attributed to it, alongside omitted/novel/environmental/`inconclusive_race` lanes.
 
-For a fixed Hyperswitch candidate image, the orchestrator has one narrower
-post-hoc rule for an **args-free serve** of `km::call_encryption_service`. It
-compares the observed arguments with the *recorded event actually served*:
-base64 `request.data` is decoded as JSON. A plain JSON document, including
-the ProfileUpdate webhook-header map in Hyperswitch #14368, is compared
-structurally (object-key order ignored, arrays positional) without assuming
-it is a signed envelope. An envelope with `{body, headers}` may also carry
-`status_code` and `error_message` (the latest sandbox KM response image);
-those fields are compared exactly. Header-name groups may move, but values
-within a repeated name keep their relative order (notably `Set-Cookie`).
-Without a signature, equivalent body JSON and header groups are an absorbed
-rendering difference. With `X-Webhook-Signature-512`, a changed signature is
-declared derived and counted as absorbed only when the raw body bytes differ but
-the parsed JSON body, key identifiers, other arguments and non-signature
-headers agree. A signature change with identical raw body bytes, changed
-raw bytes with an unchanged signature, a changed JSON value, changed
-status/error field, a non-signature header change, reversed values within
-one repeated header name, malformed input, or a serve paired to a different
-recorded event still blocks. Deja does not possess or verify the HMAC key:
-`KmDerivedAbsorbed` is a declared dependency, **not** cryptographic proof.
-The raw args remain in the call ledger; the behavior tree carries only
-digests. The three-way delta compares matching semantic digests for separately
-signed main/candidate runs only when both served the same recorded event
-without an independent call-order mismatch. If only one run is eligible
-for semantic normalization, the delta flags a change even when its raw
-argument hash matches the other's: an order regression is not inherited
-entropy. Reusing one signature for different raw body renderings, or
-changing a signature for identical raw bytes, still charges the delta;
-a candidate restoring the tape stays `Resolved`. This rule changes neither
-the candidate lookup/runtime nor recording; unrelated omitted or novel
-calls keep their own verdicts. A previously published scorecard/ledger is
-not silently re-scored: new replay runs apply the rule, while a tree rebuilt
-from an old ledger still reflects that ledger's original classification.
+For the fixed Hyperswitch candidate image, an args-free serve of
+`km/common_utils::keymanager/call_encryption_service` can be classified by a
+**system-owned, versioned boundary policy**. A signed-in maintainer proposes an
+immutable revision from the dashboard; a different signed-in maintainer
+activates it. Every new run pins the active revision (or an explicit strict
+empty policy if none is active) before its worker starts. The policy is
+stored with the run parameters and audit event; store failure prevents launch.
+Re-activating an older revision rolls back the policy. Proposing an empty
+ruleset and activating it disables all KM allowances in one change. Existing
+runs retain their original scoring; activation is not retroactive.
+
+The rule applies only to the exact KM selector and the recorded event that
+was actually served, never to arbitrary KM calls or response values.
+`plain_base64_json_order` parses a base64-encoded plain JSON document and
+compares object keys structurally, with arrays positional.
+`http_response_header_groups` compares equivalent JSON bodies and header
+groups in an unsigned or signed HTTP response envelope; repeated values
+within a header name retain their order, and `status_code` and
+`error_message` remain exact. `signed_body_derived_signature` can absorb
+a changed `X-Webhook-Signature-512` only if the raw body bytes changed,
+the parsed JSON body and all other arguments/non-signature headers agree.
+It **declares a derived dependency, not verified HMAC authenticity**:
+Deja has no signing key. Different JSON values, mismatched non-signature
+headers, malformed arguments, unrelated call/serve pairing, and mismatched
+status/error fields still block. An already-published ledger or scorecard
+is never rewritten; preview streams a historical run's call ledger and
+reports bounded classification counts without raw payloads, but only a new
+replay proves the policy's full effect.
+
+The scorecard and cached behavior tree carry the pinned policy digest.
+Three-way delta refuses to compare runs with different digests (including
+legacy/no-policy versus a new pinned run), rather than presenting different
+scoring rules as a candidate change. The call ledger retains the raw
+recorded/observed arguments under the run's pinned policy provenance.
+This is a scorer-only rule: the lookup/runtime, recording, candidate image,
+and independent omitted/novel calls are unaffected.
 
 The blocking-vs-drift policy is **built, declared, and judged** — not open. Boundaries declare canonicalization presets applied by the scorer before judging (never by runtime routing): `final_state`, `absent_after`, `project{include,exclude}`. Volatile columns are declared `project:!created_at,!last_synced,!modified_at` on the DB row seams with a matching `reply_canon` on `http_incoming`. Blocking vs non-blocking is explicit in the verdict: seed gaps, order-nondeterminism, and idempotent-delete lines are non-blocking; evidence-gated `inconclusive_race` rows (recognized only when the run's HTTP layer is clean) make the verdict `inconclusive` with an auto-rerun recommendation — a race-only run can never pass.
 
