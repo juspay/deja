@@ -145,6 +145,30 @@ fn same_envelope_extras(left: &Value, right: &Value) -> bool {
             .all(|(key, value)| r.get(key) == Some(value))
 }
 
+/// Preserve whether a signed envelope ALSO changed header presentation. Ignore
+/// only the signature value; requiring a second treatment must not decode the
+/// payload a second time, nor allocate another copy of its header array.
+fn same_header_sequence_except_signature(left: &Value, right: &Value) -> bool {
+    let (Some(left), Some(right)) = (
+        left.get("headers").and_then(Value::as_array),
+        right.get("headers").and_then(Value::as_array),
+    ) else {
+        return false;
+    };
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(l, r)| {
+            let (Some(l), Some(r)) = (l.as_array(), r.as_array()) else {
+                return false;
+            };
+            l.first() == r.first()
+                && (l
+                    .first()
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(SIGNATURE))
+                    || l.get(1) == r.get(1))
+        })
+}
+
 fn same_except_data(left: &Value, right: &Value) -> bool {
     let (Some(l), Some(r)) = (left.as_object(), right.as_object()) else {
         return false;
@@ -170,67 +194,73 @@ fn same_members_except(l: &Map<String, Value>, r: &Map<String, Value>, skip: &st
         .all(|(key, value)| r.get(key) == Some(value))
 }
 
-/// Return both the semantic result and the exact treatment proved by the
-/// decoded arguments. Scoring must not decode/base64-parse the same KM payload
-/// again merely to decide whether the pinned policy enables that treatment.
+/// Return the semantic result, its primary treatment, and whether a changed
+/// signed envelope additionally needs the header-groups treatment. Scoring
+/// must not decode/base64-parse the same KM payload again just to check policy.
 fn classify_and_treatment(
     boundary: &str,
     trait_name: &str,
     method_name: &str,
     recorded: &Value,
     observed: &Value,
-) -> (KmClass, Option<Treatment>) {
+) -> (KmClass, Option<Treatment>, bool) {
     if !is_km(boundary, trait_name, method_name) {
-        return (KmClass::NotApplicable, None);
+        return (KmClass::NotApplicable, None, false);
     }
     if recorded == observed {
-        return (KmClass::Equal, None);
+        return (KmClass::Equal, None, false);
     }
     if !same_except_data(recorded, observed) {
-        return (KmClass::Different, None);
+        return (KmClass::Different, None, false);
     }
     let (Some(left_wire), Some(right_wire)) = (decoded_data(recorded), decoded_data(observed))
     else {
-        return (KmClass::Different, None);
+        return (KmClass::Different, None, false);
     };
     if !looks_like_envelope(&left_wire.value) && !looks_like_envelope(&right_wire.value) {
-        // Plain JSON header maps: object keys are unordered, arrays positional.
         return if left_wire.value == right_wire.value {
-            (KmClass::Rendering, Some(Treatment::PlainBase64JsonOrder))
+            (
+                KmClass::Rendering,
+                Some(Treatment::PlainBase64JsonOrder),
+                false,
+            )
         } else {
-            (KmClass::Different, None)
+            (KmClass::Different, None, false)
         };
     }
     let (Some(left), Some(right)) = (envelope(&left_wire.value), envelope(&right_wire.value))
     else {
-        return (KmClass::Different, None);
+        return (KmClass::Different, None, false);
     };
     if !same_envelope_extras(&left_wire.value, &right_wire.value)
         || left.body != right.body
         || left.non_signature_headers != right.non_signature_headers
     {
-        return (KmClass::Different, None);
+        return (KmClass::Different, None, false);
     }
     match (&left.signature, &right.signature) {
         (None, None) => (
             KmClass::Rendering,
             Some(Treatment::HttpResponseHeaderGroups),
+            false,
         ),
         (Some(a), Some(b)) if left.raw_body == right.raw_body => {
             if a == b {
                 (
                     KmClass::Rendering,
                     Some(Treatment::HttpResponseHeaderGroups),
+                    false,
                 )
             } else {
-                (KmClass::Different, None) // Same signed bytes: not signing entropy.
+                (KmClass::Different, None, false) // Same signed bytes: not signing entropy.
             }
         }
         (Some(a), Some(b)) if a != b => (
             KmClass::DeclaredDerived,
             Some(Treatment::SignedBodyDerivedSignature),
+            !same_header_sequence_except_signature(&left_wire.value, &right_wire.value),
         ),
-        _ => (KmClass::Different, None), // Signature added/removed or reused on changed bytes.
+        _ => (KmClass::Different, None, false),
     }
 }
 
@@ -255,12 +285,20 @@ pub(super) fn classify_with_policy(
     observed: &Value,
     snapshot: Option<&BoundaryPolicySnapshot>,
 ) -> KmClass {
-    let (class, treatment) =
+    let (class, treatment, needs_header_groups) =
         classify_and_treatment(boundary, trait_name, method_name, recorded, observed);
     let (Some(snapshot), Some(treatment)) = (snapshot, treatment) else {
         return class;
     };
-    if snapshot.allows(boundary, trait_name, method_name, treatment) {
+    if snapshot.allows(boundary, trait_name, method_name, treatment)
+        && (!needs_header_groups
+            || snapshot.allows(
+                boundary,
+                trait_name,
+                method_name,
+                Treatment::HttpResponseHeaderGroups,
+            ))
+    {
         class
     } else {
         KmClass::Different
@@ -814,6 +852,33 @@ mod tests {
         let derived_allowed = snapshot(vec![Treatment::SignedBodyDerivedSignature]);
         assert_eq!(
             classify_under(&signed, &signed_reordered, &derived_allowed),
+            KmClass::DeclaredDerived
+        );
+        let recorded_with_headers = args(
+            r#"{"a":1,"b":2}"#,
+            "sig-a",
+            &[("content-type", "application/json"), ("x-trace", "v")],
+        );
+        let changed_body_and_headers = args(
+            r#"{"b":2,"a":1}"#,
+            "sig-b",
+            &[("x-trace", "v"), ("content-type", "application/json")],
+        );
+        assert_eq!(
+            classify_under(
+                &recorded_with_headers,
+                &changed_body_and_headers,
+                &derived_allowed
+            ),
+            KmClass::Different,
+            "signature allowance alone cannot silently allow header reordering"
+        );
+        let both = snapshot(vec![
+            Treatment::SignedBodyDerivedSignature,
+            Treatment::HttpResponseHeaderGroups,
+        ]);
+        assert_eq!(
+            classify_under(&recorded_with_headers, &changed_body_and_headers, &both),
             KmClass::DeclaredDerived
         );
         assert_eq!(

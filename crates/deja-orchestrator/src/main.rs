@@ -1005,45 +1005,49 @@ async fn v1_create_run(
             "boundary_policy is selected by the maintainer, not the caller",
         );
     }
-    let store = match require_store(&st) {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
-    let active_policy = match store.boundary_policy_active(spec.system()).await {
-        Ok(active) => active,
-        Err(e) => return error_resp(503, &format!("read active boundary policy: {e}")),
-    };
-    let (revision_id, document) = match active_policy {
-        Some(row) => {
-            let document = match serde_json::from_value::<
-                deja_orchestrator::policy::BoundaryPolicyDocument,
-            >(row.document)
-            {
-                Ok(document) => document,
-                Err(e) => return error_resp(503, &format!("invalid active policy: {e}")),
-            };
-            (Some((row.id, row.digest)), document)
+    if spec.mode == deja_orchestrator::RunMode::Replay {
+        // Only replay scoring consumes boundary policy. Recording remains
+        // independent of Postgres, as it was before this feature.
+        let store = match require_store(&st) {
+            Ok(store) => store,
+            Err(response) => return response,
+        };
+        let active_policy = match store.boundary_policy_active(spec.system()).await {
+            Ok(active) => active,
+            Err(e) => return error_resp(503, &format!("read active boundary policy: {e}")),
+        };
+        let (revision_id, document) = match active_policy {
+            Some(row) => {
+                let document = match serde_json::from_value::<
+                    deja_orchestrator::policy::BoundaryPolicyDocument,
+                >(row.document)
+                {
+                    Ok(document) => document,
+                    Err(e) => return error_resp(503, &format!("invalid active policy: {e}")),
+                };
+                (Some((row.id, row.digest)), document)
+            }
+            None => (
+                None,
+                deja_orchestrator::policy::BoundaryPolicyDocument { rules: Vec::new() },
+            ),
+        };
+        let digest = match document.canonical_digest() {
+            Ok(digest) => digest,
+            Err(why) => return error_resp(503, &format!("invalid active policy: {why}")),
+        };
+        if revision_id
+            .as_ref()
+            .is_some_and(|(_, stored_digest)| stored_digest != &digest)
+        {
+            return error_resp(503, "active policy digest does not match its document");
         }
-        None => (
-            None,
-            deja_orchestrator::policy::BoundaryPolicyDocument { rules: Vec::new() },
-        ),
-    };
-    let digest = match document.canonical_digest() {
-        Ok(digest) => digest,
-        Err(why) => return error_resp(503, &format!("invalid active policy: {why}")),
-    };
-    if revision_id
-        .as_ref()
-        .is_some_and(|(_, stored_digest)| stored_digest != &digest)
-    {
-        return error_resp(503, "active policy digest does not match its document");
+        spec.boundary_policy = Some(deja_orchestrator::policy::BoundaryPolicySnapshot {
+            revision_id: revision_id.map(|(id, _)| id),
+            digest,
+            rules: document.rules,
+        });
     }
-    spec.boundary_policy = Some(deja_orchestrator::policy::BoundaryPolicySnapshot {
-        revision_id: revision_id.map(|(id, _)| id),
-        digest,
-        rules: document.rules,
-    });
     if let Err(e) = admit_github(&mut spec) {
         return error_resp(400, &format!("github: {e}"));
     }
@@ -1051,36 +1055,67 @@ async fn v1_create_run(
         Ok(run) => run,
         Err(e) => return error_resp(500, &format!("create run: {e}")),
     };
-    // Row and audit commit together before the worker starts. A failed store
-    // write must not leave a replay running under an unaccounted policy.
-    let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
-    let params =
-        deja_orchestrator::RunParams::resolved(&run.spec, expectation.as_deref()).to_json();
-    if let Err(e) = store
-        .insert_run_with_audit(
-            &run.run_id,
-            runs::mode_str(run.spec.mode),
-            run.spec.recording_id.as_deref(),
-            &candidate,
-            &params,
-            expectation.as_deref(),
-            &actor,
-            &serde_json::json!({ "spec": run.spec, "expectation": expectation }),
-        )
-        .await
-    {
-        if let Err(cleanup) = std::fs::remove_file(st.root.run_path(&run.run_id)) {
-            eprintln!(
-                "deja-orchestrator: remove unadmitted run {}: {cleanup}",
-                run.run_id
-            );
+    let ctx = if let Some(store) = &st.store {
+        let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
+        let params =
+            deja_orchestrator::RunParams::resolved(&run.spec, expectation.as_deref()).to_json();
+        if run.spec.mode == deja_orchestrator::RunMode::Replay {
+            // For policy-pinned replays, row and audit commit before launch.
+            if let Err(e) = store
+                .insert_run_with_audit(
+                    &run.run_id,
+                    runs::mode_str(run.spec.mode),
+                    run.spec.recording_id.as_deref(),
+                    &candidate,
+                    &params,
+                    expectation.as_deref(),
+                    &actor,
+                    &serde_json::json!({ "spec": run.spec, "expectation": expectation }),
+                )
+                .await
+            {
+                if let Err(cleanup) = std::fs::remove_file(st.root.run_path(&run.run_id)) {
+                    eprintln!(
+                        "deja-orchestrator: remove unadmitted run {}: {cleanup}",
+                        run.run_id
+                    );
+                }
+                return error_resp(503, &format!("create run store transaction: {e}"));
+            }
+        } else {
+            // A recording is not judged under replay policy; preserve its
+            // original file-only and best-effort catalog behavior.
+            if let Err(e) = store
+                .insert_run(
+                    &run.run_id,
+                    runs::mode_str(run.spec.mode),
+                    run.spec.recording_id.as_deref(),
+                    &candidate,
+                    &params,
+                    expectation.as_deref(),
+                    &actor,
+                )
+                .await
+            {
+                eprintln!("deja-orchestrator: store insert_run failed: {e}");
+            }
+            let _ = store
+                .audit(
+                    &actor,
+                    "run.create",
+                    "run",
+                    &run.run_id,
+                    &serde_json::json!({ "spec": run.spec, "expectation": expectation }),
+                )
+                .await;
         }
-        return error_resp(503, &format!("create run store transaction: {e}"));
-    }
-    let ctx = deja_orchestrator::lifecycle::StoreCtx::new(
-        &run.run_id,
-        Some((tokio::runtime::Handle::current(), store.clone())),
-    );
+        deja_orchestrator::lifecycle::StoreCtx::new(
+            &run.run_id,
+            Some((tokio::runtime::Handle::current(), store.clone())),
+        )
+    } else {
+        deja_orchestrator::lifecycle::StoreCtx::disabled(&run.run_id)
+    };
     match &*st.executor {
         ExecutorSelection::Compose => runs::spawn_worker(&st.root, &run.run_id, ctx),
         // Scheduling on: the run is ACCEPTED and its Job created SUSPENDED —

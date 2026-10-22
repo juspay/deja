@@ -1616,17 +1616,9 @@ impl Store {
         if active != expected_active {
             return Err(BoundaryPolicyWriteError::Conflict);
         }
-        if let Some(existing) = sqlx::query(&format!(
-            "{POLICY_SELECT} WHERE r.system = $1 AND r.digest = $2"
-        ))
-        .bind(system)
-        .bind(digest)
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            tx.commit().await?;
-            return Ok(boundary_policy_row(existing));
-        }
+        // Identical rules may be proposed by different maintainers for
+        // different reasons. Each is a distinct audited proposal, with its
+        // own proposer subject for the two-person activation check.
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO boundary_policy_revisions
                (system, digest, document, reason, proposed_by, proposed_by_sub)
@@ -2154,6 +2146,34 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored.document, strict);
+        // Same content from another maintainer is a distinct audited act, not
+        // an alias for Alice's old proposal with Alice still named proposer.
+        let duplicate = store
+            .boundary_policy_propose(
+                &system,
+                "strict",
+                &strict,
+                "Independent strict proposal",
+                "carol@example.test",
+                "carol-sub",
+                Some(proposed.id),
+            )
+            .await
+            .unwrap();
+        assert_ne!(duplicate.id, proposed.id);
+        assert_eq!(duplicate.proposed_by_sub, "carol-sub");
+        assert!(matches!(
+            store
+                .boundary_policy_activate(
+                    &system,
+                    duplicate.id,
+                    Some(proposed.id),
+                    "carol@example.test",
+                    "carol-sub"
+                )
+                .await,
+            Err(super::BoundaryPolicyWriteError::SameActor)
+        ));
         let audit_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM audit_events WHERE object_type = 'boundary_policy'
              AND object_id LIKE $1",
@@ -2162,7 +2182,7 @@ mod tests {
         .fetch_one(&store.pool)
         .await
         .unwrap();
-        assert_eq!(audit_count, 5); // Two proposals and three activations.
+        assert_eq!(audit_count, 6); // Three proposals and three activations.
     }
 
     /// A settlement against the old baseline that was in flight when the run

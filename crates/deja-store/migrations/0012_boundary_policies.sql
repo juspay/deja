@@ -18,10 +18,10 @@ CREATE TABLE boundary_policy_revisions (
     CHECK (length(btrim(reason)) > 0),
     CHECK (length(btrim(proposed_by_sub)) > 0)
 );
+-- Digest identifies scoring semantics, not a unique proposal: different
+-- maintainers can independently propose the same rules and retain authorship.
 CREATE INDEX boundary_policy_revisions_system_id
     ON boundary_policy_revisions (system, id DESC);
-CREATE UNIQUE INDEX boundary_policy_revision_identity
-    ON boundary_policy_revisions (system, digest);
 
 CREATE TABLE boundary_policy_active (
     system TEXT PRIMARY KEY,

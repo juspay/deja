@@ -354,12 +354,14 @@ For the fixed Hyperswitch candidate image, an args-free serve of
 `km/common_utils::keymanager/call_encryption_service` can be classified by a
 **system-owned, versioned boundary policy**. A signed-in maintainer proposes an
 immutable revision from the dashboard; a different signed-in maintainer
-activates it. Every new run pins the active revision (or an explicit strict
-empty policy if none is active) before its worker starts. The policy is
-stored with the run parameters and audit event; store failure prevents launch.
-Re-activating an older revision rolls back the policy. Proposing an empty
-ruleset and activating it disables all KM allowances in one change. Existing
-runs retain their original scoring; activation is not retroactive.
+activates it. Every new **replay** run pins the active revision (or an explicit
+strict empty policy if none is active) before its worker starts. The policy is
+stored with the replay parameters and audit event; store failure prevents a
+replay launch. Recording remains independent of this policy and can run
+file-only. Re-activating an older revision rolls back the policy. Proposing an
+empty ruleset and activating it disables all KM allowances in one change.
+Activation does not rewrite published runs; explicitly re-scoring older raw
+artifacts still uses the legacy #286 classifier.
 
 The rule applies only to the exact KM selector and the recorded event that
 was actually served, never to arbitrary KM calls or response values.
@@ -371,6 +373,9 @@ within a header name retain their order, and `status_code` and
 `error_message` remain exact. `signed_body_derived_signature` can absorb
 a changed `X-Webhook-Signature-512` only if the raw body bytes changed,
 the parsed JSON body and all other arguments/non-signature headers agree.
+When non-signature header order/rendering also changes, both the signature
+and header-groups treatments must be enabled; one rule cannot silently enable
+the other.
 It **declares a derived dependency, not verified HMAC authenticity**:
 Deja has no signing key. Different JSON values, mismatched non-signature
 headers, malformed arguments, unrelated call/serve pairing, and mismatched
