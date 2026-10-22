@@ -624,11 +624,14 @@ async fn require_cd_reader(
     if !cfg.enabled {
         return error_resp(
             401,
-            "Deployments is in beta for maintainers, and sign-in is not configured on this deployment",
+            "Deployments is in beta for maintainers and environment upgraders, and sign-in is not configured on this deployment",
         );
     }
     let Some(session) = session_from_headers(&st, req.headers()) else {
-        return error_resp(401, "Deployments is in beta for maintainers: sign in");
+        return error_resp(
+            401,
+            "Deployments is in beta for maintainers and environment upgraders: sign in",
+        );
     };
     if !cfg.domain_allowed(&session.email) {
         return error_resp(401, "this account is no longer allowed to sign in");
