@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
-import { ago, agoText, argoOf, carries, promotionReplayWord, howOf, inFlight, mergesSince, placesOf, promotionCandidates, promotionProgress, stateTone } from "./cd";
-import type { CdVersionRow } from "./api";
+import { ago, agoText, argoOf, carriedBy, carries, promotionReplayWord, howOf, inFlight, mergesSince, placesOf, promotionActivity, promotionCandidates, promotionFocus, promotionProgress, promotionRail, releaseStrip, stateTone } from "./cd";
+import type { CdDeploymentRow, CdPromotion, CdVersionRow } from "./api";
 
 function v(partial: Partial<CdVersionRow> & { version: string; kind: string }): CdVersionRow {
   return {
@@ -167,5 +167,158 @@ describe("promotion", () => {
     expect(promotionProgress({ state: "live" }).every((s) => s.at === "done")).toBe(true);
     expect(inFlight({ state: "picked" })).toBe(true);
     expect(inFlight({ state: "cancelled" })).toBe(false);
+  });
+});
+
+// ---- the promotion page and the strip ---------------------------------------
+
+function req(partial: Partial<CdPromotion> & { state: string }): CdPromotion {
+  return {
+    id: 14,
+    system: "prism",
+    environment: "sandbox",
+    from_version: "8eaddb0b85",
+    release: null,
+    requested_by: "qa-reviewer",
+    note: null,
+    evidence: {},
+    step_detail: {},
+    picked_by_build: null,
+    created_at: "2026-10-12T07:53:00Z",
+    updated_at: "2026-10-12T07:53:00Z",
+    finished_at: null,
+    ...partial,
+  };
+}
+
+function row(partial: Partial<CdDeploymentRow> & { id: number; version: string; state: string; at: string }): CdDeploymentRow {
+  return { system: "prism", environment: "sandbox", requested_by: "prism-cd", request_id: null, jenkins_build: null, detail: {}, ...partial };
+}
+
+describe("promotionRail", () => {
+  const flat = (p: CdPromotion) => promotionRail(p).flatMap((g) => g.steps.map((s) => `${s.step}:${s.at}`));
+
+  test("a pending request is its own step, with the job's first step next", () => {
+    expect(flat(req({ state: "pending" }))).toEqual(["pending:done", "picked:now", "tagged:todo", "built:todo", "committed:todo", "live:todo"]);
+  });
+
+  test("steps posted are done and the one after is now", () => {
+    const p = req({ state: "tagged", release: "cd-2026.10.12.1", step_detail: { picked: { at: "2026-10-12T07:53:30Z", jenkins_build: "prism-cd-promote #14" }, tagged: { at: "2026-10-12T07:54:00Z" } } });
+    expect(flat(p)).toEqual(["pending:done", "picked:done", "tagged:done", "built:now", "committed:todo", "live:todo"]);
+    expect(promotionFocus(promotionRail(p)).step).toBe("built");
+  });
+
+  test("live is done all the way", () => {
+    expect(flat(req({ state: "live" }))).toEqual(["pending:done", "picked:done", "tagged:done", "built:done", "committed:done", "live:done"]);
+    expect(promotionFocus(promotionRail(req({ state: "live" }))).step).toBe("live");
+  });
+
+  test("a failure stops at the step the job was on, with the reason there", () => {
+    const p = req({
+      state: "failed",
+      step_detail: { picked: { at: "2026-10-12T07:53:30Z" }, tagged: { at: "2026-10-12T07:54:00Z" }, failed: { at: "2026-10-12T09:30:00Z", reason: "tagged: after 90 min: image missing, chart there" } },
+    });
+    expect(flat(p)).toEqual(["pending:done", "picked:done", "tagged:done", "built:failed", "committed:todo", "live:todo"]);
+    const focus = promotionFocus(promotionRail(p));
+    expect(focus.step).toBe("built");
+    expect(focus.detail?.reason).toContain("image missing");
+  });
+
+  test("a cancelled request stops at the request itself", () => {
+    const p = req({ state: "cancelled", step_detail: { cancelled: { at: "2026-10-12T08:00:00Z", by: "qa-reviewer" } } });
+    expect(flat(p)).toEqual(["pending:cancelled", "picked:todo", "tagged:todo", "built:todo", "committed:todo", "live:todo"]);
+    expect(promotionFocus(promotionRail(p)).detail?.by).toBe("qa-reviewer");
+  });
+
+  test("the request step carries who asked and when", () => {
+    const first = promotionRail(req({ state: "pending" }))[0].steps[0];
+    expect(first.detail).toEqual({ at: "2026-10-12T07:53:00Z", by: "qa-reviewer" });
+  });
+});
+
+describe("promotionActivity", () => {
+  test("one line per step, newest first, the failure with its reason", () => {
+    const p = req({
+      state: "failed",
+      release: "cd-2026.10.12.1",
+      step_detail: { picked: { at: "2026-10-12T07:53:30Z", jenkins_build: "prism-cd-promote #14" }, tagged: { at: "2026-10-12T07:54:00Z" }, failed: { at: "2026-10-12T09:30:00Z", reason: "tagged: image missing" } },
+    });
+    const lines = promotionActivity(p);
+    expect(lines.map((l) => l.what)).toEqual(["ended the request as failed: tagged: image missing", "cut cd-2026.10.12.1 on 8eaddb0b85", "picked the request", "requested 8eaddb0b85 → sandbox"]);
+    expect(lines[2].by).toBe("prism-cd-promote #14");
+    expect(lines[3].by).toBe("qa-reviewer");
+  });
+});
+
+describe("carriedBy", () => {
+  const versions = [
+    merge("9d8050b234", "2026-10-12T10:35:28Z", 2501),
+    merge("8eaddb0b85", "2026-10-12T06:54:18Z", 2488),
+    merge("efdd705fea", "2026-10-10T09:36:40Z", 2490),
+    v({ version: "2026.10.09.1", kind: "release", released_from: "6aa4b50944", merged_at: "2026-10-09T14:00:00Z" }),
+    merge("6aa4b50944", "2026-10-09T13:00:00Z", 2480),
+  ];
+  const live = versions[3];
+
+  test("the promoted merge and the ones before it, back to the live release's merge", () => {
+    expect(carriedBy(versions, "8eaddb0b85", live)?.map((x) => x.version)).toEqual(["8eaddb0b85", "efdd705fea"]);
+  });
+
+  test("not known when the target's release names no merge, or the version is not after it", () => {
+    expect(carriedBy(versions, "8eaddb0b85", v({ version: "2026.10.07.1", kind: "release" }))).toBeNull();
+    expect(carriedBy(versions, "6aa4b50944", live)).toBeNull();
+  });
+});
+
+describe("releaseStrip", () => {
+  const versions = [
+    merge("9d8050b234", "2026-10-12T10:35:28Z", 2501),
+    merge("8eaddb0b85", "2026-10-12T06:54:18Z", 2488),
+    v({ version: "2026.10.09.1", kind: "release", released_from: "6aa4b50944", merged_at: "2026-10-09T14:00:00Z", prs: Array.from({ length: 9 }, (_, i) => ({ repo: "r", pr_number: i, title: null, author: null, merged_at: null })) }),
+    merge("6aa4b50944", "2026-10-09T13:00:00Z", 2480),
+    v({ version: "2026.10.07.1", kind: "release" }),
+    v({ version: "2026.10.06.0", kind: "release", released_from: "3c19e7a0b2" }),
+  ];
+  const history = [
+    row({ id: 9, version: "2026.10.09.1", state: "live", at: "2026-10-09T14:20:00Z", requested_by: "qa-reviewer", jenkins_build: "prism-cd-promote #12", detail: { sync: "Synced", health: "Healthy" } }),
+    row({ id: 8, version: "2026.10.09.1", state: "committed", at: "2026-10-09T14:10:00Z", requested_by: "qa-reviewer" }),
+    row({ id: 7, version: "2026.10.07.1", state: "live", at: "2026-10-08T10:02:00Z", requested_by: "observed", detail: { out_of_band: true } }),
+    row({ id: 6, version: "2026.10.06.0", state: "failed", at: "2026-10-06T09:40:00Z", requested_by: "qa-reviewer", detail: { reason: "sync timed out" } }),
+    row({ id: 5, version: "2026.10.05.2", state: "live", at: "2026-10-05T09:00:00Z", requested_by: "qa-reviewer" }),
+  ];
+
+  test("earlier, previous and live come from the log, one place per version", () => {
+    const cells = releaseStrip(history, versions, [], "integ");
+    expect(cells.map((c) => [c.role, c.version, c.note])).toEqual([
+      ["earlier", "2026.10.06.0", "failed"],
+      ["previous", "2026.10.07.1", "replaced · outside déjà"],
+      ["live", "2026.10.09.1", "promoted by qa-reviewer"],
+      ["promoting", null, "nothing moving"],
+      ["next", "9d8050b234", "2 merges on integ, not requested"],
+    ]);
+    expect(cells[2].from).toBe("6aa4b50944");
+    expect(cells[2].merges).toBe(9);
+    expect(cells[0].from).toBe("3c19e7a0b2");
+    expect(cells[0].merges).toBeNull();
+  });
+
+  test("a request in flight takes the moving place and the next waits for a merge after it", () => {
+    const moving = req({ state: "tagged", release: "cd-2026.10.12.1", step_detail: { picked: { at: "2026-10-12T07:53:30Z" }, tagged: { at: "2026-10-12T07:54:00Z" } } });
+    const cells = releaseStrip(history, versions, [moving, req({ id: 13, state: "live" })], "integ");
+    expect(cells[3]).toMatchObject({ role: "promoting", version: "cd-2026.10.12.1", from: "8eaddb0b85", note: "building the image and chart" });
+    expect(cells[3].request?.id).toBe(14);
+    expect(cells[4]).toMatchObject({ role: "next", version: null, note: "any merge after 8eaddb0b85, once it runs on integ" });
+  });
+
+  test("a live release first seen on the environment cannot say what is next", () => {
+    const cells = releaseStrip([row({ id: 1, version: "2026.10.07.1", state: "live", at: "2026-10-08T10:02:00Z", requested_by: "observed" })], versions, [], "integ");
+    expect(cells.map((c) => c.version)).toEqual([null, null, "2026.10.07.1", null, null]);
+    expect(cells[2].note).toBe("seen by reconcile");
+    expect(cells[4].note).toBe("not known: 2026.10.07.1 names no merge it was cut on");
+  });
+
+  test("an empty log is five empty places", () => {
+    expect(releaseStrip([], versions, [], "integ").map((c) => c.version)).toEqual([null, null, null, null, null]);
+    expect(releaseStrip([], versions, [], "integ")[4].note).toBe("nothing live yet");
   });
 });
