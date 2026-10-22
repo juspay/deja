@@ -21112,6 +21112,63 @@ mod tests {
     }
 
     #[test]
+    fn pinned_km_policy_changes_the_scorecard_ledger_and_tree_together() {
+        use crate::policy::{
+            BoundaryPolicyDocument, BoundaryPolicySnapshot, BoundaryRule, BoundarySelector,
+            Treatment,
+        };
+        let recorded = km_plain_args(r#"{"X-A":"a","X-B":"b"}"#);
+        let observed = km_plain_args(r#"{"X-B":"b","X-A":"a"}"#);
+        for allowed in [false, true] {
+            let rules = if allowed {
+                vec![BoundaryRule {
+                    selector: BoundarySelector {
+                        boundary: "km".into(),
+                        trait_name: "common_utils::keymanager".into(),
+                        method_name: "call_encryption_service".into(),
+                    },
+                    treatments: vec![Treatment::PlainBase64JsonOrder],
+                }]
+            } else {
+                Vec::new()
+            };
+            let document = BoundaryPolicyDocument { rules };
+            let snapshot = BoundaryPolicySnapshot {
+                revision_id: Some(if allowed { 2 } else { 1 }),
+                digest: document.canonical_digest().expect("valid KM policy"),
+                rules: document.rules,
+            };
+            let mut art = km_served_artifacts(recorded.clone(), observed.clone(), UPSTREAM_CALL);
+            art.boundary_policy = Some(snapshot.clone());
+            let card = detect(&art);
+            let rows = build_ledger(&art).expect("ledger builds");
+            let row = rows.iter().find(|r| r.boundary == "km").expect("km row");
+            let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
+            let km = tree.entries.iter().find(|entry| {
+                matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "km")
+            }).expect("KM tree entry");
+            assert_eq!(
+                card.policy_digest.as_deref(),
+                Some(snapshot.digest.as_str())
+            );
+            assert_eq!(card.summary.value_divergences, u64::from(!allowed));
+            assert_eq!(row.blocking, !allowed);
+            assert_eq!(
+                row.kind,
+                if allowed {
+                    "km_rendering_absorbed"
+                } else {
+                    "value_diverged"
+                }
+            );
+            assert_eq!(
+                matches!(km.value, behaviour_tree::Value::Reproduced),
+                allowed
+            );
+        }
+    }
+
+    #[test]
     fn km_args_free_serve_is_absorbed_only_for_rendering_or_declared_derivation() {
         let recorded = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);
         for (observed, kind, row_kind) in [
