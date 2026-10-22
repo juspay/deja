@@ -829,7 +829,7 @@ function StripPlace({ c, system, cfg }: { c: StripCell; system: string; cfg: CdC
   const how = row ? howOf(row) : null;
   const top =
     c.request ? `Requested ${when(c.request.created_at)} · ${c.request.requested_by}`
-    : row ? `${how?.kind === "job" ? "Promoted" : "Seen"} ${when(row.at)}`
+    : row ? `${how?.kind !== "job" ? "Seen" : row.state === "failed" ? "Requested" : "Promoted"} ${when(row.at)}`
     : c.role === "next" ? "Not requested"
     : "";
   const foot = () => {
