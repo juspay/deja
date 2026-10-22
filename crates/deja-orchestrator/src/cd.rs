@@ -223,11 +223,13 @@ pub fn promotion_checks(cfg: &CdConfig, f: &PromotionFacts) -> Vec<PromotionChec
     out
 }
 
-/// Whether a version name is a CalVer release (`2026.10.10.0`, or a hotfix
-/// of one, `2026.09.28.1-hotfix1`) rather than a merge's short sha. Only for
-/// a version first seen on an environment, which the pipeline never posted a
-/// kind for.
+/// Whether a version name is a release (a CalVer, `2026.10.10.0`, a hotfix
+/// of one, `2026.09.28.1-hotfix1`, or the pipeline's internal deploy tag on
+/// a promoted merge, `cd-2026.10.22.3`) rather than a merge's short sha.
+/// Only for a version first seen on an environment, which the pipeline never
+/// posted a kind for.
 pub fn kind_of_version_name(version: &str) -> &'static str {
+    let version = version.strip_prefix("cd-").unwrap_or(version);
     let base = version.split_once('-').map_or(version, |(b, _)| b);
     let parts: Vec<&str> = base.split('.').collect();
     let calver = parts.len() == 4
@@ -563,6 +565,10 @@ mod tests {
         assert_eq!(kind_of_version_name("2026.10.10.0"), "release");
         assert_eq!(kind_of_version_name("2026.10.12.11"), "release");
         assert_eq!(kind_of_version_name("2026.09.28.1-hotfix1"), "release");
+        assert_eq!(kind_of_version_name("cd-2026.10.22.3"), "release");
+        assert_eq!(kind_of_version_name("cd-2026.10.22.3-hotfix1"), "release");
+        assert_eq!(kind_of_version_name("cd-"), "merge");
+        assert_eq!(kind_of_version_name("cd-8eaddb0b85"), "merge");
         assert_eq!(kind_of_version_name("8eaddb0b85"), "merge");
         assert_eq!(kind_of_version_name("1.2.3.4"), "merge");
         assert_eq!(kind_of_version_name("8ead-db0b"), "merge");
