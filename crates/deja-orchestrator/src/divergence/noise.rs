@@ -211,21 +211,27 @@ fn hash_semantic_value(
     let mut scalar = false;
     let mut grouped = false;
     let mut ignored_header: Option<&str> = None;
-    for rule in rules
-        .iter()
-        .flatten()
-        .filter(|rule| rule_path(rule) == path)
-    {
-        match &rule.target {
-            NoiseTarget::Scalar { .. } => scalar = true,
-            NoiseTarget::HeaderGroup { .. } => grouped = true,
-            NoiseTarget::HeaderValue { name, .. } => {
-                if ignored_header.replace(name).is_some() {
-                    return None;
+    // A rule's pointer is relative to the decoded source, never the outer
+    // arguments. Activate targets only after the source branch above enters
+    // that document (or immediately when no source was configured).
+    if source.is_none() {
+        for rule in rules
+            .iter()
+            .flatten()
+            .filter(|rule| rule_path(rule) == path)
+        {
+            match &rule.target {
+                NoiseTarget::Scalar { .. } => scalar = true,
+                NoiseTarget::HeaderGroup { .. } => grouped = true,
+                NoiseTarget::HeaderValue { name, .. } => {
+                    if ignored_header.replace(name).is_some() {
+                        return None;
+                    }
                 }
             }
         }
     }
+
     if scalar {
         if grouped || ignored_header.is_some() || !scalar_value(value) {
             return None;
@@ -513,6 +519,35 @@ mod tests {
             semantic_digest(&signed_a, "api", "service", "send", None),
             semantic_digest(&signed_b, "api", "service", "send", None),
             "an unapproved signature difference must affect the delta key"
+        );
+    }
+    #[test]
+    fn decoded_source_rule_never_masks_a_same_named_outer_argument() {
+        use base64::Engine as _;
+        let policy = snapshot(
+            vec![NoiseTarget::Scalar {
+                json_pointer: "/signature".into(),
+            }],
+            Some("/request/data"),
+        );
+        let args = |outer: &str, inner: &str| {
+            let data = base64::engine::general_purpose::STANDARD
+                .encode(format!(r#"{{"signature":"{inner}","body":1}}"#));
+            serde_json::json!({"signature":outer,"request":{"data":data}})
+        };
+        let recorded = args("outer-a", "inner-a");
+        let inner_only = args("outer-a", "inner-b");
+        let outer_and_inner = args("outer-b", "inner-b");
+        assert!(matches(recorded.clone(), inner_only.clone(), &policy));
+        assert_eq!(
+            semantic_digest(&recorded, "api", "service", "send", Some(&policy)),
+            semantic_digest(&inner_only, "api", "service", "send", Some(&policy))
+        );
+        assert!(!matches(recorded.clone(), outer_and_inner.clone(), &policy));
+        assert_ne!(
+            semantic_digest(&recorded, "api", "service", "send", Some(&policy)),
+            semantic_digest(&outer_and_inner, "api", "service", "send", Some(&policy)),
+            "the outer signature was never approved"
         );
     }
 }

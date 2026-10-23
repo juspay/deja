@@ -108,7 +108,11 @@ pub fn semantic_differences(recorded: &Value, observed: &Value) -> Option<Vec<Id
         return Some(changes);
     }
     let mut changes = Vec::new();
-    semantic_same(recorded, observed, "$", &mut changes).then_some(changes)
+    if !semantic_same(recorded, observed, "$", &mut changes) {
+        return None;
+    }
+    changes.sort();
+    Some(changes)
 }
 
 fn semantic_same(
@@ -118,6 +122,10 @@ fn semantic_same(
     changes: &mut Vec<IdentityChange>,
 ) -> bool {
     if recorded == observed {
+        return true;
+    }
+    if same(recorded, observed) {
+        differences(recorded, observed, path, changes);
         return true;
     }
     match (recorded, observed) {
@@ -1303,6 +1311,28 @@ mod tests {
             Some(vec![
                 IdentityChange::ArrayOrder("$".into()),
                 IdentityChange::DocumentText("$[0].data".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn encoded_document_chain_keeps_existing_json_tolerances_elsewhere() {
+        use base64::Engine as _;
+        let encoded = |document: &str| base64::engine::general_purpose::STANDARD.encode(document);
+        let recorded = json!({
+            "encoded": encoded(r#"{"x":1,"y":2}"#),
+            "plain": r#"{"ids":[1,2]}"#
+        });
+        let observed = json!({
+            "encoded": encoded(r#"{"y":2,"x":1}"#),
+            "plain": r#"{"ids":[2,1]}"#
+        });
+        assert_eq!(identity_differences(&recorded, &observed), None);
+        assert_eq!(
+            semantic_differences(&recorded, &observed),
+            Some(vec![
+                IdentityChange::DocumentText("$.encoded".into()),
+                IdentityChange::DocumentText("$.plain".into()),
             ])
         );
     }
