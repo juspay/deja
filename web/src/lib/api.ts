@@ -1102,6 +1102,9 @@ export type CdPromotionReplayRow = {
   run_delta_against: string | null;
 };
 
+/** What a request recorded for one step: who or which build posted it and when, and the reason when it ended there. */
+export type CdPromotionStep = { reason?: string | null; jenkins_build?: string | null; by?: string; at?: string };
+
 /** A promotion request, as deja keeps it (migration 0013). */
 export type CdPromotion = {
   id: number;
@@ -1113,7 +1116,7 @@ export type CdPromotion = {
   requested_by: string;
   note: string | null;
   evidence: Record<string, unknown>;
-  step_detail: Record<string, { reason?: string | null; jenkins_build?: string | null; by?: string; at?: string } | undefined>;
+  step_detail: Record<string, CdPromotionStep | undefined>;
   picked_by_build: string | null;
   created_at: string;
   updated_at: string;
@@ -1154,6 +1157,9 @@ export const cdApi = {
     }),
   promotions: (system: string, environment: string, limit = 10) =>
     request<CdPromotion[]>(`/api/v1/cd/promotion-requests?${sys(system)}&environment=${encodeURIComponent(environment)}&limit=${limit}`),
+  /** Every environment's requests, newest first. */
+  promotionsAll: (system: string, limit = 50) => request<CdPromotion[]>(`/api/v1/cd/promotion-requests?${sys(system)}&limit=${limit}`),
+  promotion: (id: number) => request<CdPromotion>(`/api/v1/cd/promotion-requests/${id}`),
   cancelPromotion: (id: number) =>
     request<CdPromotion>(`/api/v1/cd/promotion-requests/${id}`, { method: "DELETE", credentials: "same-origin" }),
   markPromotionFailed: (id: number, reason: string) =>

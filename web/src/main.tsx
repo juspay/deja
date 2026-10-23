@@ -28,6 +28,8 @@ import AuditPage from "./pages/AuditPage";
 import DeploymentsPage, {
   EnvironmentPage,
   EnvironmentsPage,
+  PromotionPage,
+  PromotionsPage,
   PullRequestPage,
   VersionPage,
   VersionsPage,
@@ -195,6 +197,8 @@ const router = createBrowserRouter([
       { path: "/deployments/versions/:version", element: <VersionPage /> },
       { path: "/deployments/environments", element: <EnvironmentsPage /> },
       { path: "/deployments/environments/:env", element: <EnvironmentPage /> },
+      { path: "/deployments/promotions", element: <PromotionsPage /> },
+      { path: "/deployments/promotions/:id", element: <PromotionPage /> },
       { path: "/deployments/pull-requests/:owner/:repo/:number", element: <PullRequestPage /> },
     ],
   },

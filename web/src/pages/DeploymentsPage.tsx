@@ -1,19 +1,21 @@
 // Deployments: what runs in each environment, how it got there, and where
 // each version and pull request is. Every fact comes from the CD pipeline's
-// posts and the reconcile job's observations, through `/api/v1/cd/*`.
-// Promotion (phase 5) is not here yet, and no control for it is drawn until
-// it is. The one control is the pause switch.
+// posts and the reconcile job's observations, through `/api/v1/cd/*`. The
+// controls are the pause switch and, on a promotable environment, Promote:
+// a request the promote job picks up and reports step by step.
 //
 // BETA, for maintainers and environment upgraders: the API answers a signed-in
 // maintainer or upgrader (or the pipeline's token) only, and the tab is drawn
 // for them only.
 //
-// Five views under /deployments, all keyed by `?system=` so a link carries
+// Seven views under /deployments, all keyed by `?system=` so a link carries
 // the system it was read from:
-//   /deployments                                   pipeline
+//   /deployments                                   pipeline, with the release strip
 //   /deployments/versions                          merges and releases
 //   /deployments/versions/:version                 one version, its history
 //   /deployments/environments/:env                 one environment's history
+//   /deployments/promotions                        every promotion request
+//   /deployments/promotions/:id                    one request, step by step
 //   /deployments/pull-requests/:owner/:repo/:n     where a pull request is
 
 import React from "react";
@@ -27,11 +29,40 @@ import {
   type CdConfig,
   type CdDeploymentRow,
   type CdEnvironment,
+  type CdPromotion,
+  type CdPromotionCheck,
   type CdPromotionReplayRow,
   type CdVersionRow,
   type CdVersionWhere,
 } from "../lib/api";
-import { ago, agoText, argoOf, carries, promotionReplayWord, howOf, inFlight, isRunning, mergesSince, placesOf, promotionCandidates, promotionProgress, pullRequestOf, stateTone, when } from "../lib/cd";
+import {
+  ago,
+  agoText,
+  argoOf,
+  buildLink,
+  carriedBy,
+  carries,
+  howOf,
+  inFlight,
+  isRunning,
+  mergesSince,
+  placesOf,
+  promotionActivity,
+  promotionCandidates,
+  promotionFocus,
+  promotionPhrase,
+  promotionProgress,
+  PROMOTION_STEP_RUNNING,
+  promotionRail,
+  promotionReplayWord,
+  pullRequestOf,
+  releaseStrip,
+  releaseTagOf,
+  stateTone,
+  when,
+  type RailStep,
+  type StripCell,
+} from "../lib/cd";
 
 // ---- shared ---------------------------------------------------------------
 
@@ -184,11 +215,21 @@ function Frame({ title, crumb, children }: { title: React.ReactNode; crumb?: Rea
   const cfg = useCdConfig();
   const [system, setSystem] = useSystem(cfg.data);
   const here = useLocation().pathname;
-  const sub = (path: string, label: string, exact = false) => {
+  // How many requests are moving, for the Promotions tab's badge.
+  const moving = useQuery({
+    queryKey: ["cd", "promotions", system],
+    queryFn: () => cdApi.promotionsAll(system, 20),
+    enabled: !!system && !!cfg.data?.enabled,
+    refetchInterval: 30_000,
+    retry: false,
+  });
+  const running = (moving.data ?? []).filter(inFlight).length;
+  const sub = (path: string, label: string, exact = false, badge?: React.ReactNode) => {
     const on = exact ? here === path : here.startsWith(path);
     return (
       <Link className={on ? "cd-sub active" : "cd-sub"} to={href(path, system, cfg.data)}>
         {label}
+        {badge}
       </Link>
     );
   };
@@ -221,6 +262,7 @@ function Frame({ title, crumb, children }: { title: React.ReactNode; crumb?: Rea
         {sub("/deployments", "Pipeline", true)}
         {sub("/deployments/versions", "Versions")}
         {sub("/deployments/environments", "Environments")}
+        {sub("/deployments/promotions", "Promotions", false, running > 0 ? <i className="cd-subbadge">{running} running</i> : null)}
       </div>
       <PauseSwitch cfg={c} system={system} />
       {crumb && <div className="crumb">{crumb}</div>}
@@ -258,15 +300,48 @@ function HowCell({ row }: { row: CdDeploymentRow }) {
   return (
     <>
       {how.by}
-      {how.build && (
-        <>
-          {" · "}
-          <a href={how.build} target="_blank" rel="noreferrer">
-            build
-          </a>
-        </>
+      <BuildRef build={how.build} />
+    </>
+  );
+}
+
+/** ` · <job> #<n>` as the row names the build (never by URL, D10); an older
+ *  row's URL stays a link. */
+function BuildRef({ build }: { build: string | null | undefined }) {
+  const b = buildLink(build);
+  if (!b) return null;
+  return (
+    <>
+      {" · "}
+      {b.href ? (
+        <a href={b.href} target="_blank" rel="noreferrer">
+          {b.name}
+        </a>
+      ) : (
+        <span className="mono cd-build">{b.name}</span>
       )}
     </>
+  );
+}
+
+/** The `cd-` tag integ-deploy cut as the merge landed, whose image and
+ *  chart build in the background for the promotion (D8, D15). */
+function ReleaseTagRow({ rows }: { rows: (CdDeploymentRow | null | undefined)[] }) {
+  const c = releaseTagOf(rows);
+  if (!c) return null;
+  return (
+    <div className="cd-row">
+      <span className="l">Release tag</span>
+      {c.tag ? (
+        <span className="mono" title="Cut as the merge landed; its image and chart build in the background, so a promotion finds them ready">
+          {c.tag}
+        </span>
+      ) : (
+        <span className="err" title={c.error ?? ""}>
+          not tagged
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -363,8 +438,13 @@ function Pipeline({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
   const [first, second] = cfg.environments;
   const pending = second ? mergesSince(all, byName.get(second)?.live_version) : null;
 
+  const strips = cfg.environments.filter((env, i) => i > 0 && cfg.promotable.includes(env));
+
   return (
     <>
+      {strips.map((env) => (
+        <ReleaseStrip key={env} env={env} source={cfg.environments[cfg.environments.indexOf(env) - 1]} system={system} cfg={cfg} versions={versions.data?.versions.map((x) => x.version) ?? []} />
+      ))}
       <div className="cd-pipeline">
         {cfg.environments.map((env, i) => (
           <React.Fragment key={env}>
@@ -488,6 +568,7 @@ function EnvCard({
                 <VersionLink version={lv.released_from} system={system} cfg={cfg} />
               </div>
             )}
+            <ReleaseTagRow rows={[latest, live]} />
             <div className="cd-row">
               <span className="l">Last confirmed live</span>
               <span title={live.at}>
@@ -607,7 +688,8 @@ function Promotions({
             ))}
           </ol>
           <div className="hint">
-            #{current.id} by {current.requested_by} · {agoText(current.created_at)}{current.note ? ` · ${current.note}` : ""}
+            <Link to={href(`/deployments/promotions/${current.id}`, system, cfg)}>#{current.id}</Link> by {current.requested_by} · {agoText(current.created_at)}
+            {current.note ? ` · ${current.note}` : ""}
           </div>
           <div className="cd-promoactions">
             {current.state === "pending" && (
@@ -739,6 +821,460 @@ function PromoteDialog({
           <button className="btn" onClick={onClose}>
             Cancel
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- the release strip -------------------------------------------------------
+
+/** A promotable environment's releases in order: the two before the live
+ *  one, the live one, the request moving, and what comes next. */
+function ReleaseStrip({ env, source, system, cfg, versions }: { env: string; source: string; system: string; cfg: CdConfig; versions: CdVersionRow[] }) {
+  const history = useQuery({
+    queryKey: ["cd", "environment", system, env],
+    queryFn: () => cdApi.environmentDeployments(system, env),
+    refetchInterval: 15_000,
+  });
+  const promos = useQuery({ queryKey: ["cd", "promotions", system, env], queryFn: () => cdApi.promotions(system, env), refetchInterval: 10_000 });
+  if (!history.data || !promos.data) return null;
+  const cells = releaseStrip(history.data, versions, promos.data, source);
+  return (
+    <section className="cd-strippanel" aria-label={`${env} releases`}>
+      <div className="cd-striphead">
+        <h2>{env} releases</h2>
+        <span className="hint">earlier → live → moving → next</span>
+        <Link className="btn" to={href(`/deployments/environments/${encodeURIComponent(env)}`, system, cfg)}>
+          History
+        </Link>
+      </div>
+      <div className="cd-strip">
+        {cells.map((c) => (
+          <StripPlace key={c.role} c={c} system={system} cfg={cfg} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+const STRIP_HEADS: Record<StripCell["role"], string> = { earlier: "Earlier", previous: "Previous", live: "Live", promoting: "Promoting", next: "Next" };
+
+function StripPlace({ c, system, cfg }: { c: StripCell; system: string; cfg: CdConfig }) {
+  const row = c.row;
+  const how = row ? howOf(row) : null;
+  const top =
+    c.request ? `Requested ${when(c.request.created_at)} · ${c.request.requested_by}`
+    : row ? `${how?.kind !== "job" ? "Seen" : row.state === "failed" ? "Requested" : "Promoted"} ${when(row.at)}`
+    : c.role === "next" ? "Not requested"
+    : "";
+  const foot = () => {
+    if (c.request) {
+      return (
+        <>
+          <span className="chip pending">{c.note}</span>
+          <Link className="hint" to={href(`/deployments/promotions/${c.request.id}`, system, cfg)}>
+            #{c.request.id}
+          </Link>
+        </>
+      );
+    }
+    if (c.role === "live" && row) {
+      return (
+        <>
+          <ArgoChip row={row} />
+          <span className="hint">{ago(row.at)}</span>
+        </>
+      );
+    }
+    if (row) {
+      const [word, rest] = c.note.split(" · ");
+      return (
+        <>
+          <span className={`chip ${row.state === "failed" ? "failed" : "muted"}`}>{word}</span>
+          {rest && <span className="hint">{rest}</span>}
+        </>
+      );
+    }
+    if (c.role === "next" && !c.version) return <span className="hint">{c.note}</span>;
+    return <span className={`chip ${c.role === "next" && c.merges ? "pending" : "muted"}`}>{c.note}</span>;
+  };
+  return (
+    <div className={`cd-place cd-place-${c.role}`}>
+      <div className="cd-placehead">{STRIP_HEADS[c.role]}</div>
+      <div className="cd-placebody">
+        <span className="hint">{top}</span>
+        {c.version ? <VersionLink version={c.version} system={system} cfg={cfg} /> : <span className="cd-placeempty">—</span>}
+        <span className="hint">
+          {c.from ? (
+            <>
+              from <span className="mono">{c.from}</span>
+              {c.merges != null ? ` · ${c.merges} merge${c.merges === 1 ? "" : "s"}` : ""}
+            </>
+          ) : c.role === "live" && row ? (
+            c.note
+          ) : (
+            ""
+          )}
+        </span>
+        <div className="cd-placefoot">{foot()}</div>
+      </div>
+    </div>
+  );
+}
+
+// ---- promotions ---------------------------------------------------------------
+
+export function PromotionsPage() {
+  return (
+    <Frame title="Deployments">
+      {(cfg, system) => <PromotionsList cfg={cfg} system={system} />}
+    </Frame>
+  );
+}
+
+/** What a request is doing, in a few words, for a list. */
+function requestWord(p: CdPromotion): { word: string; tone: string } {
+  if (p.state === "live") return { word: "live", tone: "ok" };
+  if (p.state === "failed") return { word: "failed", tone: "failed" };
+  if (p.state === "cancelled") return { word: "cancelled", tone: "muted" };
+  return { word: promotionPhrase(p), tone: "pending" };
+}
+
+function PromotionsList({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; system: string }) {
+  const q = useQuery({ queryKey: ["cd", "promotions", system, "all"], queryFn: () => cdApi.promotionsAll(system, 100), refetchInterval: 10_000 });
+  if (q.isLoading) return <p className="hint">loading…</p>;
+  if (q.error) return <p className="err">{String(q.error)}</p>;
+  const rows = q.data ?? [];
+  const running = rows.filter(inFlight);
+  return (
+    <>
+      <p className="hint">
+        {running.length === 0 ? "Nothing moving." : `${running.length} moving.`} Every request made with Promote, newest first; open one for its steps.
+      </p>
+      {rows.length === 0 ? (
+        <div className="empty">
+          <div className="et">No promotions yet</div>
+          <p className="hint">Promote on the pipeline page writes one; the promote job picks it up and posts each step here.</p>
+        </div>
+      ) : (
+        <table className="cd-promotions">
+          <thead>
+            <tr>
+              <th>request</th>
+              <th>to</th>
+              <th>version</th>
+              <th>as</th>
+              <th>state</th>
+              <th>by</th>
+              <th>when</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((p) => {
+              const { word, tone } = requestWord(p);
+              return (
+                <tr key={p.id}>
+                  <td>
+                    <Link to={href(`/deployments/promotions/${p.id}`, system, cfg)}>#{p.id}</Link>
+                  </td>
+                  <td>{p.environment}</td>
+                  <td>
+                    <VersionLink version={p.from_version} system={system} cfg={cfg} />
+                  </td>
+                  <td>{p.release ? <VersionLink version={p.release} system={system} cfg={cfg} /> : <span className="hint">—</span>}</td>
+                  <td>
+                    <span className={`chip ${tone}`}>{word}</span>
+                    {p.state === "failed" && p.step_detail.failed?.reason && (
+                      <span className="hint" title={p.step_detail.failed.reason}>
+                        {" "}
+                        {p.step_detail.failed.reason.length > 60 ? p.step_detail.failed.reason.slice(0, 60) + "…" : p.step_detail.failed.reason}
+                      </span>
+                    )}
+                  </td>
+                  <td>
+                    {p.requested_by}
+                    {p.note && <div className="hint">{p.note}</div>}
+                  </td>
+                  <td className="hint" title={p.created_at}>
+                    {when(p.created_at)} · {agoText(p.created_at)}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      )}
+    </>
+  );
+}
+
+// ---- one promotion, step by step ---------------------------------------------
+
+export function PromotionPage() {
+  const { id = "" } = useParams();
+  const n = Number(id);
+  return (
+    <Frame
+      title="Deployments"
+      crumb={
+        <>
+          <Link to="/deployments/promotions">Promotions</Link>
+          <span>/</span>#{id}
+        </>
+      }
+    >
+      {(cfg, system) => (Number.isFinite(n) ? <PromotionDetail cfg={cfg} system={system} id={n} /> : <p className="err">not a request id</p>)}
+    </Frame>
+  );
+}
+
+const STEP_TONE: Record<RailStep["at"], { word: string; tone: string }> = {
+  done: { word: "done", tone: "ok" },
+  now: { word: "running", tone: "pending" },
+  todo: { word: "not yet", tone: "muted" },
+  failed: { word: "failed", tone: "failed" },
+  cancelled: { word: "cancelled", tone: "muted" },
+};
+
+function StepMark({ s, index }: { s: RailStep; index: number }) {
+  const text = s.at === "done" ? "✓" : s.at === "failed" ? "✕" : s.at === "cancelled" ? "–" : String(index + 1);
+  return (
+    <span className={`cd-si ${s.at}`} aria-hidden="true">
+      {text}
+    </span>
+  );
+}
+
+function PromotionDetail({ cfg, system, id }: { cfg: Extract<CdConfig, { enabled: true }>; system: string; id: number }) {
+  const q = useQuery({ queryKey: ["cd", "promotion", id], queryFn: () => cdApi.promotion(id), refetchInterval: 10_000 });
+  const versions = useQuery({ queryKey: ["cd", "versions", system], queryFn: () => cdApi.versions(system), refetchInterval: 30_000 });
+  const me = useMe();
+  const qc = useQueryClient();
+  const [sel, setSel] = React.useState<string | null>(null);
+  const refresh = () => {
+    void qc.invalidateQueries({ queryKey: ["cd", "promotion", id] });
+    void qc.invalidateQueries({ queryKey: ["cd", "promotions"] });
+    void qc.invalidateQueries({ queryKey: ["cd", "environments", system] });
+  };
+  const cancel = useMutation({ mutationFn: () => cdApi.cancelPromotion(id), onSuccess: refresh });
+  const fail = useMutation({ mutationFn: (reason: string) => cdApi.markPromotionFailed(id, reason), onSuccess: refresh });
+  if (q.isLoading || versions.isLoading) return <p className="hint">loading…</p>;
+  if (q.error) return (q.error as ApiError).status === 404 ? <div className="empty"><div className="et">No such request</div></div> : <p className="err">{String(q.error)}</p>;
+  if (versions.error) return <p className="err">{String(versions.error)}</p>;
+  if (!q.data) return null;
+  const p = q.data;
+  const rail = promotionRail(p);
+  const steps = rail.flatMap((g) => g.steps);
+  const current = steps.find((s) => s.step === sel) ?? promotionFocus(rail);
+  const all = versions.data?.versions ?? [];
+  const byName = new Map(all.map((x) => [x.version.version, x]));
+  const ev = p.evidence as { checks?: CdPromotionCheck[]; target_live?: string | null; from?: string };
+  const targetLive = ev.target_live ? byName.get(ev.target_live)?.version ?? null : null;
+  const carried = carriedBy(all.map((x) => x.version), p.from_version, targetLive);
+  const maintainer = (me.data?.roles ?? []).includes("maintainer");
+  const mine = me.data?.authenticated && me.data.email === p.requested_by;
+  const activity = promotionActivity(p);
+  const { word, tone } = STEP_TONE[current.at];
+  const d = current.detail;
+  const before = steps[steps.indexOf(current) - 1]?.detail?.at ?? null;
+  const running = PROMOTION_STEP_RUNNING[current.step];
+  const title = current.at === "now" ? running.charAt(0).toUpperCase() + running.slice(1) : current.label;
+  return (
+    <div className="cd-prom">
+      <aside className="cd-srail" aria-label="Promotion steps">
+        <div className="cd-srailhead">
+          <VersionLink version={p.release ?? p.from_version} system={system} cfg={cfg} />
+          <span className="hint">
+            from <VersionLink version={p.from_version} system={system} cfg={cfg} /> → {p.environment}
+          </span>
+          {ev.target_live && <span className="hint">replaces {ev.target_live}</span>}
+        </div>
+        {rail.map((g) => (
+          <div className="cd-sgrp" key={g.title}>
+            <span className="cd-cap">{g.title}</span>
+            {g.steps.map((s) => (
+              <button
+                key={s.step}
+                type="button"
+                className={`cd-sitem ${s.at}${s.step === current.step ? " on" : ""}`}
+                aria-current={s.step === current.step ? "step" : undefined}
+                onClick={() => setSel(s.step)}
+              >
+                <StepMark s={s} index={steps.indexOf(s)} />
+                <span>{s.label}</span>
+                <span className="hint">{s.detail?.at ? when(s.detail.at) : s.at === "now" && steps.indexOf(s) > 0 && steps[steps.indexOf(s) - 1].detail?.at ? ago(steps[steps.indexOf(s) - 1].detail!.at!) : ""}</span>
+              </button>
+            ))}
+          </div>
+        ))}
+        <div className="cd-srailfoot">
+          {p.state === "pending" && (mine || maintainer) && (
+            <button className="btn" disabled={cancel.isPending} onClick={() => cancel.mutate()}>
+              Cancel this promotion
+            </button>
+          )}
+          {inFlight(p) && p.state !== "pending" && maintainer && (
+            <button
+              className="btn"
+              disabled={fail.isPending}
+              title="For a request the promote job will not finish: frees the environment for the next one"
+              onClick={() => {
+                const reason = window.prompt("Why mark this promotion failed?");
+                if (reason && reason.trim()) fail.mutate(reason.trim());
+              }}
+            >
+              Mark failed
+            </button>
+          )}
+          <span className="hint">
+            {p.state === "pending"
+              ? "Cancel works while the request is pending, before the job picks it up."
+              : inFlight(p)
+                ? "Once picked, the job finishes or fails the request; a maintainer can end one the job will not finish."
+                : p.finished_at
+                  ? `Ended ${when(p.finished_at)}.`
+                  : ""}
+          </span>
+          {(cancel.error || fail.error) && <div className="err">{String(cancel.error ?? fail.error)}</div>}
+        </div>
+      </aside>
+
+      <div className="cd-pane">
+        <h2 className="cd-panetitle">
+          {title} <span className={`chip ${tone}`}>{word}</span>
+        </h2>
+        <dl className="cd-facts">
+          {d?.at && (
+            <div>
+              <dt>when</dt>
+              <dd title={d.at}>
+                {when(d.at)} · {agoText(d.at)}
+              </dd>
+            </div>
+          )}
+          {d?.by && (
+            <div>
+              <dt>by</dt>
+              <dd>{d.by}</dd>
+            </div>
+          )}
+          {(d?.jenkins_build || (current.step !== "pending" && p.picked_by_build)) && (
+            <div>
+              <dt>jenkins</dt>
+              <dd className="mono">{d?.jenkins_build ?? p.picked_by_build}</dd>
+            </div>
+          )}
+          {current.step === "tagged" && p.release && (
+            <div>
+              <dt>tag</dt>
+              <dd>
+                <span className="mono">{p.release}</span> on <span className="mono">{p.from_version}</span>
+              </dd>
+            </div>
+          )}
+          {current.step === "built" && p.release && (
+            <div>
+              <dt>image · chart</dt>
+              <dd className="mono">{byName.get(p.release)?.version.image_tag ?? p.release} · {byName.get(p.release)?.version.chart ?? "—"}</dd>
+            </div>
+          )}
+          {current.step === "pending" && p.note && (
+            <div>
+              <dt>note</dt>
+              <dd>{p.note}</dd>
+            </div>
+          )}
+          {d?.reason && (
+            <div>
+              <dt>reason</dt>
+              <dd className="cd-reason">{d.reason}</dd>
+            </div>
+          )}
+          {!d && current.at === "now" && before && (
+            <div>
+              <dt>since</dt>
+              <dd title={before}>
+                {when(before)} · {ago(before)}
+              </dd>
+            </div>
+          )}
+          {!d && current.at === "todo" && <div className="hint">Not reached.</div>}
+        </dl>
+
+        <section>
+          <h2>What this promotion carries</h2>
+          {carried === null ? (
+            <p className="hint">
+              Not known: {ev.target_live ? `${ev.target_live}, which ${p.environment} ran, names no merge it was cut on` : `nothing was recorded on ${p.environment} when it was requested`}.
+            </p>
+          ) : (
+            <>
+              <p className="hint">
+                {carried.length} merge{carried.length === 1 ? "" : "s"} since {ev.target_live}, newest first.
+              </p>
+              <table>
+                <thead>
+                  <tr>
+                    <th>version</th>
+                    <th>pull request</th>
+                    <th>promotion replay</th>
+                    <th>merged</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {carried.map((v) => (
+                    <tr key={v.version}>
+                      <td>
+                        <VersionLink version={v.version} system={system} cfg={cfg} />
+                      </td>
+                      <td>
+                        <PrCell v={v} />
+                      </td>
+                      <td>
+                        <PromotionReplayChip replay={byName.get(v.version)?.promotion_replay} />
+                      </td>
+                      <td className="hint" title={v.merged_at ?? ""}>
+                        {v.merged_at ? when(v.merged_at) : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+        </section>
+
+        <div className="cd-two">
+          <section>
+            <h2>Activity</h2>
+            <ol className="cd-events">
+              {activity.map((e, i) => (
+                <li key={i}>
+                  <span className="hint" title={e.at}>
+                    {when(e.at)}
+                  </span>
+                  <span>
+                    <b>{e.by}</b> {e.what}
+                  </span>
+                </li>
+              ))}
+            </ol>
+          </section>
+          <section>
+            <h2>Checks at press</h2>
+            {ev.checks?.length ? (
+              <ul className="cd-checks">
+                {ev.checks.map((c) => (
+                  <li key={c.id} className={c.ok ? "ok" : "no"}>
+                    <span className={`chip ${c.ok ? "ok" : "failed"}`}>{c.ok ? "pass" : "fail"}</span> {c.why}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="hint">Not recorded.</p>
+            )}
+          </section>
         </div>
       </div>
     </div>
@@ -915,6 +1451,24 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
           <dt>merged</dt>
           <dd>{v.merged_at ? when(v.merged_at) : "—"}</dd>
         </div>
+        {v.kind === "merge" && releaseTagOf(rows) && (
+          <div>
+            <dt>release tag</dt>
+            <dd>
+              {releaseTagOf(rows)!.tag ? (
+                <>
+                  <span className="mono">{releaseTagOf(rows)!.tag}</span>
+                  <div className="hint">cut as the merge landed; its image and chart build in the background</div>
+                </>
+              ) : (
+                <>
+                  <span className="err">not tagged</span>
+                  <div className="hint">{releaseTagOf(rows)!.error}</div>
+                </>
+              )}
+            </dd>
+          </div>
+        )}
       </dl>
 
       <section>
@@ -1037,14 +1591,7 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
                   </td>
                   <td>
                     {h.requested_by}
-                    {h.jenkins_build && (
-                      <>
-                        {" · "}
-                        <a href={h.jenkins_build} target="_blank" rel="noreferrer">
-                          build
-                        </a>
-                      </>
-                    )}
+                    <BuildRef build={h.jenkins_build} />
                   </td>
                 </tr>
               ))}

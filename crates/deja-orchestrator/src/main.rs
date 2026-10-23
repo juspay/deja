@@ -413,7 +413,10 @@ fn app_router(state: AppState) -> Router {
         )
         .route("/cd/environments/{env}/promotions", promote)
         .route("/cd/promotion-requests", promotions)
-        .route("/cd/promotion-requests/{id}", promotion_cancel)
+        .route(
+            "/cd/promotion-requests/{id}",
+            cd_read(get(v1_cd_promotion_get)).merge(promotion_cancel),
+        )
         .route("/cd/promotion-requests/{id}/fail", promotion_fail)
         .route("/cd/promotion-requests/{id}/{step}", promotion_step)
         .route(
@@ -4915,6 +4918,20 @@ async fn v1_cd_promotion_step(
             json_ok_ser(&row)
         }
         Err(e) => step_refusal(e, &step),
+    }
+}
+
+/// `GET /api/v1/cd/promotion-requests/{id}`: one request with every step it
+/// has reached, for the promotion page.
+async fn v1_cd_promotion_get(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.cd_promotion_get(id).await {
+        Ok(Some(row)) => json_ok_ser(&row),
+        Ok(None) => error_resp(404, "no such promotion request"),
+        Err(e) => error_resp(500, &format!("promotion: {e}")),
     }
 }
 
