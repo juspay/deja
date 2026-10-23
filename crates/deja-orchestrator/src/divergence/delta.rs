@@ -182,10 +182,6 @@ pub struct Delta {
     pub m_run: String,
     pub y_run: String,
     pub canon_version: u32,
-    /// Cache discriminator for this semantic comparison format. Version 6
-    /// was also used by an unmerged draft with different tree contents.
-    #[serde(default)]
-    pub semantic_revision: u8,
     pub verdict: DeltaVerdict,
     pub buckets: BTreeMap<Bucket, usize>,
     pub lanes: Vec<LaneSummary>,
@@ -268,9 +264,6 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             "the two trees were built under different rules ({} and {}); rebuild one before comparing",
             m.canon_version, y.canon_version
         ));
-    }
-    if m.semantic_revision != 1 || y.semantic_revision != 1 {
-        return Err("the two trees lack the current semantic comparison format".into());
     }
     if m.policy_digest != y.policy_digest {
         return Err(format!(
@@ -501,7 +494,6 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         m_run: m.run_id.clone(),
         y_run: y.run_id.clone(),
         canon_version: m.canon_version,
-        semantic_revision: 1,
         verdict: DeltaVerdict {
             pass,
             introduced,
@@ -578,7 +570,6 @@ mod tests {
         BehaviourTree {
             run_id: run.into(),
             canon_version: CANON_VERSION,
-            semantic_revision: 1,
             entries: entries
                 .into_iter()
                 .map(|(address, value)| Entry {

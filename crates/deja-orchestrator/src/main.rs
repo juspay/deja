@@ -3229,7 +3229,6 @@ fn read_or_build_tree(
         .and_then(|t| BehaviourTree::from_jsonl(&t))
         .filter(|t| {
             t.canon_version == behaviour_tree::CANON_VERSION
-                && t.semantic_revision == 1
                 && t.policy_digest.as_deref() == policy_digest
         })
     {
@@ -3477,6 +3476,9 @@ async fn delta_between(
             .map(|p| serde_json::to_value(&p.candidate_spec).unwrap_or_default())
     };
     let mut body = serde_json::to_value(&delta).unwrap_or_default();
+    // Cache-only marker distinguishes this final v6 computation from v6
+    // documents produced by a superseded draft; no Delta API field is needed.
+    body["semantic_revision"] = serde_json::json!(1);
     // Recorded in the body so a cached copy shows it passed the check.
     divergence::tape::record_tape_check(&mut body, y_id, Some(&y_report), m_id, Some(&m_report))
         .map_err(refuse)?;
