@@ -350,6 +350,52 @@ After the replay run, the observed and shadow boundary calls are compared agains
 
 The orchestrator adds cause-vs-consequence lanes: `ValueDivergedOrigin` marks the originating read so downstream consequences are attributed to it, alongside omitted/novel/environmental/`inconclusive_race` lanes.
 
+Argument identity is evaluated **before the scorer declares a request
+divergent**. The comparison-only chain recognizes a bounded standard-base64
+string containing UTF-8 JSON, parses its document, and compares JSON object
+members structurally; decoded arrays remain positional. Inline JSON already
+has structural comparison. Malformed encodings, non-document text, changed
+JSON values, and changed surrounding arguments are not treated as equal.
+This scorer rule has no boundary, operation, or vendor condition.
+
+A fixed candidate image still executes its own compiled lookup policy. If it
+used the args-free fallback, it will have stamped `arg_divergent` before the
+orchestrator observes the call. The scorer checks that the call paired with
+the *recorded event it actually served*, then evaluates the generic semantic
+chain **before its own divergence verdict**. It does not change lookup keys,
+the candidate's flag, the recording, or the candidate image. An unpaired
+serve or independent order mismatch remains blocking.
+
+For residual differences whose semantics cannot be proved by decoding, an
+authenticated maintainer can propose a **per-system noise rule** selecting an
+exact boundary/trait/method and one typed target: a scalar JSON Pointer,
+header-name group presentation, or one named header value. The source can be
+raw arguments or a declared JSON Pointer to base64-encoded UTF-8 JSON.
+Everything outside approved targets is still compared; repeated values of
+one header name retain their order. Approving a signature value declares
+noise; Deja has no signing key and does **not** verify its HMAC.
+
+Proposals are immutable and audited; a different signed-in maintainer must
+activate one. A run pins the revision at admission. To **revoke** an allowance
+once its root cause is fixed, propose a new revision without that rule and
+have a different maintainer activate it; existing run snapshots and raw
+ledger arguments remain unchanged. An empty revision disables all approved
+noise. Dashboard preview streams bounded historical ledger classifications
+without returning payloads and refuses to promise absorption without trusted
+paired-serve evidence. Only a new replay proves the full effect. Scorecards
+and cached behavior trees record the policy digest; three-way delta refuses
+comparison across different digests instead of presenting differently
+judged runs as one candidate change.
+
+When both replays make the same genuine JSON change from the tape but encode
+it differently, a trustworthy paired ledger row carries a semantic digest of
+the observed arguments. The digest canonicalizes decoded documents and only
+the active revision's approved noise targets. The behavior tree uses that
+digest for a still-divergent call, so three-way delta inherits common semantic
+drift instead of comparing base64 renderings or declared volatile header
+values. Untrusted pairing falls back to the raw hash; no signature is
+cryptographically verified.
+
 The blocking-vs-drift policy is **built, declared, and judged** — not open. Boundaries declare canonicalization presets applied by the scorer before judging (never by runtime routing): `final_state`, `absent_after`, `project{include,exclude}`. Volatile columns are declared `project:!created_at,!last_synced,!modified_at` on the DB row seams with a matching `reply_canon` on `http_incoming`. Blocking vs non-blocking is explicit in the verdict: seed gaps, order-nondeterminism, and idempotent-delete lines are non-blocking; evidence-gated `inconclusive_race` rows (recognized only when the run's HTTP layer is clean) make the verdict `inconclusive` with an auto-rerun recommendation — a race-only run can never pass.
 
 The comparator produces a `ReplayReport` and a scorecard containing a Summary (matched/total correlations, side-effect and value divergences, inconclusive races/seed gaps), per-boundary and per-correlation breakdowns, warnings, and a three-state `Verdict {pass, inconclusive, reason}`. Latency/resource scoring does not exist today; if added it would be future work.

@@ -18,6 +18,7 @@ import "json-diff-kit/dist/viewer.css";
 import "./styles.css";
 import { SIGN_IN_EVENT, actor, api, setActor } from "./lib/api";
 import { loginUrl, useMe } from "./lib/me";
+import { useSystems } from "./lib/systems";
 import RecordingsPage from "./pages/RecordingsPage";
 import NewRunPage from "./pages/NewRunPage";
 import RunsPage from "./pages/RunsPage";
@@ -36,6 +37,7 @@ import DeploymentsPage, {
 } from "./pages/DeploymentsPage";
 import LoginPage from "./pages/LoginPage";
 
+import BoundaryPolicyPage from "./pages/BoundaryPolicyPage";
 const queryClient = new QueryClient({
   defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
 });
@@ -128,12 +130,13 @@ function ActorBox() {
 function Shell() {
   const loc = useLocation();
   const me = useMe();
-  // Deployments is in beta: the tab is drawn for a signed-in maintainer or an
-  // environment's upgrader, the people who press Promote (the API refuses
-  // everyone else anyway).
+  const systems = useSystems();
+  // Policy changes require a maintainer. Deployment readers also include
+  // environment upgraders, whose API actions have separate authorization.
   const roles = me.data?.roles ?? [];
-  const maintainer =
-    !!me.data?.configured && !!me.data.authenticated && roles.some((r) => r === "maintainer" || r.endsWith("_upgrader"));
+  const signedIn = !!me.data?.configured && !!me.data.authenticated;
+  const maintainer = signedIn && roles.includes("maintainer");
+  const deploymentsReader = signedIn && roles.some((role) => role === "maintainer" || role.endsWith("_upgrader"));
   const tab = (path: string, label: string, exact = false, beta = false) => {
     const on = exact ? loc.pathname === path : loc.pathname.startsWith(path);
     return (
@@ -151,7 +154,8 @@ function Shell() {
           {tab("/", "New run", true)}
           {tab("/runs", "Runs")}
           {tab("/recordings", "Recordings")}
-          {maintainer && tab("/deployments", "Deployments", false, true)}
+          {deploymentsReader && tab("/deployments", "Deployments", false, true)}
+          {maintainer && <Link className={loc.pathname.startsWith("/systems/") ? "tab active" : "tab"} to={systems.defaultSystem ? `/systems/${encodeURIComponent(systems.defaultSystem.name)}/boundary-policy` : "/"}>Boundary policy<span className="beta">beta</span></Link>}
           {tab("/audit", "Audit")}
         </nav>
         <Identity />
@@ -191,6 +195,7 @@ const router = createBrowserRouter([
       { path: "/runs/:runId", element: <LegacyRunRedirect /> },
       { path: "/runs/:runId/scorecard", element: <LegacyRunRedirect /> },
       { path: "/recordings", element: <RecordingsPage /> },
+      { path: "/systems/:system/boundary-policy", element: <BoundaryPolicyPage /> },
       { path: "/audit", element: <AuditPage /> },
       { path: "/deployments", element: <DeploymentsPage /> },
       { path: "/deployments/versions", element: <VersionsPage /> },

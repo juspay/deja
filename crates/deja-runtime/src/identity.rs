@@ -26,6 +26,8 @@
 
 use serde_json::Value;
 
+/// Maximum size of decoded JSON accepted by the scorer-only base64 path.
+const MAX_ENCODED_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// A captured request body is hashed by its content (see
 /// `replay::hash_request_body`); its identity is that content's, so two calls
 /// the exact hash finds the same are always the same identity.
@@ -91,6 +93,173 @@ pub fn identity_differences(recorded: &Value, observed: &Value) -> Option<Vec<Id
     differences(recorded, observed, "$", &mut changes);
     changes.sort();
     Some(changes)
+}
+
+/// Scorer-only identity chain: decode eligible base64 UTF-8 JSON documents
+/// before deciding whether a paired call's arguments differ. This deliberately
+/// does not change `same`, `identity_args_hash`, or lookup policy: a fixed
+/// candidate still probes the addresses its compiled runtime understands.
+///
+/// Within decoded JSON, object keys are structural and arrays are positional.
+/// The legacy comparison runs first, so existing unencoded identity semantics
+/// remain unchanged.
+pub fn semantic_differences(recorded: &Value, observed: &Value) -> Option<Vec<IdentityChange>> {
+    if let Some(changes) = identity_differences(recorded, observed) {
+        return Some(changes);
+    }
+    let mut changes = Vec::new();
+    semantic_same(recorded, observed, "$", &mut changes).then_some(changes)
+}
+
+fn semantic_same(
+    recorded: &Value,
+    observed: &Value,
+    path: &str,
+    changes: &mut Vec<IdentityChange>,
+) -> bool {
+    if recorded == observed {
+        return true;
+    }
+    match (recorded, observed) {
+        (Value::String(left), Value::String(right)) => {
+            let (Some(left), Some(right)) = (semantic_document(left), semantic_document(right))
+            else {
+                return false;
+            };
+            if left != right {
+                return false;
+            }
+            changes.push(IdentityChange::DocumentText(path.to_owned()));
+            true
+        }
+        (Value::Object(left), Value::Object(right)) if left.len() == right.len() => {
+            left.iter().all(|(key, value)| {
+                let Some(other) = right.get(key) else {
+                    return false;
+                };
+                if is_byte_string(key, value) || is_byte_string(key, other) {
+                    return member_same(key, value, other);
+                }
+                value == other || semantic_same(value, other, &format!("{path}.{key}"), changes)
+            })
+        }
+        (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
+            let Some(partners) = semantic_matching(left, right) else {
+                return false;
+            };
+            if partners
+                .iter()
+                .enumerate()
+                .any(|(index, partner)| index != *partner)
+            {
+                changes.push(IdentityChange::ArrayOrder(path.to_owned()));
+            }
+            left.iter()
+                .zip(partners)
+                .enumerate()
+                .all(|(index, (value, partner))| {
+                    value == &right[partner]
+                        || semantic_same(
+                            value,
+                            &right[partner],
+                            &format!("{path}[{index}]"),
+                            changes,
+                        )
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The lookup hash is deliberately unchanged. This hash is only a bucket key
+/// for the scorer's fallback matching; every candidate is confirmed by
+/// `semantic_same`, so collisions cannot turn different calls into matches.
+fn semantic_hash(value: &Value) -> u64 {
+    let tagged = |tag: u64, inner: u64| finalise(tag ^ inner.rotate_left(17));
+    match value {
+        Value::String(text) => semantic_document(text)
+            .map(|document| tagged(0x7365_6d64_6f63, element_hash(&document)))
+            .unwrap_or_else(|| element_hash(value)),
+        Value::Object(map) => {
+            let sum = map.iter().fold(0u64, |sum, (key, member)| {
+                let member_hash = if is_byte_string(key, member) {
+                    match byte_document(member) {
+                        Some(document) => tagged(0x0062_7974_6564_6f63, element_hash(&document)),
+                        None => tagged(0x6279_7465, element_hash(member)),
+                    }
+                } else {
+                    semantic_hash(member)
+                };
+                let key_hash = crate::fnv1a_str(crate::FNV_OFFSET_BASIS, key);
+                sum.wrapping_add(finalise(key_hash ^ member_hash.rotate_left(29)))
+            });
+            tagged(0x7365_6d6f_626a, sum)
+        }
+        Value::Array(items) => {
+            let sum = items
+                .iter()
+                .fold(0u64, |sum, item| sum.wrapping_add(semantic_hash(item)));
+            tagged(0x7365_6d61_7272, sum)
+        }
+        _ => element_hash(value),
+    }
+}
+
+fn semantic_matching(left: &[Value], right: &[Value]) -> Option<Vec<usize>> {
+    use std::collections::{HashMap, VecDeque};
+    if left.len() != right.len() {
+        return None;
+    }
+    let mut buckets: HashMap<u64, VecDeque<usize>> = HashMap::new();
+    let left_hashes: Vec<_> = left.iter().map(semantic_hash).collect();
+    let right_hashes: Vec<_> = right.iter().map(semantic_hash).collect();
+    for (index, hash) in right_hashes.iter().enumerate() {
+        buckets.entry(*hash).or_default().push_back(index);
+    }
+    let mut used = vec![false; right.len()];
+    let mut partners = vec![None; left.len()];
+    for (index, value) in left.iter().enumerate() {
+        if left_hashes[index] == right_hashes[index]
+            && semantic_same(value, &right[index], "", &mut Vec::new())
+        {
+            used[index] = true;
+            partners[index] = Some(index);
+        }
+    }
+    for (index, value) in left.iter().enumerate() {
+        if partners[index].is_some() {
+            continue;
+        }
+        let hash = left_hashes[index];
+        let bucket = buckets.get_mut(&hash)?;
+        let position = bucket.iter().position(|&other| {
+            !used[other] && semantic_same(value, &right[other], "", &mut Vec::new())
+        })?;
+        let other = bucket.remove(position)?;
+        used[other] = true;
+        partners[index] = Some(other);
+    }
+    partners.into_iter().collect()
+}
+
+/// A bounded inline or standard-base64 UTF-8 JSON object/array. The scorer
+/// uses the same chain for pairwise comparison and its semantic delta digest.
+pub fn semantic_document(text: &str) -> Option<Value> {
+    embedded_document(text).or_else(|| encoded_document(text))
+}
+
+fn encoded_document(text: &str) -> Option<Value> {
+    use base64::Engine as _;
+    if text.len() < 4 || text.len() > MAX_ENCODED_DOCUMENT_BYTES * 2 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
+    if bytes.len() > MAX_ENCODED_DOCUMENT_BYTES {
+        return None;
+    }
+    embedded_document(std::str::from_utf8(&bytes).ok()?)
 }
 
 /// Whether two values are one identity: arrays compared as multisets, objects
@@ -412,6 +581,77 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn base64(text: &str) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = text.as_bytes();
+        let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let a = chunk[0];
+            let b = *chunk.get(1).unwrap_or(&0);
+            let c = *chunk.get(2).unwrap_or(&0);
+            encoded.push(TABLE[(a >> 2) as usize] as char);
+            encoded.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize] as char);
+            encoded.push(if chunk.len() > 1 {
+                TABLE[(((b & 15) << 2) | (c >> 6)) as usize] as char
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                TABLE[(c & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        encoded
+    }
+
+    #[test]
+    fn semantic_comparison_accepts_generic_encoded_boundary_documents() {
+        let recorded = json!({
+            "boundary": "ledger",
+            "args": { "payload": base64(r#"{"nested":{"b":2,"a":1}}"#) }
+        });
+        let reordered = json!({
+            "boundary": "ledger",
+            "args": { "payload": base64(r#"{"nested":{"a":1,"b":2}}"#) }
+        });
+        assert!(identity_differences(&recorded, &reordered).is_none());
+        assert!(semantic_differences(&recorded, &reordered).is_some());
+    }
+
+    #[test]
+    fn semantic_comparison_detects_encoded_value_changes() {
+        let recorded = json!({ "payload": base64(r#"{"nested":{"value":1}}"#) });
+        let changed = json!({ "payload": base64(r#"{"nested":{"value":2}}"#) });
+        assert!(semantic_differences(&recorded, &changed).is_none());
+    }
+
+    #[test]
+    fn semantic_comparison_keeps_malformed_or_ciphertext_exact() {
+        let malformed = json!({ "payload": "not base64" });
+        let other = json!({ "payload": "also not base64" });
+        assert!(semantic_differences(&malformed, &other).is_none());
+
+        let ciphertext = json!({ "payload": base64("opaque ciphertext") });
+        let different_ciphertext = json!({ "payload": base64("other ciphertext") });
+        assert!(semantic_differences(&ciphertext, &different_ciphertext).is_none());
+    }
+
+    #[test]
+    fn semantic_comparison_preserves_decoded_array_order() {
+        let recorded = json!({ "payload": base64(r#"{"items":[1,2]}"#) });
+        let reordered = json!({ "payload": base64(r#"{"items":[2,1]}"#) });
+        assert!(semantic_differences(&recorded, &reordered).is_none());
+    }
+
+    #[test]
+    fn semantic_comparison_keeps_inline_and_encoded_json_distinct() {
+        let inline = json!({ "payload": r#"{"a":1}"# });
+        let encoded = json!({ "payload": base64(r#"{"a":1}"#) });
+        assert!(identity_differences(&inline, &encoded).is_none());
+        assert!(semantic_differences(&inline, &encoded).is_some());
+    }
     /// Arrays are multisets everywhere, with no exceptions: a tuple, a pair, a
     /// row, numbers and nulls are one identity in any order. Multiplicity
     /// counts: a repeated member is not the same as one.
@@ -1005,6 +1245,65 @@ mod tests {
             Some(vec![IdentityChange::ArrayOrder(
                 "$.body.json.ids".to_owned()
             )])
+        );
+    }
+
+    #[test]
+    fn encoded_json_is_compared_semantically_only_by_the_scorer() {
+        use base64::Engine as _;
+        let encoded = |document: &str| base64::engine::general_purpose::STANDARD.encode(document);
+        let args = |data: String, merchant: &str| json!({"method":"POST","request":{"data":data,"merchant":merchant}});
+        let recorded = args(encoded(r#"{"a":1,"b":[1,2]}"#), "m1");
+        let reordered = args(encoded(r#"{"b":[1,2],"a":1}"#), "m1");
+        assert_eq!(identity_differences(&recorded, &reordered), None);
+        assert_eq!(
+            semantic_differences(&recorded, &reordered),
+            Some(vec![IdentityChange::DocumentText("$.request.data".into())])
+        );
+        assert_eq!(
+            semantic_differences(&recorded, &args(encoded(r#"{"a":2,"b":[1,2]}"#), "m1")),
+            None,
+            "changed JSON values are not representation noise"
+        );
+        assert_eq!(
+            semantic_differences(&recorded, &args(encoded(r#"{"a":1,"b":[2,1]}"#), "m1")),
+            None,
+            "decoded JSON arrays remain positional"
+        );
+        assert_eq!(
+            semantic_differences(&recorded, &args(encoded(r#"{"a":1,"b":[1,2]}"#), "m2")),
+            None,
+            "other argument fields remain exact"
+        );
+        assert_eq!(
+            semantic_differences(
+                &args(encoded("not json"), "m1"),
+                &args(encoded("different"), "m1")
+            ),
+            None,
+            "non-document text is not silently normalized"
+        );
+    }
+
+    #[test]
+    fn outer_multiset_order_and_encoded_json_rendering_can_change_together() {
+        use base64::Engine as _;
+        let encoded = |document: &str| base64::engine::general_purpose::STANDARD.encode(document);
+        let recorded = json!([
+            {"operation":"a","data":encoded(r#"{"x":1,"y":2}"#)},
+            {"operation":"b","data":"unchanged"}
+        ]);
+        let observed = json!([
+            {"operation":"b","data":"unchanged"},
+            {"operation":"a","data":encoded(r#"{"y":2,"x":1}"#)}
+        ]);
+        assert_eq!(identity_differences(&recorded, &observed), None);
+        assert_eq!(
+            semantic_differences(&recorded, &observed),
+            Some(vec![
+                IdentityChange::ArrayOrder("$".into()),
+                IdentityChange::DocumentText("$[0].data".into()),
+            ])
         );
     }
 }

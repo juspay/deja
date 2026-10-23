@@ -42,7 +42,11 @@ use super::ledger::CallRecord;
 /// 5: a whole-body difference the kernel could only report as raw bytes is
 ///    hashed by the candidate's decoded body, so the map order serialised
 ///    into those bytes is not behaviour either.
-pub const CANON_VERSION: u32 = 5;
+/// 6: paired argument verdicts use semantic JSON and pinned maintainer noise
+///    rules; divergent tree values hash normalized semantic arguments rather
+///    than representation bytes. The run's immutable policy digest is part of
+///    its comparison identity.
+pub const CANON_VERSION: u32 = 6;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -138,6 +142,9 @@ pub struct BehaviourTree {
     /// when these agree; otherwise an encoding change reads as behaviour.
     #[serde(default)]
     pub event_schema_versions: BTreeSet<u32>,
+    /// Immutable boundary policy used for this run; absent on legacy runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_digest: Option<String>,
 }
 
 /// The event schema versions named in an observed stream. Every event carries
@@ -315,15 +322,21 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             lanes.entry(correlation.clone()).or_insert(lane);
         }
         let observed_hash = || {
-            row.observed
-                .as_ref()
-                .and_then(|s| s.args.as_ref())
-                .map(hash_of)
-                .unwrap_or_else(|| "∅".to_owned())
+            row.semantic_digest.as_ref().map_or_else(
+                || {
+                    row.observed
+                        .as_ref()
+                        .and_then(|side| side.args.as_ref())
+                        .map(hash_of)
+                        .unwrap_or_else(|| "∅".to_owned())
+                },
+                |digest| format!("semantic:{digest}"),
+            )
         };
         let value = match row.kind.as_str() {
             // A served call returned exactly the value the recording holds.
             "matched"
+            | "approved_noise"
             | "recovered"
             | "identity_skew"
             | "deterministic"
@@ -424,6 +437,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
         lanes,
         correlations,
         event_schema_versions: BTreeSet::new(),
+        policy_digest: None,
     }
 }
 
@@ -469,6 +483,7 @@ impl BehaviourTree {
                 "lanes": self.lanes,
                 "correlations": self.correlations,
                 "event_schema_versions": self.event_schema_versions,
+                "policy_digest": self.policy_digest,
             })
             .to_string(),
         );
@@ -507,6 +522,7 @@ impl BehaviourTree {
                 head.get("event_schema_versions")?.clone(),
             )
             .ok()?,
+            policy_digest: head.get("policy_digest")?.as_str().map(str::to_owned),
         })
     }
 
@@ -520,6 +536,22 @@ impl BehaviourTree {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn policy_digest_roundtrips_and_rejects_old_draft_cache_header() {
+        let mut tree = build("run", &[], &[]);
+        tree.policy_digest = Some("policy-sha256".into());
+        let encoded = tree.to_jsonl();
+        assert_eq!(
+            BehaviourTree::from_jsonl(&encoded).unwrap().policy_digest,
+            tree.policy_digest
+        );
+
+        // The superseded draft's version-6 header lacked the policy key.
+        // Refuse that cache even though its numeric version happens to match:
+        // its call entries were built under different semantics.
+        let prior_draft = encoded.replace(",\"policy_digest\":\"policy-sha256\"", "");
+        assert!(BehaviourTree::from_jsonl(&prior_draft).is_none());
+    }
     use super::*;
     use crate::divergence::ledger::CallSide;
 
@@ -534,6 +566,8 @@ mod tests {
             correlation_id: Some(corr.to_owned()),
             source_event_global_sequence: source_seq,
             served_event_global_sequence: None,
+            semantic_pair: false,
+            semantic_digest: None,
             boundary: "http_outgoing".to_owned(),
             trait_name: "svc".to_owned(),
             method_name: "call_connector_api".to_owned(),

@@ -1019,6 +1019,7 @@ mod tests {
             unplanted_presence: Default::default(),
             scored_span_namespaces: Vec::new(),
             reply_canons: Default::default(),
+            boundary_policy: None,
             run_id: "run-1".to_owned(),
             recording_id: Some("rec-1".to_owned()),
             table,

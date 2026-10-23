@@ -106,10 +106,22 @@ pub struct CallRecord {
     /// `source_event_global_sequence` is the twin the pairing judged it against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_event_global_sequence: Option<u64>,
+    /// This row paired to its recorded event without an independent call-order
+    /// mismatch. An args-free serve must also name that same event; a paired
+    /// Execute call has no served-event sequence. Raw arguments remain here
+    /// even when the scorer judged their representation or approved noise equal.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub semantic_pair: bool,
+    /// Canonical observed argument digest for a trustworthy paired call whose
+    /// tape-relative args still diverged. The tree/delta compare this instead
+    /// of representation bytes; it never contains the raw captured payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_digest: Option<String>,
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
-    /// matched | recovered | served_recorded_error | novel | novel_absorbed | inconclusive_seed_gap |
+    /// matched | approved_noise | recovered |
+    /// served_recorded_error | novel | novel_absorbed | inconclusive_seed_gap |
     /// inconclusive_tail_gap | omitted | environmental | deterministic |
     /// value_diverged | idempotent_delete | inconclusive_race | schema_default |
     /// identity_skew | pruned_subtree | novel_subtree
@@ -272,6 +284,7 @@ fn paired_value_diverged(
     index: usize,
     by_seq: &HashMap<u64, &BoundaryEvent>,
     pairing: &super::CallPairing,
+    policy: Option<&crate::policy::BoundaryPolicySnapshot>,
 ) -> bool {
     let Some(twin) = pairing.twin(index) else {
         return false;
@@ -280,7 +293,7 @@ fn paired_value_diverged(
     pairing.changed(
         index,
         matches!(
-            super::pair_request_verdict(obs, twin_event),
+            super::pair_request_verdict(obs, twin_event, policy),
             super::ValueVerdict::Diverged
         ),
         twin.order_mismatch,
@@ -292,6 +305,7 @@ fn last_divergence_per_correlation(
     by_seq: &HashMap<u64, &BoundaryEvent>,
     tail_gap: &TailGapEvidence,
     pairing: &super::CallPairing,
+    policy: Option<&crate::policy::BoundaryPolicySnapshot>,
 ) -> HashMap<String, usize> {
     let mut last: HashMap<String, usize> = HashMap::new();
     for (index, obs) in observed.iter().enumerate() {
@@ -314,7 +328,7 @@ fn last_divergence_per_correlation(
         // added call caused could not see any of them.
         if observed_value_diverged(obs, source)
             || stopped_at(obs)
-            || paired_value_diverged(obs, index, by_seq, pairing)
+            || paired_value_diverged(obs, index, by_seq, pairing, policy)
         {
             last.insert(corr.to_owned(), index);
         }
@@ -374,6 +388,7 @@ pub(crate) fn build_with_inconclusive(
         &super::UnplantedPresence::default(),
         &super::SeedGapCascade::default(),
         None,
+        None,
         &mut |row| {
             rows.push(row);
             Ok(())
@@ -400,6 +415,7 @@ pub(crate) fn build_with_inconclusive_into(
     tail_gap: &TailGapEvidence,
     unplanted: &super::UnplantedPresence,
     cascade: &super::SeedGapCascade,
+    policy: Option<&crate::policy::BoundaryPolicySnapshot>,
     plan: Option<&GraphScoringPlan>,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -427,7 +443,7 @@ pub(crate) fn build_with_inconclusive_into(
     // is ONE row, not a novel call beside an omitted one, at whatever tier its
     // boundary sits; and structure never pairs, because a span holding one event
     // on each side says nothing about whether they are one call.
-    let pairing = super::CallPairing::build(table, events, observed, &column_provenance);
+    let pairing = super::CallPairing::build(table, events, observed, &column_provenance, policy);
     // How far each argument-divergent substitution could have carried, from the
     // same seam the scorecard reads so the rows and the counts cannot come apart.
     // Attribution only: it sets no `kind` and no `blocking`.
@@ -441,7 +457,8 @@ pub(crate) fn build_with_inconclusive_into(
     // call must come after the correlation's last recorded event was reproduced.
     // A novel call before a correlation's last divergence is an origin; one
     // with nothing diverging after it is not a finding at all.
-    let last_divergence = last_divergence_per_correlation(observed, &by_seq, tail_gap, &pairing);
+    let last_divergence =
+        last_divergence_per_correlation(observed, &by_seq, tail_gap, &pairing, policy);
     for (observed_index, obs) in observed.iter().enumerate() {
         let arg_divergence_reach = arg_divergence.serve(observed_index);
         let reached = arg_divergence.reached(observed_index);
@@ -482,6 +499,8 @@ pub(crate) fn build_with_inconclusive_into(
                 correlation_id: obs.correlation_id.clone(),
                 source_event_global_sequence: obs.source_event_global_sequence,
                 served_event_global_sequence: None,
+                semantic_pair: false,
+                semantic_digest: None,
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
@@ -533,7 +552,12 @@ pub(crate) fn build_with_inconclusive_into(
             let twin_event = by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded_result, obs, twin_event);
-            let value_diverged = paired_value_diverged(obs, observed_index, &by_seq, &pairing);
+            let verdict = super::pair_request_verdict(obs, twin_event, policy);
+            let value_diverged = pairing.changed(
+                observed_index,
+                matches!(verdict, super::ValueVerdict::Diverged),
+                twin.order_mismatch,
+            );
             let race_downstream = !twin.order_mismatch
                 && !obs.arg_divergent
                 && value_diverged
@@ -565,12 +589,36 @@ pub(crate) fn build_with_inconclusive_into(
                 // The recorded event the candidate served, where it served one
                 // by address alone: auditable against the twin paired here.
                 served_event_global_sequence: obs.served_event_global_sequence,
+                semantic_pair: !twin.order_mismatch
+                    && (!obs.arg_divergent || obs.served_event_global_sequence == Some(twin_seq)),
+                semantic_digest: (value_diverged
+                    && !twin.order_mismatch
+                    && (!obs.arg_divergent || obs.served_event_global_sequence == Some(twin_seq)))
+                .then(|| {
+                    super::noise::semantic_digest(
+                        &obs.args,
+                        &obs.boundary,
+                        &obs.trait_name,
+                        &obs.method_name,
+                        policy,
+                    )
+                })
+                .flatten(),
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
                 kind: match &schema_default {
                     Some(kind) => kind.clone(),
-                    None if !value_diverged => "matched".to_owned(),
+                    None if !value_diverged => {
+                        if matches!(
+                            verdict,
+                            super::ValueVerdict::Absorbed(super::ValueAbsorption::ApprovedNoise)
+                        ) {
+                            "approved_noise".to_owned()
+                        } else {
+                            "matched".to_owned()
+                        }
+                    }
                     None if race_downstream => "inconclusive_race".to_owned(),
                     None => "value_diverged".to_owned(),
                 },
@@ -692,6 +740,8 @@ pub(crate) fn build_with_inconclusive_into(
             } else {
                 obs.served_event_global_sequence
             },
+            semantic_pair: false,
+            semantic_digest: None,
             boundary: obs.boundary.clone(),
             trait_name: obs.trait_name.clone(),
             method_name: obs.method_name.clone(),
@@ -734,6 +784,8 @@ pub(crate) fn build_with_inconclusive_into(
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),
             served_event_global_sequence: None,
+            semantic_pair: false,
+            semantic_digest: None,
             boundary: ev.boundary.clone(),
             trait_name: ev.trait_name.clone(),
             method_name: ev.method_name.clone(),
@@ -776,9 +828,8 @@ pub(crate) fn build_with_inconclusive_into(
 /// memory before a byte reached disk. That OOMKilled the runner at 16 GiB on a
 /// 287-correlation tape, while the SAME tape scored fine for a candidate whose
 /// rows were overwhelmingly payload-free — 82 resolved calls against thousands.
-// Eight because the sink is an eighth parameter on a function that already took
-// seven; bundling them into a struct would be a larger change than the one being
-// made and would obscure that this is the same function, streaming.
+// The sink and immutable policy snapshot are explicit inputs to the same
+// streaming builder; bundling them would hide which run the scorer judged.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_with_plan_into(
     events: &[BoundaryEvent],
@@ -789,6 +840,7 @@ pub(crate) fn build_with_plan_into(
     tail_gap: &TailGapEvidence,
     unplanted: &super::UnplantedPresence,
     cascade: &super::SeedGapCascade,
+    policy: Option<&crate::policy::BoundaryPolicySnapshot>,
     plan: &GraphScoringPlan,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
@@ -805,6 +857,7 @@ pub(crate) fn build_with_plan_into(
         tail_gap,
         unplanted,
         cascade,
+        policy,
         Some(plan),
         sink,
     )

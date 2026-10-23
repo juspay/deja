@@ -250,6 +250,7 @@ pub fn cached_is_current(doc: &serde_json::Value, y: &str, m: &str, canon_versio
     doc.get("y_run").and_then(|v| v.as_str()) == Some(y)
         && doc.get("m_run").and_then(|v| v.as_str()) == Some(m)
         && doc.get("canon_version").and_then(|v| v.as_u64()) == Some(u64::from(canon_version))
+        && doc.get("semantic_revision").and_then(|v| v.as_u64()) == Some(1)
         && doc.get("verdict").is_some()
         // A delta cached before request counts existed lacks them; recompute it.
         && doc.get("requests").is_some()
@@ -262,6 +263,12 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         return Err(format!(
             "the two trees were built under different rules ({} and {}); rebuild one before comparing",
             m.canon_version, y.canon_version
+        ));
+    }
+    if m.policy_digest != y.policy_digest {
+        return Err(format!(
+            "the candidates use different boundary policies ({:?} and {:?}); read each run's tape verdict instead",
+            m.policy_digest, y.policy_digest
         ));
     }
     // The trees hash what each candidate captured, in the encoding of the
@@ -324,8 +331,8 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             .iter()
             .flatten()
             .any(|e| !matches!(e.value, Value::Novel { .. }));
-        let m_side = side_of(me.map(|e| &e.value), tape_has);
-        let y_side = side_of(ye.map(|e| &e.value), tape_has);
+        let m_side = side_of(me.map(|entry| &entry.value), tape_has);
+        let y_side = side_of(ye.map(|entry| &entry.value), tape_has);
         let bucket = classify(tape_has, &m_side, &y_side);
         let blocking =
             me.map(|e| e.blocking).unwrap_or(false) || ye.map(|e| e.blocking).unwrap_or(false);
@@ -586,6 +593,7 @@ mod tests {
                 .collect(),
             correlations,
             event_schema_versions: [10].into_iter().collect(),
+            policy_digest: None,
         }
     }
     fn div(h: &str) -> Value {
@@ -595,6 +603,25 @@ mod tests {
         Value::Novel { hash: h.into() }
     }
 
+    #[test]
+    fn policy_mismatch_rejects_comparison_even_when_one_digest_is_absent() {
+        let m = tree("m", vec![(call("c", 0), Value::Reproduced)]);
+        let mut y = tree("y", vec![(call("c", 0), Value::Reproduced)]);
+        y.policy_digest = Some("policy-b".into());
+        assert!(three_way(&m, &y)
+            .unwrap_err()
+            .contains("different boundary policies"));
+    }
+
+    #[test]
+    fn same_policy_comparison_retains_existing_semantics() {
+        let mut m = tree("m", vec![(call("c", 0), Value::Reproduced)]);
+        let mut y = tree("y", vec![(call("c", 0), Value::Reproduced)]);
+        m.policy_digest = Some("policy-a".into());
+        y.policy_digest = Some("policy-a".into());
+        let delta = three_way(&m, &y).unwrap();
+        assert_eq!(delta.clean, 1);
+    }
     #[test]
     fn every_row_of_the_bucket_table() {
         let m = tree(
@@ -821,6 +848,7 @@ mod tests {
     fn checked(doc: serde_json::Value) -> serde_json::Value {
         let report = serde_json::json!({"members": ["rec-a"], "correlations": 3});
         let mut doc = doc;
+        doc["semantic_revision"] = serde_json::json!(1);
         super::super::tape::record_tape_check(&mut doc, "y", Some(&report), "m", Some(&report))
             .unwrap();
         doc
@@ -861,6 +889,15 @@ mod tests {
             serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}, "requests": {}}),
         );
         assert!(cached_is_current(&doc, "y", "m", CANON_VERSION));
+        let mut old_draft = doc.clone();
+        old_draft
+            .as_object_mut()
+            .unwrap()
+            .remove("semantic_revision");
+        assert!(
+            !cached_is_current(&old_draft, "y", "m", CANON_VERSION),
+            "a version-6 cache from the superseded draft is not this format"
+        );
         assert!(
             !cached_is_current(&doc, "y", "other", CANON_VERSION),
             "a different baseline"

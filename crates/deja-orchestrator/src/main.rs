@@ -370,10 +370,32 @@ fn app_router(state: AppState) -> Router {
     let cd_pause = cd_read(get(v1_cd_pause)).merge(post(v1_cd_set_pause).route_layer(
         middleware::from_fn_with_state(state.clone(), require_session),
     ));
+    // A system-wide replay policy is a maintainer act, not a PR-author
+    // acknowledgement or a pipeline token operation. All reads and writes
+    // here require a verified signed-in maintainer session.
+    let policy_guard =
+        middleware::from_fn_with_state(state.clone(), require_boundary_policy_maintainer);
+    let policy_route = |h: MethodRouter<AppState>| h.route_layer(policy_guard.clone());
 
     let api_v1 = Router::new()
         .route("/healthz", get(healthz))
         .route("/systems", get(v1_systems))
+        .route(
+            "/systems/{system}/boundary-policy",
+            policy_route(get(v1_boundary_policy)),
+        )
+        .route(
+            "/systems/{system}/boundary-policy/preview",
+            policy_route(post(v1_boundary_policy_preview)),
+        )
+        .route(
+            "/systems/{system}/boundary-policy/revisions",
+            policy_route(post(v1_boundary_policy_propose)),
+        )
+        .route(
+            "/systems/{system}/boundary-policy/revisions/{id}/activate",
+            policy_route(post(v1_boundary_policy_activate)),
+        )
         .route("/recordings", get(v1_list_recordings))
         .route("/recordings/available", get(v1_available_recordings))
         .route(
@@ -649,6 +671,35 @@ async fn require_cd_reader(
         .insert(AuthenticatedActor(session.email));
     req.extensions_mut()
         .insert(ActorSubject(Some(session.sub).filter(|s| !s.is_empty())));
+    next.run(req).await
+}
+
+async fn require_boundary_policy_maintainer(
+    State(st): State<AppState>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let cfg = st.auth.config();
+    if !cfg.enabled {
+        return error_resp(401, "boundary policy needs configured sign-in");
+    }
+    // A service token or a typed actor cannot make a system-wide policy
+    // decision. Only the verified session carries a stable sign-in subject.
+    let Some(session) = session_from_headers(&st, req.headers()) else {
+        return error_resp(401, "sign in as a maintainer to manage boundary policy");
+    };
+    if !cfg.domain_allowed(&session.email) {
+        return error_resp(401, "this account is no longer allowed to sign in");
+    }
+    if !cfg.has_role(&session.email, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return error_resp(403, "boundary policy is for maintainers only");
+    }
+    if session.sub.is_empty() {
+        return error_resp(401, "sign-in has no stable subject");
+    }
+    req.extensions_mut()
+        .insert(AuthenticatedActor(session.email));
+    req.extensions_mut().insert(ActorSubject(Some(session.sub)));
     next.run(req).await
 }
 
@@ -961,6 +1012,7 @@ async fn v1_create_run(
         Ok(v) => v,
         Err(e) => return error_resp(400, &format!("parse RunSpec: {e}")),
     };
+    let body_has_boundary_policy = raw.get("boundary_policy").is_some();
     let expectation = raw
         .get("expectation")
         .and_then(|v| v.as_str())
@@ -986,6 +1038,58 @@ async fn v1_create_run(
         }
     }
     let mut spec = spec;
+    // Callers cannot choose an older/more permissive policy by posting their
+    // own snapshot. The store is mandatory even for systems with no active
+    // revision: that absence is a pinned, explicit strict policy.
+    if body_has_boundary_policy {
+        return error_resp(
+            400,
+            "boundary_policy is selected by the maintainer, not the caller",
+        );
+    }
+    if spec.mode == deja_orchestrator::RunMode::Replay {
+        // Only replay scoring consumes boundary policy. Recording remains
+        // independent of Postgres, as it was before this feature.
+        let store = match require_store(&st) {
+            Ok(store) => store,
+            Err(response) => return response,
+        };
+        let active_policy = match store.boundary_policy_active(spec.system()).await {
+            Ok(active) => active,
+            Err(e) => return error_resp(503, &format!("read active boundary policy: {e}")),
+        };
+        let (revision_id, document) = match active_policy {
+            Some(row) => {
+                let document = match serde_json::from_value::<
+                    deja_orchestrator::policy::BoundaryPolicyDocument,
+                >(row.document)
+                {
+                    Ok(document) => document,
+                    Err(e) => return error_resp(503, &format!("invalid active policy: {e}")),
+                };
+                (Some((row.id, row.digest)), document)
+            }
+            None => (
+                None,
+                deja_orchestrator::policy::BoundaryPolicyDocument { rules: Vec::new() },
+            ),
+        };
+        let digest = match document.canonical_digest() {
+            Ok(digest) => digest,
+            Err(why) => return error_resp(503, &format!("invalid active policy: {why}")),
+        };
+        if revision_id
+            .as_ref()
+            .is_some_and(|(_, stored_digest)| stored_digest != &digest)
+        {
+            return error_resp(503, "active policy digest does not match its document");
+        }
+        spec.boundary_policy = Some(deja_orchestrator::policy::BoundaryPolicySnapshot {
+            revision_id: revision_id.map(|(id, _)| id),
+            digest,
+            rules: document.rules,
+        });
+    }
     if let Err(e) = admit_github(&mut spec) {
         return error_resp(400, &format!("github: {e}"));
     }
@@ -993,37 +1097,60 @@ async fn v1_create_run(
         Ok(run) => run,
         Err(e) => return error_resp(500, &format!("create run: {e}")),
     };
-    // Store row + audit BEFORE the worker spawns (stage rows FK the run row).
     let ctx = if let Some(store) = &st.store {
         let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
-        // The whole request, defaults already applied — the run row is the only
-        // durable record of what this run was asked to do, and a report cannot
-        // name a scope, a recording or a candidate it was never told.
         let params =
             deja_orchestrator::RunParams::resolved(&run.spec, expectation.as_deref()).to_json();
-        if let Err(e) = store
-            .insert_run(
-                &run.run_id,
-                runs::mode_str(run.spec.mode),
-                run.spec.recording_id.as_deref(),
-                &candidate,
-                &params,
-                expectation.as_deref(),
-                &actor,
-            )
-            .await
-        {
-            eprintln!("deja-orchestrator: store insert_run failed: {e}");
+        if run.spec.mode == deja_orchestrator::RunMode::Replay {
+            // For policy-pinned replays, row and audit commit before launch.
+            if let Err(e) = store
+                .insert_run_with_audit(
+                    &run.run_id,
+                    runs::mode_str(run.spec.mode),
+                    run.spec.recording_id.as_deref(),
+                    &candidate,
+                    &params,
+                    expectation.as_deref(),
+                    &actor,
+                    &serde_json::json!({ "spec": run.spec, "expectation": expectation }),
+                )
+                .await
+            {
+                if let Err(cleanup) = std::fs::remove_file(st.root.run_path(&run.run_id)) {
+                    eprintln!(
+                        "deja-orchestrator: remove unadmitted run {}: {cleanup}",
+                        run.run_id
+                    );
+                }
+                return error_resp(503, &format!("create run store transaction: {e}"));
+            }
+        } else {
+            // A recording is not judged under replay policy; preserve its
+            // original file-only and best-effort catalog behavior.
+            if let Err(e) = store
+                .insert_run(
+                    &run.run_id,
+                    runs::mode_str(run.spec.mode),
+                    run.spec.recording_id.as_deref(),
+                    &candidate,
+                    &params,
+                    expectation.as_deref(),
+                    &actor,
+                )
+                .await
+            {
+                eprintln!("deja-orchestrator: store insert_run failed: {e}");
+            }
+            let _ = store
+                .audit(
+                    &actor,
+                    "run.create",
+                    "run",
+                    &run.run_id,
+                    &serde_json::json!({ "spec": run.spec, "expectation": expectation }),
+                )
+                .await;
         }
-        let _ = store
-            .audit(
-                &actor,
-                "run.create",
-                "run",
-                &run.run_id,
-                &serde_json::json!({ "spec": run.spec, "expectation": expectation }),
-            )
-            .await;
         deja_orchestrator::lifecycle::StoreCtx::new(
             &run.run_id,
             Some((tokio::runtime::Handle::current(), store.clone())),
@@ -3093,13 +3220,17 @@ fn tree_sources(
 fn read_or_build_tree(
     id: &str,
     sources: &TreeSources,
+    policy_digest: Option<&str>,
 ) -> Result<divergence::behaviour_tree::BehaviourTree, ReadFailure> {
     use divergence::behaviour_tree::{self, BehaviourTree};
 
     if let Some(tree) = std::fs::read_to_string(&sources.cache)
         .ok()
         .and_then(|t| BehaviourTree::from_jsonl(&t))
-        .filter(|t| t.canon_version == behaviour_tree::CANON_VERSION)
+        .filter(|t| {
+            t.canon_version == behaviour_tree::CANON_VERSION
+                && t.policy_digest.as_deref() == policy_digest
+        })
     {
         return Ok(tree);
     }
@@ -3115,6 +3246,7 @@ fn read_or_build_tree(
         None => Default::default(),
     };
     let mut tree = behaviour_tree::build(id, &rows, &diffs);
+    tree.policy_digest = policy_digest.map(str::to_owned);
     tree.event_schema_versions = event_schema_versions;
     // renamed into place, so a concurrent reader never sees a prefix
     let _ = tree.write_atomic(&sources.cache);
@@ -3140,6 +3272,16 @@ async fn behaviour_tree_for(
     id: &str,
 ) -> Result<divergence::behaviour_tree::BehaviourTree, Unavailable> {
     let (state, _) = run_disposition(st, id).await;
+    let params = run_params_read(st, id)
+        .await
+        .map_err(Unavailable::Refused)?
+        .ok_or_else(|| Unavailable::Refused(format!("run {id} has no stored policy provenance")))?;
+    if let Some(snapshot) = &params.boundary_policy {
+        snapshot
+            .validate()
+            .map_err(|why| Unavailable::Refused(format!("run {id} has invalid policy: {why}")))?;
+    }
+    let policy_digest = params.boundary_policy.map(|snapshot| snapshot.digest);
     let mut refetched = false;
     loop {
         let hydrated = hydrate_run_artifacts(st, id).await;
@@ -3168,9 +3310,12 @@ async fn behaviour_tree_for(
             }
         };
         let run = id.to_owned();
-        let read = tokio::task::spawn_blocking(move || read_or_build_tree(&run, &sources))
-            .await
-            .map_err(|e| Unavailable::Pending(format!("build behaviour tree of run {id}: {e}")))?;
+        let policy = policy_digest.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            read_or_build_tree(&run, &sources, policy.as_deref())
+        })
+        .await
+        .map_err(|e| Unavailable::Pending(format!("build behaviour tree of run {id}: {e}")))?;
         let failure = match read {
             Ok(tree) => return Ok(tree),
             Err(failure) => failure,
@@ -3331,6 +3476,9 @@ async fn delta_between(
             .map(|p| serde_json::to_value(&p.candidate_spec).unwrap_or_default())
     };
     let mut body = serde_json::to_value(&delta).unwrap_or_default();
+    // Cache-only marker distinguishes this final v6 computation from v6
+    // documents produced by a superseded draft; no Delta API field is needed.
+    body["semantic_revision"] = serde_json::json!(1);
     // Recorded in the body so a cached copy shows it passed the check.
     divergence::tape::record_tape_check(&mut body, y_id, Some(&y_report), m_id, Some(&m_report))
         .map_err(refuse)?;
@@ -4329,6 +4477,333 @@ async fn v1_audit(State(st): State<AppState>) -> Response {
     match store.audit_list(500).await {
         Ok(rows) => json_ok_ser(&rows),
         Err(e) => error_resp(500, &format!("audit list: {e}")),
+    }
+}
+
+fn boundary_policy_system_refusal(system: &str) -> Option<Response> {
+    let Some(profile) = deja_orchestrator::system::registry()
+        .into_iter()
+        .find(|profile| profile.name == system)
+    else {
+        return Some(error_resp(404, "unknown Deja system"));
+    };
+    profile
+        .error
+        .as_deref()
+        .map(|why| error_resp(503, &format!("system configuration is unusable: {why}")))
+}
+
+fn policy_revision_view(row: deja_store::BoundaryPolicyRow) -> Result<serde_json::Value, String> {
+    let document: deja_orchestrator::policy::BoundaryPolicyDocument =
+        serde_json::from_value(row.document).map_err(|e| e.to_string())?;
+    let snapshot = deja_orchestrator::policy::BoundaryPolicySnapshot {
+        revision_id: Some(row.id),
+        digest: row.digest,
+        rules: document.rules,
+    };
+    snapshot.validate()?;
+    Ok(serde_json::json!({
+        "id": row.id,
+        "system": row.system,
+        "snapshot": snapshot,
+        "reason": row.reason,
+        "proposed_by": row.proposed_by,
+        "created_at": row.created_at,
+        "confirmed_by": row.confirmed_by,
+        "activated_at": row.activated_at
+    }))
+}
+
+/// Maintainer-only view of the active, immutable policy and its full history.
+async fn v1_boundary_policy(State(st): State<AppState>, Path(system): Path<String>) -> Response {
+    if let Some(refusal) = boundary_policy_system_refusal(&system) {
+        return refusal;
+    }
+    let store = match require_store(&st) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let active = match store.boundary_policy_active(&system).await {
+        Ok(active) => active,
+        Err(e) => return error_resp(500, &format!("read active boundary policy: {e}")),
+    };
+    let revisions = match store.boundary_policy_revisions(&system).await {
+        Ok(revisions) => revisions,
+        Err(e) => return error_resp(500, &format!("list boundary policies: {e}")),
+    };
+    let active = match active.map(policy_revision_view).transpose() {
+        Ok(active) => active,
+        Err(why) => return error_resp(500, &format!("invalid stored boundary policy: {why}")),
+    };
+    let revisions: Vec<_> = match revisions
+        .into_iter()
+        .map(policy_revision_view)
+        .collect::<Result<_, _>>()
+    {
+        Ok(revisions) => revisions,
+        Err(why) => return error_resp(500, &format!("invalid stored boundary policy: {why}")),
+    };
+    json_ok(serde_json::json!({ "active": active, "revisions": revisions }))
+}
+
+fn boundary_policy_write_error(error: deja_store::BoundaryPolicyWriteError) -> Response {
+    match error {
+        deja_store::BoundaryPolicyWriteError::Conflict => {
+            error_resp(409, "active policy changed: refresh before retry")
+        }
+        deja_store::BoundaryPolicyWriteError::NotFound => {
+            error_resp(404, "policy revision not found for this system")
+        }
+        deja_store::BoundaryPolicyWriteError::SameActor => error_resp(
+            403,
+            "a different signed-in maintainer must activate this proposal",
+        ),
+        deja_store::BoundaryPolicyWriteError::Db(e) => {
+            error_resp(500, &format!("boundary policy store: {e}"))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BoundaryPolicyProposal {
+    rules: Vec<deja_orchestrator::policy::BoundaryRule>,
+    reason: String,
+    expected_active_revision: Option<i64>,
+}
+
+async fn v1_boundary_policy_propose(
+    State(st): State<AppState>,
+    Path(system): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(refusal) = boundary_policy_system_refusal(&system) {
+        return refusal;
+    }
+    let store = match require_store(&st) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let proposal: BoundaryPolicyProposal = match serde_json::from_slice(&body) {
+        Ok(proposal) => proposal,
+        Err(e) => return error_resp(400, &format!("parse policy proposal: {e}")),
+    };
+    let reason = proposal.reason.trim();
+    if reason.is_empty() || reason.len() > 1024 {
+        return error_resp(400, "policy reason must be 1–1024 characters");
+    }
+    let document = deja_orchestrator::policy::BoundaryPolicyDocument {
+        rules: proposal.rules,
+    };
+    let digest = match document.canonical_digest() {
+        Ok(digest) => digest,
+        Err(why) => return error_resp(400, &why),
+    };
+    let document_json = match serde_json::to_value(&document) {
+        Ok(document) => document,
+        Err(e) => return error_resp(500, &format!("serialize policy: {e}")),
+    };
+    let Some(subject) = subject.0.as_deref() else {
+        return error_resp(401, "signed-in subject required");
+    };
+    match store
+        .boundary_policy_propose(
+            &system,
+            &digest,
+            &document_json,
+            reason,
+            &actor.0,
+            subject,
+            proposal.expected_active_revision,
+        )
+        .await
+    {
+        Ok(row) => match policy_revision_view(row) {
+            Ok(view) => json_ok(view),
+            Err(why) => error_resp(500, &format!("invalid stored proposal: {why}")),
+        },
+        Err(e) => boundary_policy_write_error(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ActivateBoundaryPolicy {
+    expected_active_revision: Option<i64>,
+}
+
+async fn v1_boundary_policy_activate(
+    State(st): State<AppState>,
+    Path((system, id)): Path<(String, i64)>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(refusal) = boundary_policy_system_refusal(&system) {
+        return refusal;
+    }
+    let store = match require_store(&st) {
+        Ok(store) => store,
+        Err(response) => return response,
+    };
+    let command: ActivateBoundaryPolicy = match serde_json::from_slice(&body) {
+        Ok(command) => command,
+        Err(e) => return error_resp(400, &format!("parse policy activation: {e}")),
+    };
+    let Some(subject) = subject.0.as_deref() else {
+        return error_resp(401, "signed-in subject required");
+    };
+    match store
+        .boundary_policy_activate(
+            &system,
+            id,
+            command.expected_active_revision,
+            &actor.0,
+            subject,
+        )
+        .await
+    {
+        Ok(row) => match policy_revision_view(row) {
+            Ok(view) => json_ok(view),
+            Err(why) => error_resp(500, &format!("invalid stored activation: {why}")),
+        },
+        Err(e) => boundary_policy_write_error(e),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct BoundaryPolicyPreviewRequest {
+    run_id: String,
+    rules: Vec<deja_orchestrator::policy::BoundaryRule>,
+}
+
+fn preview_boundary_policy_file(
+    path: &std::path::Path,
+    run_id: &str,
+    snapshot: &deja_orchestrator::policy::BoundaryPolicySnapshot,
+) -> Result<serde_json::Value, String> {
+    use std::io::BufRead as _;
+    let file = std::fs::File::open(path).map_err(|e| format!("call ledger unavailable: {e}"))?;
+    let reader = std::io::BufReader::new(file);
+    let (mut total, mut absorbed, mut blocking) = (0u64, 0u64, 0u64);
+    let mut examples = Vec::new();
+    for (line_number, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("read call ledger: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: divergence::CallRecord = serde_json::from_str(&line)
+            .map_err(|e| format!("call ledger line {}: {e}", line_number + 1))?;
+        if !snapshot.rules.is_empty()
+            && !snapshot.rules.iter().any(|rule| {
+                rule.selector.boundary == row.boundary
+                    && rule.selector.trait_name == row.trait_name
+                    && rule.selector.method_name == row.method_name
+            })
+        {
+            continue;
+        }
+        let (Some(recorded), Some(observed)) = (
+            row.recorded.as_ref().and_then(|side| side.args.as_ref()),
+            row.observed.as_ref().and_then(|side| side.args.as_ref()),
+        ) else {
+            continue; // No paired arguments means no evidence for this rule.
+        };
+        if recorded == observed {
+            continue; // Exact match is neither an allowance nor a blocker.
+        }
+        total += 1;
+        // `semantic_pair` rules out an independent order mismatch. A paired
+        // Execute call has no served sequence; an args-free serve must have
+        // served its paired source event.
+        let class = if row.semantic_pair
+            && row.source_event_global_sequence.is_some()
+            && row
+                .served_event_global_sequence
+                .is_none_or(|served| Some(served) == row.source_event_global_sequence)
+            && !row.stopped
+        {
+            divergence::classify_boundary_args_with_policy(
+                &row.boundary,
+                &row.trait_name,
+                &row.method_name,
+                recorded,
+                observed,
+                Some(snapshot),
+            )
+        } else {
+            "untrusted_pair"
+        };
+        if matches!(class, "semantic_equivalent" | "approved_noise") {
+            absorbed += 1;
+        } else {
+            blocking += 1;
+        }
+        if examples.len() < 12 {
+            examples.push(serde_json::json!({
+                "correlation_id": row.correlation_id,
+                "boundary": row.boundary,
+                "trait_name": row.trait_name,
+                "method_name": row.method_name,
+                "classification": class
+            }));
+        }
+    }
+    Ok(serde_json::json!({
+        "run_id": run_id,
+        "total_rows": total,
+        "would_absorb": absorbed,
+        "would_remain_blocking": blocking,
+        "examples": examples
+    }))
+}
+
+async fn v1_boundary_policy_preview(
+    State(st): State<AppState>,
+    Path(system): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(refusal) = boundary_policy_system_refusal(&system) {
+        return refusal;
+    }
+    let request: BoundaryPolicyPreviewRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(e) => return error_resp(400, &format!("parse policy preview: {e}")),
+    };
+    let document = deja_orchestrator::policy::BoundaryPolicyDocument {
+        rules: request.rules,
+    };
+    let digest = match document.canonical_digest() {
+        Ok(digest) => digest,
+        Err(why) => return error_resp(400, &why),
+    };
+    let id: RunId = match request.run_id.parse() {
+        Ok(id) => id,
+        Err(e) => return error_resp(400, &format!("run_id: {e}")),
+    };
+    let run = match runs::get(&st.root, &id) {
+        Ok(run) => run,
+        Err(_) => return error_resp(404, "run not found for preview"),
+    };
+    if run.spec.system() != system {
+        return error_resp(400, "preview run belongs to a different system");
+    }
+    let snapshot = deja_orchestrator::policy::BoundaryPolicySnapshot {
+        revision_id: None,
+        digest,
+        rules: document.rules,
+    };
+    let _ = hydrate_run_artifacts(&st, &id).await;
+    let path = st.root.call_ledger_path(&id);
+    let run_id = id.to_string();
+    match tokio::task::spawn_blocking(move || {
+        preview_boundary_policy_file(&path, &run_id, &snapshot)
+    })
+    .await
+    {
+        Ok(Ok(preview)) => json_ok(preview),
+        Ok(Err(why)) => error_resp(409, &why),
+        Err(e) => error_resp(500, &format!("preview worker: {e}")),
     }
 }
 
@@ -6002,6 +6477,92 @@ mod tests {
 
     const LEDGER_ROW: &str = r#"{"correlation_id":"c1","boundary":"redis","trait_name":"Cache","method_name":"get","kind":"matched","blocking":false}"#;
 
+    #[test]
+    fn preview_reuses_semantic_identity_and_revocable_noise_rules() {
+        use base64::Engine as _;
+        use deja_orchestrator::policy::{
+            BoundaryPolicyDocument, BoundaryPolicySnapshot, BoundaryRule, BoundarySelector,
+            NoiseTarget,
+        };
+        let args = |raw: &str| {
+            serde_json::json!({
+                "method":"POST",
+                "request":{"data":base64::engine::general_purpose::STANDARD.encode(raw)}
+            })
+        };
+        let mut row = serde_json::json!({
+            "correlation_id":"c1",
+            "boundary":"api",
+            "trait_name":"service",
+            "method_name":"send",
+            "kind":"value_diverged",
+            "blocking":true,
+            "source_event_global_sequence":7,
+            "served_event_global_sequence":7,
+            "semantic_pair":true,
+            "recorded":{"args":args(r#"{"X-A":"a","X-B":"b"}"#)},
+            "observed":{"args":args(r#"{"X-B":"b","X-A":"a"}"#)}
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("call-ledger.jsonl");
+        let snapshot = |rules: Vec<BoundaryRule>| {
+            let doc = BoundaryPolicyDocument { rules };
+            BoundaryPolicySnapshot {
+                revision_id: None,
+                digest: doc.canonical_digest().expect("valid policy"),
+                rules: doc.rules,
+            }
+        };
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let strict = preview_boundary_policy_file(&path, "run-1", &snapshot(Vec::new())).unwrap();
+        assert_eq!(strict["total_rows"], 1);
+        assert_eq!(strict["would_absorb"], 1);
+        assert_eq!(
+            strict["examples"][0]["classification"],
+            "semantic_equivalent"
+        );
+
+        row["observed"]["args"] = args(r#"{"X-B":"b","X-A":"changed"}"#);
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let blocked = preview_boundary_policy_file(&path, "run-1", &snapshot(Vec::new())).unwrap();
+        assert_eq!(blocked["would_remain_blocking"], 1);
+        let rule = BoundaryRule {
+            selector: BoundarySelector {
+                boundary: "api".into(),
+                trait_name: "service".into(),
+                method_name: "send".into(),
+            },
+            source_path: Some("/request/data".into()),
+            target: NoiseTarget::Scalar {
+                json_pointer: "/X-A".into(),
+            },
+        };
+        let allowed =
+            preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule.clone()])).unwrap();
+        assert_eq!(allowed["would_absorb"], 1);
+        assert_eq!(allowed["examples"][0]["classification"], "approved_noise");
+        assert!(
+            !allowed.to_string().contains("changed"),
+            "preview exposes no raw args"
+        );
+        row["served_event_global_sequence"] = serde_json::Value::Null;
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let execute_pair =
+            preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule.clone()])).unwrap();
+        assert_eq!(execute_pair["would_absorb"], 1);
+        assert_eq!(
+            execute_pair["examples"][0]["classification"],
+            "approved_noise"
+        );
+        row["semantic_pair"] = serde_json::json!(false);
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let untrusted =
+            preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule])).unwrap();
+        assert_eq!(untrusted["would_absorb"], 0);
+        assert_eq!(untrusted["would_remain_blocking"], 1);
+        assert_eq!(untrusted["examples"][0]["classification"], "untrusted_pair");
+    }
+
     /// A compose run in `status`, with `ledger` as its call ledger if given.
     fn run_with_ledger(
         dir: &std::path::Path,
@@ -6272,6 +6833,7 @@ mod tests {
                 label: None,
                 github: None,
                 delta_against: None,
+                boundary_policy: None,
                 purpose: None,
                 scored_span_namespaces: Vec::new(),
                 mode: deja_orchestrator::RunMode::Replay,
@@ -7091,7 +7653,7 @@ mod tests {
         let cache = deja_orchestrator::delta_cache_of(&ledger);
         let mut doc = serde_json::json!({
             "y_run": "run-Y", "m_run": "run-M", "canon_version": CANON_VERSION,
-            "verdict": {"pass": true}, "requests": {},
+            "semantic_revision": 1, "verdict": {"pass": true}, "requests": {},
         });
 
         std::fs::write(&cache, doc.to_string()).unwrap();
@@ -7883,6 +8445,179 @@ mod sign_in {
         Router::new()
             .route("/cd-read", get(whoami).route_layer(reader))
             .with_state(st)
+    }
+
+    #[tokio::test]
+    async fn boundary_policy_routes_require_a_maintainer_session_not_a_service_identity() {
+        let (auth, signer) = enabled(&["ravi@juspay.in"]);
+        let app = app_router(state(auth, Some("pipeline-token")));
+        let path = "/api/v1/systems/hyperswitch/boundary-policy";
+        let (anonymous, _) = call(
+            app.clone(),
+            Request::builder()
+                .uri(path)
+                .header(header::AUTHORIZATION, "Bearer pipeline-token")
+                .header("x-deja-actor", "ravi@juspay.in")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(anonymous, StatusCode::UNAUTHORIZED);
+        let (viewer, _) = call(
+            app.clone(),
+            Request::builder()
+                .uri(path)
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(viewer, StatusCode::FORBIDDEN);
+        let (maintainer, _) = call(
+            app,
+            Request::builder()
+                .uri(path)
+                .header(header::COOKIE, session_cookie(&signer, "ravi@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            maintainer,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the signed-in maintainer reached the handler, whose test store is absent"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintainer_can_activate_and_revoke_scoped_noise_through_api() {
+        let Ok(db_url) = std::env::var("DEJA_TEST_DB_URL") else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let (auth, signer) = enabled(&[
+            "alice@juspay.in",
+            "bob@juspay.in",
+            "carol@juspay.in",
+            "dave@juspay.in",
+        ]);
+        let mut st = state(auth, None);
+        st.store = Some(Arc::new(
+            Store::connect(&db_url).await.expect("test Postgres"),
+        ));
+        let app = app_router(st);
+        let base = "/api/v1/systems/hyperswitch/boundary-policy";
+        let (status, body) = call(
+            app.clone(),
+            Request::builder()
+                .uri(base)
+                .header(header::COOKIE, session_cookie(&signer, "alice@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let active: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let previous = active["active"]["id"].as_i64();
+        let rule = serde_json::json!({
+            "selector":{
+                "boundary":"api","trait_name":"service","method_name":"send"
+            },
+            "source_path":"/request/data",
+            "target":{"kind":"header_group","json_pointer":"/headers"}
+        });
+        let post = |path: String, email: &str, body: serde_json::Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, session_cookie(&signer, email))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (status, body) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions"),
+                "alice@juspay.in",
+                serde_json::json!({
+                    "rules":[rule.clone()],
+                    "reason":"Header presentation from unstable collection order",
+                    "expected_active_revision":previous
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let proposed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = proposed["id"].as_i64().expect("revision id");
+        let (same_actor, _) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions/{id}/activate"),
+                "alice@juspay.in",
+                serde_json::json!({"expected_active_revision":previous}),
+            ),
+        )
+        .await;
+        assert_eq!(same_actor, StatusCode::FORBIDDEN);
+        let (activated, body) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions/{id}/activate"),
+                "bob@juspay.in",
+                serde_json::json!({"expected_active_revision":previous}),
+            ),
+        )
+        .await;
+        assert_eq!(activated, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions"),
+                "carol@juspay.in",
+                serde_json::json!({
+                    "rules":[],
+                    "reason":"Source became deterministic; revoke allowance",
+                    "expected_active_revision":id
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let revoked: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let revoked_id = revoked["id"].as_i64().expect("new revision id");
+        let (status, body) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions/{revoked_id}/activate"),
+                "dave@juspay.in",
+                serde_json::json!({"expected_active_revision":id}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            app,
+            Request::builder()
+                .uri(base)
+                .header(header::COOKIE, session_cookie(&signer, "bob@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let policy: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(policy["active"]["id"], revoked_id);
+        assert_eq!(policy["active"]["snapshot"]["rules"], serde_json::json!([]));
+        assert!(policy["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|revision| {
+                revision["id"] == id && revision["snapshot"]["rules"] == serde_json::json!([rule])
+            }));
     }
 
     fn get_cd_read() -> axum::http::request::Builder {
