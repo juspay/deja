@@ -5,14 +5,14 @@
 use crate::policy::{BoundaryPolicySnapshot, BoundaryRule, NoiseTarget};
 use base64::Engine as _;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 const MAX_DATA_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_PAIRS: usize = 4096;
 
-/// The paired-serve and independent-order checks belong to the caller. This
-/// function judges only arguments; a false result is always blocking there.
+/// The paired-serve and independent-order checks belong to the caller.
+/// Both scorecard equivalence and delta keys use the SAME canonical digest,
+/// so a maintainer rule cannot be interpreted differently by those readers.
 pub(super) fn equivalent(
     recorded: &Value,
     observed: &Value,
@@ -24,52 +24,22 @@ pub(super) fn equivalent(
     let Some(snapshot) = snapshot else {
         return false;
     };
-    // Run admission/artifact loading and policy preview validate the digest
-    // once. Avoid hashing/cloning the whole policy for every boundary call.
-    if snapshot.rules.len() > 32 {
-        return false;
-    }
-    let mut matching: [Option<&BoundaryRule>; 32] = [None; 32];
-    let mut count = 0;
-    for rule in &snapshot.rules {
-        if rule.selector.boundary == boundary
-            && rule.selector.trait_name == trait_name
-            && rule.selector.method_name == method_name
-        {
-            matching[count] = Some(rule);
-            count += 1;
-        }
-    }
-    let Some(first) = matching[0] else {
-        return false;
-    };
-    let rules = &matching[..count];
-    let source_path = first.source_path.as_deref();
-    if rules
-        .iter()
-        .flatten()
-        .any(|rule| rule.source_path.as_deref() != source_path)
+    if recorded == observed
+        || !snapshot.rules.iter().any(|rule| {
+            rule.selector.boundary == boundary
+                && rule.selector.trait_name == trait_name
+                && rule.selector.method_name == method_name
+        })
     {
         return false;
     }
-    let (left, right): (Cow<'_, Value>, Cow<'_, Value>) = match source_path {
-        None => (Cow::Borrowed(recorded), Cow::Borrowed(observed)),
-        Some(path) => {
-            let Some(parts) = pointer_parts(path) else {
-                return false;
-            };
-            if !same_outside_path(recorded, observed, &parts) {
-                return false;
-            }
-            let (Some(a), Some(b)) = (decode_source(recorded, path), decode_source(observed, path))
-            else {
-                return false;
-            };
-            (Cow::Owned(a), Cow::Owned(b))
-        }
-    };
-    let mut approved_change = false;
-    compare(&left, &right, "", rules, &mut approved_change) && approved_change
+    match (
+        semantic_hash(recorded, boundary, trait_name, method_name, Some(snapshot)),
+        semantic_hash(observed, boundary, trait_name, method_name, Some(snapshot)),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn decode_source(args: &Value, path: &str) -> Option<Value> {
@@ -87,146 +57,11 @@ fn decode_source(args: &Value, path: &str) -> Option<Value> {
     (value.is_object() || value.is_array()).then_some(value)
 }
 
-fn pointer_parts(path: &str) -> Option<Vec<String>> {
-    if path.is_empty() {
-        return Some(Vec::new());
-    }
-    if !path.starts_with('/') {
-        return None;
-    }
-    path[1..]
-        .split('/')
-        .map(|part| {
-            let mut out = String::with_capacity(part.len());
-            let mut chars = part.chars();
-            while let Some(ch) = chars.next() {
-                if ch == '~' {
-                    out.push(match chars.next()? {
-                        '0' => '~',
-                        '1' => '/',
-                        _ => return None,
-                    });
-                } else {
-                    out.push(ch);
-                }
-            }
-            Some(out)
-        })
-        .collect()
-}
-
-fn same_outside_path(left: &Value, right: &Value, parts: &[String]) -> bool {
-    let Some((part, rest)) = parts.split_first() else {
-        return true;
-    };
-    match (left, right) {
-        (Value::Object(a), Value::Object(b)) if a.len() == b.len() => {
-            a.iter().all(|(key, value)| {
-                let Some(other) = b.get(key) else {
-                    return false;
-                };
-                if key == part {
-                    same_outside_path(value, other, rest)
-                } else {
-                    deja::identity::semantic_differences(value, other).is_some()
-                }
-            })
-        }
-        (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
-            let Ok(index) = part.parse::<usize>() else {
-                return false;
-            };
-            if index >= a.len() {
-                return false;
-            }
-            a.iter().zip(b).enumerate().all(|(i, (value, other))| {
-                if i == index {
-                    same_outside_path(value, other, rest)
-                } else {
-                    deja::identity::semantic_differences(value, other).is_some()
-                }
-            })
-        }
-        _ => false,
-    }
-}
-
 fn rule_path(rule: &BoundaryRule) -> &str {
     match &rule.target {
         NoiseTarget::Scalar { json_pointer }
         | NoiseTarget::HeaderGroup { json_pointer }
         | NoiseTarget::HeaderValue { json_pointer, .. } => json_pointer,
-    }
-}
-
-fn compare(
-    left: &Value,
-    right: &Value,
-    path: &str,
-    rules: &[Option<&BoundaryRule>],
-    approved_change: &mut bool,
-) -> bool {
-    if left == right {
-        return true;
-    }
-    let here = rules
-        .iter()
-        .flatten()
-        .filter(|rule| rule_path(rule) == path);
-    let mut scalar = false;
-    let mut group_order = false;
-    let mut ignored_header: Option<&str> = None;
-    for rule in here {
-        match &rule.target {
-            NoiseTarget::Scalar { .. } => scalar = true,
-            NoiseTarget::HeaderGroup { .. } => group_order = true,
-            NoiseTarget::HeaderValue { name, .. } => {
-                if ignored_header.replace(name).is_some() {
-                    return false;
-                }
-            }
-        }
-    }
-    if scalar {
-        if group_order || ignored_header.is_some() || !scalar_value(left) || !scalar_value(right) {
-            return false;
-        }
-        *approved_change = true;
-        return true;
-    }
-    if group_order || ignored_header.is_some() {
-        let (Some(a), Some(b)) = (left.as_array(), right.as_array()) else {
-            return false;
-        };
-        return compare_headers(a, b, group_order, ignored_header, approved_change);
-    }
-    match (left, right) {
-        (Value::Object(a), Value::Object(b)) if a.len() == b.len() => {
-            a.iter().all(|(key, value)| {
-                let Some(other) = b.get(key) else {
-                    return false;
-                };
-                if value == other {
-                    return true;
-                }
-                compare(
-                    value,
-                    other,
-                    &format!("{path}/{}", escape_pointer(key)),
-                    rules,
-                    approved_change,
-                )
-            })
-        }
-        (Value::Array(a), Value::Array(b)) if a.len() == b.len() => {
-            a.iter().zip(b).enumerate().all(|(i, (value, other))| {
-                value == other
-                    || compare(value, other, &format!("{path}/{i}"), rules, approved_change)
-            })
-        }
-        // The same comparison-only encoded-JSON chain applies outside the
-        // approved path; representation differences are not independent bugs.
-        _ => deja::identity::semantic_differences(left, right).is_some(),
     }
 }
 
@@ -265,71 +100,6 @@ fn header_groups(items: &[Value]) -> Option<BTreeMap<String, Vec<&str>>> {
     Some(groups)
 }
 
-fn compare_headers(
-    left: &[Value],
-    right: &[Value],
-    group_order: bool,
-    ignored_header: Option<&str>,
-    approved_change: &mut bool,
-) -> bool {
-    let (Some(a), Some(b)) = (header_groups(left), header_groups(right)) else {
-        return false;
-    };
-    if a.len() != b.len() {
-        return false;
-    }
-    let ignored = ignored_header.map(str::to_ascii_lowercase);
-    for (name, values) in &a {
-        let Some(other) = b.get(name) else {
-            return false;
-        };
-        if values.len() != other.len() {
-            return false;
-        }
-        if ignored.as_deref() == Some(name.as_str()) {
-            if values.len() != 1 {
-                return false;
-            }
-            if values[0] != other[0] {
-                *approved_change = true;
-            }
-        } else if values != other {
-            // In particular, repeated values under one name are positional.
-            return false;
-        }
-    }
-    if ignored.as_ref().is_some_and(|name| !a.contains_key(name)) {
-        return false;
-    }
-    if group_order {
-        if left != right {
-            *approved_change = true;
-        }
-    } else {
-        if left.len() != right.len() {
-            return false;
-        }
-        for (item_a, item_b) in left.iter().zip(right) {
-            let (Some(pair_a), Some(pair_b)) = (item_a.as_array(), item_b.as_array()) else {
-                return false;
-            };
-            if pair_a[0] != pair_b[0] {
-                return false;
-            }
-            if ignored.as_deref()
-                != pair_a[0]
-                    .as_str()
-                    .map(|s| s.to_ascii_lowercase())
-                    .as_deref()
-                && pair_a[1] != pair_b[1]
-            {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 /// Stable candidate-argument key for a paired divergent call. The scorer has
 /// already judged its tape-relative verdict; this key lets the three-way delta
 /// inherit the SAME semantic drift across independently rendered replays.
@@ -341,6 +111,16 @@ pub(super) fn semantic_digest(
     method_name: &str,
     snapshot: Option<&BoundaryPolicySnapshot>,
 ) -> Option<String> {
+    semantic_hash(args, boundary, trait_name, method_name, snapshot).map(hex::encode)
+}
+
+fn semantic_hash(
+    args: &Value,
+    boundary: &str,
+    trait_name: &str,
+    method_name: &str,
+    snapshot: Option<&BoundaryPolicySnapshot>,
+) -> Option<[u8; 32]> {
     use sha2::Digest as _;
     let mut matching: [Option<&BoundaryRule>; 32] = [None; 32];
     let mut count = 0;
@@ -404,7 +184,7 @@ pub(super) fn semantic_digest(
         source.zip(decoded.as_ref()),
         rules,
     )?;
-    Some(hex::encode(hasher.finalize()))
+    Some(hasher.finalize().into())
 }
 
 fn hash_bytes(hasher: &mut sha2::Sha256, bytes: &[u8]) {
