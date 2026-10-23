@@ -182,6 +182,10 @@ pub struct Delta {
     pub m_run: String,
     pub y_run: String,
     pub canon_version: u32,
+    /// Cache discriminator for this semantic comparison format. Version 6
+    /// was also used by an unmerged draft with different tree contents.
+    #[serde(default)]
+    pub semantic_revision: u8,
     pub verdict: DeltaVerdict,
     pub buckets: BTreeMap<Bucket, usize>,
     pub lanes: Vec<LaneSummary>,
@@ -250,6 +254,7 @@ pub fn cached_is_current(doc: &serde_json::Value, y: &str, m: &str, canon_versio
     doc.get("y_run").and_then(|v| v.as_str()) == Some(y)
         && doc.get("m_run").and_then(|v| v.as_str()) == Some(m)
         && doc.get("canon_version").and_then(|v| v.as_u64()) == Some(u64::from(canon_version))
+        && doc.get("semantic_revision").and_then(|v| v.as_u64()) == Some(1)
         && doc.get("verdict").is_some()
         // A delta cached before request counts existed lacks them; recompute it.
         && doc.get("requests").is_some()
@@ -263,6 +268,9 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             "the two trees were built under different rules ({} and {}); rebuild one before comparing",
             m.canon_version, y.canon_version
         ));
+    }
+    if m.semantic_revision != 1 || y.semantic_revision != 1 {
+        return Err("the two trees lack the current semantic comparison format".into());
     }
     if m.policy_digest != y.policy_digest {
         return Err(format!(
@@ -493,6 +501,7 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         m_run: m.run_id.clone(),
         y_run: y.run_id.clone(),
         canon_version: m.canon_version,
+        semantic_revision: 1,
         verdict: DeltaVerdict {
             pass,
             introduced,
@@ -569,6 +578,7 @@ mod tests {
         BehaviourTree {
             run_id: run.into(),
             canon_version: CANON_VERSION,
+            semantic_revision: 1,
             entries: entries
                 .into_iter()
                 .map(|(address, value)| Entry {
@@ -847,6 +857,7 @@ mod tests {
     fn checked(doc: serde_json::Value) -> serde_json::Value {
         let report = serde_json::json!({"members": ["rec-a"], "correlations": 3});
         let mut doc = doc;
+        doc["semantic_revision"] = serde_json::json!(1);
         super::super::tape::record_tape_check(&mut doc, "y", Some(&report), "m", Some(&report))
             .unwrap();
         doc
@@ -887,6 +898,15 @@ mod tests {
             serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}, "requests": {}}),
         );
         assert!(cached_is_current(&doc, "y", "m", CANON_VERSION));
+        let mut old_draft = doc.clone();
+        old_draft
+            .as_object_mut()
+            .unwrap()
+            .remove("semantic_revision");
+        assert!(
+            !cached_is_current(&old_draft, "y", "m", CANON_VERSION),
+            "a version-6 cache from the superseded draft is not this format"
+        );
         assert!(
             !cached_is_current(&doc, "y", "other", CANON_VERSION),
             "a different baseline"

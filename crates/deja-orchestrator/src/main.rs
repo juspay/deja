@@ -3229,6 +3229,7 @@ fn read_or_build_tree(
         .and_then(|t| BehaviourTree::from_jsonl(&t))
         .filter(|t| {
             t.canon_version == behaviour_tree::CANON_VERSION
+                && t.semantic_revision == 1
                 && t.policy_digest.as_deref() == policy_digest
         })
     {
@@ -7650,7 +7651,7 @@ mod tests {
         let cache = deja_orchestrator::delta_cache_of(&ledger);
         let mut doc = serde_json::json!({
             "y_run": "run-Y", "m_run": "run-M", "canon_version": CANON_VERSION,
-            "verdict": {"pass": true}, "requests": {},
+            "semantic_revision": 1, "verdict": {"pass": true}, "requests": {},
         });
 
         std::fs::write(&cache, doc.to_string()).unwrap();

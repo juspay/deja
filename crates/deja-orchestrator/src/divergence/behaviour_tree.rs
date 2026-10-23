@@ -42,9 +42,11 @@ use super::ledger::CallRecord;
 /// 5: a whole-body difference the kernel could only report as raw bytes is
 ///    hashed by the candidate's decoded body, so the map order serialised
 ///    into those bytes is not behaviour either.
-/// 8: semantic argument/noise verdicts project from the ledger; obsolete
-///    boundary-specific evidence is no longer stored in the tree.
-pub const CANON_VERSION: u32 = 8;
+/// 6: paired argument verdicts use semantic JSON and pinned maintainer noise
+///    rules; divergent tree values hash normalized semantic arguments rather
+///    than representation bytes. The run's immutable policy digest is part of
+///    its comparison identity.
+pub const CANON_VERSION: u32 = 6;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -124,6 +126,11 @@ pub struct Entry {
 pub struct BehaviourTree {
     pub run_id: String,
     pub canon_version: u32,
+    /// Distinguishes this final version-6 format from version-6 caches
+    /// produced by an unmerged KM draft. Legacy headers default to zero and
+    /// are rebuilt, never mistaken for the generic semantic format.
+    #[serde(default)]
+    pub semantic_revision: u8,
     pub entries: Vec<Entry>,
     /// The lane each correlation ran in, from its connector call.
     pub lanes: HashMap<String, Lane>,
@@ -431,6 +438,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
     BehaviourTree {
         run_id: run_id.to_owned(),
         canon_version: CANON_VERSION,
+        semantic_revision: 1,
         entries,
         lanes,
         correlations,
@@ -482,6 +490,7 @@ impl BehaviourTree {
                 "correlations": self.correlations,
                 "event_schema_versions": self.event_schema_versions,
                 "policy_digest": self.policy_digest,
+                "semantic_revision": self.semantic_revision,
             })
             .to_string(),
         );
@@ -513,6 +522,10 @@ impl BehaviourTree {
         Some(Self {
             run_id: head.get("run_id")?.as_str()?.to_owned(),
             canon_version: head.get("canon_version")?.as_u64()? as u32,
+            semantic_revision: head
+                .get("semantic_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u8,
             entries,
             lanes: serde_json::from_value(head.get("lanes")?.clone()).ok()?,
             correlations: serde_json::from_value(head.get("correlations")?.clone()).ok()?,
@@ -551,6 +564,14 @@ mod tests {
         assert_eq!(
             BehaviourTree::from_jsonl(&legacy).unwrap().policy_digest,
             None
+        );
+        let prior_draft = encoded.replace(",\"semantic_revision\":1", "");
+        assert_eq!(
+            BehaviourTree::from_jsonl(&prior_draft)
+                .unwrap()
+                .semantic_revision,
+            0,
+            "an old draft tree must be rebuilt even if it used version 6"
         );
     }
     use super::*;
