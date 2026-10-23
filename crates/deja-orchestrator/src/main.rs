@@ -1054,6 +1054,13 @@ async fn v1_create_run(
             "boundary_policy is selected by the maintainer, not the caller",
         );
     }
+    // Queued Kubernetes runs are discovered only through the Deja run-store
+    // row. Unlike Compose, they cannot start file-only without stranding a
+    // suspended Job that the capacity scheduler cannot see.
+    let queued_k8s = matches!(&*st.executor, ExecutorSelection::K8s(k) if k.scheduler_capacity > 0);
+    if queued_k8s && st.store.is_none() {
+        return error_resp(503, "Kubernetes queue needs Deja DB; retry after recovery");
+    }
     if spec.mode == deja_orchestrator::RunMode::Replay && st.noise_store_configured {
         let active = if let Some(store) = &st.store {
             match store.boundary_policy_active(spec.system()).await {
@@ -1107,6 +1114,18 @@ async fn v1_create_run(
         Ok(run) => run,
         Err(e) => return error_resp(500, &format!("create run: {e}")),
     };
+    let reject_unregistered_queue = |error: &str| {
+        if let Err(cleanup) = std::fs::remove_file(st.root.run_path(&run.run_id)) {
+            eprintln!(
+                "deja-orchestrator: remove unadmitted queued run {}: {cleanup}",
+                run.run_id
+            );
+        }
+        error_resp(
+            503,
+            &format!("Kubernetes queue needs Deja DB; retry after recovery: {error}"),
+        )
+    };
     let ctx = if let Some(store) = &st.store {
         let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
         let params =
@@ -1128,6 +1147,9 @@ async fn v1_create_run(
                 )
                 .await
             {
+                if queued_k8s {
+                    return reject_unregistered_queue(&e.to_string());
+                }
                 eprintln!(
                     "deja-orchestrator: create run store transaction failed for {}: {e}; \
                      continuing file-only",
@@ -1150,6 +1172,9 @@ async fn v1_create_run(
                 )
                 .await
             {
+                if queued_k8s {
+                    return reject_unregistered_queue(&e.to_string());
+                }
                 eprintln!("deja-orchestrator: store insert_run failed: {e}");
             }
             let _ = store
@@ -6959,6 +6984,71 @@ mod tests {
             StatusCode::OK,
             "file-only run remains readable"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_kubernetes_requires_a_store_row_before_admission() {
+        let incluster = {
+            let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let sa = tempfile::tempdir().unwrap();
+            std::fs::write(sa.path().join("ca.crt"), "ca").unwrap();
+            std::fs::write(sa.path().join("namespace"), "ns\n").unwrap();
+            std::fs::write(sa.path().join("token"), "tok").unwrap();
+            std::env::set_var("KUBERNETES_SERVICE_HOST", "127.0.0.1");
+            std::env::set_var("KUBERNETES_SERVICE_PORT", "1");
+            let incluster = InClusterConfig::from_env_at(sa.path()).unwrap();
+            std::env::remove_var("KUBERNETES_SERVICE_HOST");
+            std::env::remove_var("KUBERNETES_SERVICE_PORT");
+            incluster
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut st = test_state(dir.path());
+        st.noise_store_configured = true;
+        st.executor = Arc::new(ExecutorSelection::K8s(Box::new(K8sExecutor {
+            incluster,
+            cfg: K8sExecutorConfig::from_env(),
+            scheduler_capacity: 1,
+        })));
+        let payload = serde_json::json!({
+            "mode":"replay",
+            "recording_id":"rec-not-on-disk",
+            "candidate_spec":{"kind":"prebuilt_image","image":"local/queued-smoke:unavailable"}
+        })
+        .to_string();
+        let request = || {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/runs")
+                .header("x-deja-actor", "queued-outage-smoke")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.clone()))
+                .unwrap()
+        };
+        let response = app_router(st.clone()).oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            std::fs::read_dir(st.root.root.join("runs"))
+                .unwrap()
+                .count(),
+            0,
+            "no file-only queued run or suspended Job may outlive the refusal"
+        );
+
+        if let Ok(url) = std::env::var("DEJA_TEST_DB_URL") {
+            let store = Arc::new(Store::connect(&url).await.unwrap());
+            st.store = Some(store.clone());
+            let response = app_router(st).oneshot(request()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let id = created["run_id"].as_str().unwrap();
+            assert!(
+                store.get_run(id).await.unwrap().is_some(),
+                "a recovered queued run must be visible to the scheduler registry"
+            );
+        }
     }
 
     fn pending_run(run_id: &str) -> Run {

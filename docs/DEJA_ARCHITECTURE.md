@@ -387,16 +387,25 @@ previous revisions, pinned run snapshots, or raw ledger arguments. When no
 rules are active, new runs carry no noise-policy digest.
 
 An explicit `DEJA_DB_URL` enables maintainer rules in **Deja's** state
-Postgres, independently of any system-under-test database. If Deja's rule
-store is unreachable, replay proceeds from its file-backed run record with
-**no newly loaded allowances**: previously approved noise may reappear as
-divergence, but no difference is silently approved. Catalog/audit writes
-are best-effort during an outage. A validated rule snapshot already read for
-a run remains pinned even if a later catalog write fails; a fetched but
-invalid rule document or digest is an integrity error and still refuses
-admission. Maintainer changes and policy preview require the connected Deja
-store. Without an explicitly configured rule store, replay retains its prior
-file-only behavior and no maintainer rules can be activated. Dashboard
+Postgres, independently of any system-under-test database. If it is
+unreachable, Compose replay proceeds file-backed with **no newly loaded
+allowances**: known noise may reappear, but no difference is silently
+approved. A validated snapshot already read remains pinned even if its
+later catalog write fails. An invalid fetched document or digest is an
+integrity error and still refuses admission. Direct Kubernetes execution
+without scheduling retains its existing behavior.
+
+Queued Kubernetes runs (`scheduler_capacity > 0`) cannot use that fallback:
+the capacity scheduler discovers runs only through Deja's store. Without a
+connected store or a successfully inserted run row, admission returns 503
+before creating a Job and removes any just-created run file. Retry after
+database recovery; restart the orchestrator if it booted without a store,
+so its scheduler starts. This is a scheduler dependency, not a noise-rule
+requirement.
+
+Maintainer changes and policy preview require the connected Deja store.
+Without an explicitly configured rule store, Compose replay retains its
+prior file-only behavior and cannot activate maintainer rules. Dashboard
 preview streams bounded historical ledger classifications without payloads
 and refuses to promise absorption without trusted pairing. Only a new replay
 proves the full effect. Three-way delta refuses comparisons across different
