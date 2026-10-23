@@ -1140,10 +1140,64 @@ export type CdEnvironment = {
   live_promotion_replay: CdPromotionReplayRow | null;
 };
 
+/** A merge's "what it changed": its merge-queue run (the queue sha against
+ *  main's base), else its newest pull-request run measured against a
+ *  baseline, with that run's delta verdict. */
+export type CdQueueSummary = {
+  run_id: string;
+  source: "queue" | "pr";
+  delta_against: string;
+  verdict?: Delta["verdict"];
+  unavailable?: DeltaUnavailable;
+};
+
+/** One merge a promotion carries, as `/cd/versions/{v}/promotion-preview` lists it. */
+export type CdCarried = {
+  version: CdVersionRow;
+  queue: CdQueueSummary | null;
+  /** The charged rows of its queue run's delta: what this merge changed. */
+  queue_rows: DeltaRow[];
+  /** Its own promotion replay against what the target runs. */
+  promotion_replay: CdPromotionReplayRow | null;
+};
+
+export type CdAttributedRow = DeltaRow & {
+  /** Later merges whose queue run showed the same shape. */
+  also_changed_by: string[];
+};
+
+/** The picked version's promotion delta, laid on the merges: `groups` oldest
+ *  first as the server attributes them. */
+export type CdPromotionDiff =
+  | (Pick<Delta, "verdict" | "buckets" | "lanes" | "requests" | "covered_correlations" | "uncovered" | "clean" | "tape" | "sides"> & {
+      groups: { version: string; rows: CdAttributedRow[] }[];
+      unattributed: DeltaRow[];
+      fixed: DeltaRow[];
+    })
+  | DeltaUnavailable;
+
+export type CdPromotionPreview = {
+  version: CdVersionRow;
+  environment: string;
+  target_live: CdVersionRow | null;
+  /** False when the merges that ride along cannot be known (the target's
+   *  release names no merge); `carried` then holds the picked version alone. */
+  carried_known: boolean;
+  carried: CdCarried[];
+  promotion_replay: CdPromotionReplayRow | null;
+  diff: CdPromotionDiff;
+};
+
 const sys = (system: string) => `system=${encodeURIComponent(system)}`;
 
 export const cdApi = {
   config: () => request<CdConfig>("/api/v1/cd/config"),
+  /** What promoting a version to an environment would do: the merges that
+   *  ride along with their verdicts, and the promotion delta by merge. */
+  promotionPreview: (system: string, version: string, environment: string) =>
+    request<CdPromotionPreview>(
+      `/api/v1/cd/versions/${encodeURIComponent(version)}/promotion-preview?${sys(system)}&environment=${encodeURIComponent(environment)}`,
+    ),
   promotionCheck: (system: string, environment: string, version: string) =>
     request<{ ok: boolean; from: string; target_live: string | null; checks: CdPromotionCheck[] }>(
       `/api/v1/cd/environments/${encodeURIComponent(environment)}/promotion-check?${sys(system)}&version=${encodeURIComponent(version)}`,

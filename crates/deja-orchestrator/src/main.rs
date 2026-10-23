@@ -428,6 +428,10 @@ fn app_router(state: AppState) -> Router {
             "/cd/versions/{version}/promotion-replays",
             cd_read(get(v1_cd_version_promotion_replays)).merge(post_cd_promotion_replay),
         )
+        .route(
+            "/cd/versions/{version}/promotion-preview",
+            cd_read(get(v1_cd_promotion_preview)),
+        )
         .route("/cd/deployments", post_cd_deployment)
         .route("/cd/environments", cd_read(get(v1_cd_environments)))
         .route("/cd/environments/{env}/observed", post_cd_observed)
@@ -5602,6 +5606,233 @@ async fn v1_cd_post_promotion_replay(
     cd_audit(&store, &actor.0, "cd.promotion_replay", "version", &format!("{}/{}", h.system, h.version),
         &serde_json::json!({ "against_version": h.against_version, "state": h.state, "verdict": h.verdict, "candidate_run": h.candidate_run, "baseline_run": h.baseline_run, "jenkins_build": h.jenkins_build })).await;
     json_ok_ser(&row)
+}
+
+/// `GET /api/v1/cd/versions/{version}/promotion-preview?system=&environment=`:
+/// what promoting the version to `environment` would do, for the preview
+/// page. The merges that ride along (`cd::carried_by`), each with its
+/// merge-queue run's delta verdict and charged rows and its own promotion
+/// replay against what the environment runs; the version's promotion
+/// replay; and that replay's three-way delta regrouped by the merge that
+/// first showed each divergence (`cd::attribute`). Reads only.
+async fn v1_cd_promotion_preview(
+    State(st): State<AppState>,
+    Path(version): Path<String>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    use deja_orchestrator::cd::{attribute, carried_by};
+    use deja_orchestrator::divergence::delta::Row;
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let environment = match q
+        .get("environment")
+        .map(String::as_str)
+        .filter(|e| !e.is_empty())
+    {
+        Some(e) if cd.environments.iter().any(|x| x == e) => e.to_owned(),
+        Some(e) => return error_resp(400, &format!("unknown environment {e:?}")),
+        None => return error_resp(400, "environment is required"),
+    };
+    let v = match store.cd_version_get(&system, &version).await {
+        Ok(Some(v)) => v,
+        Ok(None) => return error_resp(404, "no such version"),
+        Err(e) => return error_resp(500, &format!("version: {e}")),
+    };
+    let versions = match store.cd_versions_list(&system, 200).await {
+        Ok(v) => v,
+        Err(e) => return error_resp(500, &format!("versions: {e}")),
+    };
+    let live = match store
+        .cd_latest_live_for_environment(&system, &environment)
+        .await
+    {
+        Ok(l) => l,
+        Err(e) => return error_resp(500, &format!("environment: {e}")),
+    };
+    let target_live = match &live {
+        Some(l) => match versions.iter().find(|x| x.version == l.version) {
+            Some(x) => Some(x.clone()),
+            None => store
+                .cd_version_get(&system, &l.version)
+                .await
+                .ok()
+                .flatten(),
+        },
+        None => None,
+    };
+    let carried: Option<Vec<deja_store::CdVersionRow>> =
+        carried_by(&versions, &version, target_live.as_ref())
+            .map(|c| c.into_iter().cloned().collect());
+    let merges: Vec<deja_store::CdVersionRow> = carried.clone().unwrap_or_else(|| vec![v.clone()]);
+
+    fn rows_of(body: &serde_json::Value) -> Vec<Row> {
+        body.get("rows")
+            .and_then(|r| serde_json::from_value::<Vec<Row>>(r.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    // Each merge that rides along: its queue run's delta and its own
+    // promotion replay. Newest first here, as the page lists them.
+    let mut carried_out = Vec::with_capacity(merges.len());
+    let mut queues: Vec<(String, Vec<Row>)> = Vec::with_capacity(merges.len());
+    for m in &merges {
+        let queue = queue_run_of(&store, m).await;
+        let (summary, rows) = match &queue {
+            Some(qr) => match delta_for_run(&st, &qr.run_id, &qr.delta_against).await {
+                Ok(body) => (
+                    serde_json::json!({ "run_id": qr.run_id, "source": qr.source, "delta_against": qr.delta_against, "verdict": body["verdict"].clone() }),
+                    rows_of(&body),
+                ),
+                Err(why) => (
+                    serde_json::json!({ "run_id": qr.run_id, "source": qr.source, "delta_against": qr.delta_against, "unavailable": why.to_json() }),
+                    Vec::new(),
+                ),
+            },
+            None => (serde_json::Value::Null, Vec::new()),
+        };
+        let replay = match &target_live {
+            Some(t) => store
+                .cd_promotion_replay_of_pair(&system, &m.version, &t.version)
+                .await
+                .ok()
+                .flatten(),
+            None => None,
+        };
+        let charged: Vec<&Row> = rows.iter().filter(|r| r.bucket.charges_y()).collect();
+        carried_out.push(serde_json::json!({
+            "version": m,
+            "queue": summary,
+            "queue_rows": charged,
+            "promotion_replay": replay,
+        }));
+        queues.push((m.version.clone(), rows));
+    }
+    queues.reverse(); // oldest first, as `attribute` wants
+
+    // The picked version's promotion replay and the delta behind it, laid
+    // on the merges.
+    let replay = match &target_live {
+        Some(t) => store
+            .cd_promotion_replay_of_pair(&system, &version, &t.version)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let diff = match &replay {
+        Some(h) => match (h.candidate_run.as_deref(), h.baseline_run.as_deref()) {
+            (Some(y), Some(m)) => {
+                // The run's own delta is cached beside its ledger; any other
+                // pairing is computed on the spot, as v1_delta does.
+                let declared = run_params_for(&st, y).await.and_then(|p| p.delta_against);
+                let result = if declared.as_deref() == Some(m) {
+                    delta_for_run(&st, y, m).await
+                } else {
+                    delta_between(&st, y, m).await
+                };
+                match result {
+                    Ok(body) => {
+                        let a = attribute(rows_of(&body), &queues);
+                        serde_json::json!({
+                            "verdict": body["verdict"], "buckets": body["buckets"], "lanes": body["lanes"],
+                            "requests": body["requests"], "covered_correlations": body["covered_correlations"],
+                            "uncovered": body["uncovered"], "clean": body["clean"], "tape": body["tape"], "sides": body["sides"],
+                            "groups": a.groups, "unattributed": a.unattributed, "fixed": a.fixed,
+                        })
+                    }
+                    Err(why) => why.to_json(),
+                }
+            }
+            _ => {
+                let running = matches!(h.state, deja_store::PromotionReplayState::Requested);
+                serde_json::json!({
+                    "unavailable": if running {
+                        "the promotion replay is still running".to_owned()
+                    } else {
+                        format!("the promotion replay is {} and names no runs to compare", h.state)
+                    },
+                    "unavailable_kind": if running { "pending" } else { "refused" },
+                })
+            }
+        },
+        None => serde_json::json!({
+            "unavailable": match &target_live {
+                Some(t) => format!("no promotion replay of {version} against {}, which {environment} runs", t.version),
+                None => format!("{environment} runs nothing recorded, so there is nothing to replay against"),
+            },
+            "unavailable_kind": "refused",
+        }),
+    };
+    json_ok(serde_json::json!({
+        "version": v,
+        "environment": environment,
+        "target_live": target_live,
+        "carried_known": carried.is_some(),
+        "carried": carried_out,
+        "promotion_replay": replay,
+        "diff": diff,
+    }))
+}
+
+/// The run that says what a merge changed: its merge-queue replay (the
+/// queue sha against main's base), else its newest pull-request run that
+/// was measured against a baseline. `None` when déjà has neither.
+struct QueueRun {
+    run_id: String,
+    source: &'static str,
+    delta_against: String,
+}
+
+async fn queue_run_of(store: &deja_store::Store, m: &deja_store::CdVersionRow) -> Option<QueueRun> {
+    let pr = m.prs.first()?;
+    let ids = store
+        .runs_for_pull_request(&pr.repo.to_lowercase(), pr.pr_number, 10)
+        .await
+        .ok()?;
+    let mut fallback = None;
+    for id in ids {
+        let Ok(Some(row)) = store.get_run(&id).await else {
+            continue;
+        };
+        if row.state != "completed" {
+            continue;
+        }
+        let Ok(params) = serde_json::from_value::<deja_orchestrator::RunParams>(row.params) else {
+            continue;
+        };
+        let Some(against) = params.delta_against else {
+            continue;
+        };
+        if params
+            .label
+            .as_deref()
+            .is_some_and(|l| l.starts_with(deja_orchestrator::cd::QUEUE_LABEL))
+        {
+            return Some(QueueRun {
+                run_id: id,
+                source: "queue",
+                delta_against: against,
+            });
+        }
+        if fallback.is_none() {
+            fallback = Some(QueueRun {
+                run_id: id,
+                source: "pr",
+                delta_against: against,
+            });
+        }
+    }
+    fallback
 }
 
 /// `GET /api/v1/cd/pull-requests/{owner}/{repo}/{number}`: the versions
