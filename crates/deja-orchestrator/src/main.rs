@@ -4910,6 +4910,9 @@ async fn v1_cd_promotion_step(
         .await
     {
         Ok(row) => {
+            if step == "tagged" {
+                fill_promoted_release_prs(&store, &row).await;
+            }
             cd_audit(
                 &store,
                 &actor.0,
@@ -4923,6 +4926,76 @@ async fn v1_cd_promotion_step(
         }
         Err(e) => step_refusal(e, &step),
     }
+}
+
+/// Write `prs` on a release, unless it already lists as many: a list is
+/// never shrunk, so a later post (a retried promotion, reconcile) cannot
+/// undo it.
+async fn write_release_prs(
+    store: &deja_store::Store,
+    system: &str,
+    release: &str,
+    prs: Vec<deja_store::CdVersionPr>,
+) {
+    let Ok(Some(row)) = store.cd_version_get(system, release).await else {
+        return;
+    };
+    if prs.len() <= row.prs.len() {
+        return;
+    }
+    let v = deja_store::NewCdVersion {
+        system: system.to_owned(),
+        version: release.to_owned(),
+        kind: row.kind.clone(),
+        commit_sha: None,
+        image_tag: None,
+        chart: None,
+        released_from: None,
+        merged_at: None,
+        prs,
+    };
+    if let Err(e) = store.cd_version_upsert(&v).await {
+        eprintln!("deja-orchestrator: pull requests of {release} not written: {e}");
+    }
+}
+
+/// A promoted release carries every merge the promotion carried: the ones
+/// since what the target ran when Promote was pressed (`evidence.target_live`),
+/// up to the promoted merge. Known only when that release can be dated.
+async fn fill_promoted_release_prs(store: &deja_store::Store, req: &deja_store::CdPromotionRow) {
+    let Some(release) = req.release.as_deref() else {
+        return;
+    };
+    let Ok(versions) = store.cd_versions_list(&req.system, 200).await else {
+        return;
+    };
+    let target_live = req
+        .evidence
+        .get("target_live")
+        .and_then(|t| t.as_str())
+        .and_then(|t| versions.iter().find(|v| v.version == t));
+    let Some(merges) = deja_orchestrator::cd::carried_by(&versions, &req.from_version, target_live)
+    else {
+        return;
+    };
+    let prs = deja_orchestrator::cd::prs_of(&merges);
+    write_release_prs(store, &req.system, release, prs).await;
+}
+
+/// A release placed on main carries the merges since the dated release
+/// before it; left as it is when there is none.
+async fn fill_placed_release_prs(store: &deja_store::Store, system: &str, release: &str) {
+    let Ok(versions) = store.cd_versions_list(system, 200).await else {
+        return;
+    };
+    let Some(row) = versions.iter().find(|v| v.version == release) else {
+        return;
+    };
+    let Some(merges) = deja_orchestrator::cd::merges_since_previous_release(&versions, row) else {
+        return;
+    };
+    let prs = deja_orchestrator::cd::prs_of(&merges);
+    write_release_prs(store, system, release, prs).await;
 }
 
 /// `GET /api/v1/cd/promotion-requests/{id}`: one request with every step it
@@ -5142,6 +5215,12 @@ async fn v1_cd_post_version(
     v.prs.retain(|p| !p.repo.trim().is_empty());
     if let Err(e) = store.cd_version_upsert(&v).await {
         return error_resp(500, &format!("version: {e}"));
+    }
+    // A release placed on main with no pull requests of its own (reconcile
+    // placing one cut outside the pipeline) carries those of the merges
+    // since the release before it, when that can be dated.
+    if v.kind == "release" && v.released_from.is_some() && v.prs.is_empty() {
+        fill_placed_release_prs(&store, &v.system, &v.version).await;
     }
     cd_audit(
         &store,
@@ -5673,7 +5752,15 @@ async fn v1_cd_promotion_preview(
     let carried: Option<Vec<deja_store::CdVersionRow>> =
         carried_by(&versions, &version, target_live.as_ref())
             .map(|c| c.into_iter().cloned().collect());
-    let merges: Vec<deja_store::CdVersionRow> = carried.clone().unwrap_or_else(|| vec![v.clone()]);
+    // When where to stop is not known, every merge up to this one: an upper
+    // bound, said so on the page, rather than this merge alone.
+    let merges: Vec<deja_store::CdVersionRow> = match &carried {
+        Some(c) => c.clone(),
+        None => deja_orchestrator::cd::carried_at_most(&versions, &version, CARRIED_AT_MOST)
+            .into_iter()
+            .cloned()
+            .collect(),
+    };
 
     fn rows_of(body: &serde_json::Value) -> Vec<Row> {
         body.get("rows")
@@ -5778,11 +5865,16 @@ async fn v1_cd_promotion_preview(
         "environment": environment,
         "target_live": target_live,
         "carried_known": carried.is_some(),
+        "carried_at_most": CARRIED_AT_MOST,
         "carried": carried_out,
         "promotion_replay": replay,
         "diff": diff,
     }))
 }
+
+/// How many merges a preview lists when it cannot tell where the target's
+/// release sits: each one's runs are looked up, so the page stays quick.
+const CARRIED_AT_MOST: usize = 30;
 
 /// The run that says what a merge changed: its merge-queue replay (the
 /// queue sha against main's base), else its newest pull-request run that

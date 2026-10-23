@@ -339,3 +339,26 @@ describe("releaseTagOf", () => {
     expect(releaseTagOf([row({ id: 1, version: "x", state: "live", at: "2026-10-12T07:12:00Z" }), null])).toBeNull();
   });
 });
+
+describe("a release placed on main by reconcile", () => {
+  const versions = [
+    merge("9d8050b234", "2026-10-23T12:28:00Z", 2592),
+    merge("43f19af99b", "2026-10-23T08:54:00Z", 2466),
+    merge("1a2b3c4d5e", "2026-10-15T10:00:00Z", 2500),
+  ];
+  // 2026.10.16.2 sits on 21e6bdad4c, a merge déjà never recorded; reconcile
+  // gave it the tag commit's time.
+  const placed = v({ version: "2026.10.16.2", kind: "release", released_from: "21e6bdad4c", merged_at: "2026-10-16T14:39:57Z" });
+
+  test("counts from its own time when the merge it names is not tracked", () => {
+    expect(mergesSince(versions, placed)?.map((x) => x.version)).toEqual(["9d8050b234", "43f19af99b"]);
+  });
+
+  test("a release only seen by name still cannot be counted from", () => {
+    expect(mergesSince(versions, v({ version: "2026.10.16.2", kind: "release", merged_at: "2026-10-16T14:39:57Z" }))).toBeNull();
+  });
+
+  test("says where it was cut when it carries no recorded pull requests", () => {
+    expect(carries(placed)).toBe("cut on 21e6bdad4c");
+  });
+});
