@@ -19,6 +19,16 @@ function ruleDescription(rule: BoundaryRule): string {
   return `${boundary} / ${trait_name} / ${method_name} · ${source} · ${target}`;
 }
 
+function sameRule(a: BoundaryRule, b: BoundaryRule): boolean {
+  return a.selector.boundary === b.selector.boundary
+    && a.selector.trait_name === b.selector.trait_name
+    && a.selector.method_name === b.selector.method_name
+    && (a.source_path ?? null) === (b.source_path ?? null)
+    && a.target.kind === b.target.kind
+    && a.target.json_pointer === b.target.json_pointer
+    && (a.target.kind !== "header_value" || (b.target.kind === "header_value" && a.target.name.toLowerCase() === b.target.name.toLowerCase()));
+}
+
 export default function BoundaryPolicyPage() {
   const { system = "" } = useParams();
   const me = useMe();
@@ -32,6 +42,7 @@ export default function BoundaryPolicyPage() {
   });
   const runs = useQuery({ queryKey: ["runs", system], queryFn: api.runs, enabled: !!system && allowed });
   const activeId = policy.data?.active?.id ?? null;
+  const activeRules = policy.data?.active?.snapshot.rules ?? [];
   const [draft, setDraft] = React.useState<BoundaryRule[]>([]);
   const [boundary, setBoundary] = React.useState("");
   const [traitName, setTraitName] = React.useState("");
@@ -44,6 +55,11 @@ export default function BoundaryPolicyPage() {
   const [runId, setRunId] = React.useState("");
   const [preview, setPreview] = React.useState<BoundaryPolicyPreview | null>(null);
   const [message, setMessage] = React.useState("");
+  const additions = draft.filter((rule) => !activeRules.some((active) => sameRule(rule, active)));
+  const removals = activeRules.filter((rule) => !draft.some((item) => sameRule(rule, item)));
+  const action = additions.length === 1 && removals.length === 0 ? "append"
+    : additions.length === 0 && removals.length === 1 ? "revoke" : null;
+  const changedRule = action === "append" ? additions[0] : action === "revoke" ? removals[0] : null;
 
   // A revision is immutable; editing always starts from the current active
   // snapshot. A new activation refreshes the draft instead of silently
@@ -59,9 +75,12 @@ export default function BoundaryPolicyPage() {
     onError: (error) => setMessage(String(error)),
   });
   const proposeMutation = useMutation({
-    mutationFn: () => boundaryPolicyApi.propose(system, draft, reason.trim(), activeId),
+    mutationFn: () => {
+      if (!action || !changedRule) throw new Error("Propose one appended or revoked rule at a time.");
+      return boundaryPolicyApi.propose(system, action, changedRule, reason.trim(), activeId);
+    },
     onSuccess: async () => {
-      setMessage("Proposal recorded. Another signed-in maintainer must activate it.");
+      setMessage("One-rule change proposed. Another signed-in maintainer must confirm it.");
       setReason("");
       await client.invalidateQueries({ queryKey: ["boundary-policy", system] });
     },
@@ -70,13 +89,17 @@ export default function BoundaryPolicyPage() {
   const activateMutation = useMutation({
     mutationFn: (id: number) => boundaryPolicyApi.activate(system, id, activeId),
     onSuccess: async () => {
-      setMessage("Revision activated for future replays; existing run snapshots are unchanged.");
+      setMessage("Allowance change activated for future replays; existing run snapshots are unchanged.");
       await client.invalidateQueries({ queryKey: ["boundary-policy", system] });
     },
     onError: (error) => setMessage(`Activation refused; refresh if the active revision changed: ${String(error)}`),
   });
 
   const addRule = () => {
+    if (action) {
+      setMessage("Propose or cancel the current single-rule change before adding another.");
+      return;
+    }
     if (!boundary.trim() || !traitName.trim() || !methodName.trim() || !jsonPointer.startsWith("/")) {
       setMessage("Provide an exact boundary, trait, method, and a JSON Pointer beginning with /.");
       return;
@@ -99,6 +122,10 @@ export default function BoundaryPolicyPage() {
       ...(sourcePath.trim() ? { source_path: sourcePath.trim() } : {}),
       target,
     };
+    if (draft.some((rule) => sameRule(rule, next))) {
+      setMessage("This exact allowance is already in the effective set or draft.");
+      return;
+    }
     setDraft((previous) => [...previous, next]);
     setPreview(null);
     setMessage("");
@@ -113,22 +140,22 @@ export default function BoundaryPolicyPage() {
     && (run.params.system_under_test ?? systems.defaultSystem?.name) === system);
 
   return <>
-    <h1>Maintainer boundary noise · {system}</h1>
-    <p className="hint">Semantic JSON decoding is automatic. These rules approve only the named residual difference for future replays—not a PR author's acknowledgement or a rewrite of past results.</p>
+    <h1>Maintainer replay allowances · {system}</h1>
+    <p className="hint">Semantic JSON decoding is automatic. Append one exact noise allowance, or revoke one once its cause is fixed. Old runs keep the rules they were scored with.</p>
     <p role="note"><strong>Safety:</strong> approving a scalar or header value is a maintainer declaration, not proof that a signature is valid. Every other argument remains compared. Raw captured arguments stay in the call ledger, not this preview.</p>
     <section>
-      <h2>Effective policy</h2>
+      <h2>Effective allowances</h2>
       {policy.data?.active ? <>
-        <p>Revision {policy.data.active.id} · digest <code>{policy.data.active.snapshot.digest}</code></p>
+        <p>Last change #{policy.data.active.id} · digest <code>{policy.data.active.snapshot.digest}</code></p>
         <p>{policy.data.active.reason}</p>
         {policy.data.active.snapshot.rules.length === 0
-          ? <p>Strict: no approved noise.</p>
+          ? <p>No approved noise.</p>
           : <ul>{policy.data.active.snapshot.rules.map((rule, index) => <li key={index}>{ruleDescription(rule)}</li>)}</ul>}
-      </> : <p>No active revision. New replays have no approved noise.</p>}
+      </> : <p>No allowances appended. Existing replay admission remains unchanged.</p>}
     </section>
     <section>
-      <h2>Draft a revision</h2>
-      <p className="hint">Adding or removing a rule creates a new immutable proposal. A different maintainer activates it. Remove the rule once its root cause is fixed; older runs retain their pinned revision.</p>
+      <h2>Append or revoke one allowance</h2>
+      <p className="hint">Each action proposes one immutable, audited change. A different maintainer confirms it. The effective set changes only after confirmation; old runs retain their pinned rules.</p>
       <label>Boundary <input type="text" value={boundary} onChange={(event) => setBoundary(event.target.value)} placeholder="exact boundary name" /></label>{" "}
       <label>Trait <input type="text" value={traitName} onChange={(event) => setTraitName(event.target.value)} placeholder="exact trait name" /></label>{" "}
       <label>Method <input type="text" value={methodName} onChange={(event) => setMethodName(event.target.value)} placeholder="exact method name" /></label>
@@ -140,13 +167,21 @@ export default function BoundaryPolicyPage() {
       </select></label>{" "}
       <label>JSON Pointer <input type="text" value={jsonPointer} onChange={(event) => setJsonPointer(event.target.value)} placeholder="/headers" /></label>{" "}
       {targetKind === "header_value" && <label>Header name <input type="text" value={headerName} onChange={(event) => setHeaderName(event.target.value)} /></label>}
-      <button className="btn" onClick={addRule}>Add to draft</button>
-      <h3>Draft rules</h3>
-      {draft.length === 0 ? <p>None: a strict revision disables every approved noise allowance.</p> :
+      <button className="btn" onClick={addRule} disabled={action !== null}>Add one allowance</button>
+      <h3>Proposed effective rules</h3>
+      {draft.length === 0 ? <p>No approved noise.</p> :
         <ul>{draft.map((rule, index) => <li key={index}>{ruleDescription(rule)}{" "}
-          <button className="btn" onClick={() => { setDraft((items) => items.filter((_, i) => i !== index)); setPreview(null); }}>Remove for future runs</button>
+          <button className="btn" disabled={action !== null && (action !== "append" || !changedRule || !sameRule(rule, changedRule))}
+            onClick={() => { setDraft((items) => items.filter((_, i) => i !== index)); setPreview(null); }}>
+            {activeRules.some((active) => sameRule(active, rule)) ? "Revoke for future runs" : "Cancel addition"}
+          </button>
         </li>)}</ul>}
-      <label htmlFor="noise-reason">Reason for this revision</label>
+      {action && <button className="btn" onClick={() => {
+        setDraft(activeRules);
+        setPreview(null);
+        setMessage("");
+      }}>Cancel draft change</button>}
+      <label htmlFor="noise-reason">Reason for this one-rule change</label>
       <textarea id="noise-reason" value={reason} onChange={(event) => setReason(event.target.value)} />
       <label htmlFor="noise-preview-run">Preview against a replay run</label>
       <select id="noise-preview-run" value={runId} onChange={(event) => { setRunId(event.target.value); setPreview(null); }}>
@@ -162,7 +197,10 @@ export default function BoundaryPolicyPage() {
           {example.classification === "untrusted_pair" && " (unpaired or independently reordered)"}
         </li>)}</ul>
       </div>}
-      <p><button className="btn" disabled={!reason.trim() || proposeMutation.isPending} onClick={() => { setMessage(""); proposeMutation.mutate(); }}>Propose immutable revision</button></p>
+      <p><button className="btn" disabled={!action || !reason.trim() || proposeMutation.isPending}
+        onClick={() => { setMessage(""); proposeMutation.mutate(); }}>
+        {action === "append" ? "Propose append" : action === "revoke" ? "Propose revocation" : "Choose one change"}
+      </button></p>
       {message && <p role="status">{message}</p>}
     </section>
     <section>
@@ -171,16 +209,19 @@ export default function BoundaryPolicyPage() {
         <thead><tr><th>Revision</th><th>Status</th><th>Rules</th><th>Reason</th><th>Proposed by</th><th>Confirmed by</th><th>Action</th></tr></thead>
         <tbody>{policy.data?.revisions.map((revision) => <tr key={revision.id}>
           <td>{revision.id}</td>
-          <td>{revision.id === activeId ? "active" : revision.activated_at ? "superseded" : "proposed"}</td>
-          <td>{revision.snapshot.rules.length === 0 ? "strict" : revision.snapshot.rules.map(ruleDescription).join("; ")}</td>
+          <td>{revision.id === activeId ? "active" : revision.activated_at ? "superseded" : revision.base_revision_id !== activeId ? "stale proposal" : "proposed"}</td>
+          <td>{revision.snapshot.rules.length === 0 ? "none" : revision.snapshot.rules.map(ruleDescription).join("; ")}</td>
           <td>{revision.reason}</td>
           <td>{revision.proposed_by}</td>
           <td>{revision.confirmed_by ?? "—"}</td>
-          <td>{revision.id !== activeId && (revision.proposed_by === (me.data?.email ?? "")
-            ? <span className="hint">Awaiting another maintainer</span>
-            : <button className="btn" disabled={activateMutation.isPending} onClick={() => { setMessage(""); activateMutation.mutate(revision.id); }}>
-              {revision.activated_at ? "Rollback to this revision" : "Confirm and activate"}
-            </button>)}</td>
+          <td>{!revision.activated_at && revision.base_revision_id === activeId && (
+            revision.proposed_by === (me.data?.email ?? "")
+              ? <span className="hint">Awaiting another maintainer</span>
+              : <button className="btn" disabled={activateMutation.isPending}
+                  onClick={() => { setMessage(""); activateMutation.mutate(revision.id); }}>
+                  Confirm this change
+                </button>
+          )}</td>
         </tr>)}</tbody>
       </table>}
     </section>

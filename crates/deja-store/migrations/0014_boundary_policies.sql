@@ -1,7 +1,7 @@
 -- Immutable, per-system replay argument policies. A proposal is not active
 -- until a different signed-in maintainer confirms it. The active pointer and
--- its audit event are written in one transaction; rollback re-selects an old
--- revision rather than mutating its document.
+-- its audit event are written in one transaction; each new revision descends
+-- from the active revision it changes.
 CREATE TABLE boundary_policy_revisions (
     id BIGSERIAL PRIMARY KEY,
     system TEXT NOT NULL,
@@ -13,6 +13,8 @@ CREATE TABLE boundary_policy_revisions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     confirmed_by TEXT,
     confirmed_by_sub TEXT,
+    base_revision_id BIGINT REFERENCES boundary_policy_revisions(id),
+    operation TEXT NOT NULL CHECK (operation IN ('append', 'revoke')),
     activated_at TIMESTAMPTZ,
     CHECK (length(btrim(system)) > 0),
     CHECK (length(btrim(reason)) > 0),

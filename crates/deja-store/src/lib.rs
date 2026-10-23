@@ -330,6 +330,8 @@ pub struct BoundaryPolicyRow {
     pub proposed_by: String,
     #[serde(skip_serializing)]
     pub proposed_by_sub: String,
+    pub base_revision_id: Option<i64>,
+    pub operation: String,
     pub created_at: DateTime<Utc>,
     pub confirmed_by: Option<String>,
     #[serde(skip_serializing)]
@@ -1978,7 +1980,7 @@ impl Store {
 }
 
 const POLICY_SELECT: &str = "SELECT r.id, r.system, r.digest, r.document, r.reason, \
-    r.proposed_by, r.proposed_by_sub, r.created_at, r.confirmed_by, \
+    r.proposed_by, r.proposed_by_sub, r.base_revision_id, r.operation, r.created_at, r.confirmed_by, \
     r.confirmed_by_sub, r.activated_at FROM boundary_policy_revisions r";
 
 fn boundary_policy_row(r: sqlx::postgres::PgRow) -> BoundaryPolicyRow {
@@ -1990,10 +1992,12 @@ fn boundary_policy_row(r: sqlx::postgres::PgRow) -> BoundaryPolicyRow {
         reason: r.get(4),
         proposed_by: r.get(5),
         proposed_by_sub: r.get(6),
-        created_at: r.get(7),
-        confirmed_by: r.get(8),
-        confirmed_by_sub: r.get(9),
-        activated_at: r.get(10),
+        base_revision_id: r.get(7),
+        operation: r.get(8),
+        created_at: r.get(9),
+        confirmed_by: r.get(10),
+        confirmed_by_sub: r.get(11),
+        activated_at: r.get(12),
     }
 }
 
@@ -2036,6 +2040,8 @@ impl Store {
         reason: &str,
         actor: &str,
         subject: &str,
+        rule: &serde_json::Value,
+        operation: &str,
         expected_active: Option<i64>,
     ) -> Result<BoundaryPolicyRow, BoundaryPolicyWriteError> {
         let mut tx = self.pool.begin().await?;
@@ -2048,7 +2054,35 @@ impl Store {
                 .bind(system)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if active != expected_active {
+        if active != expected_active || !matches!(operation, "append" | "revoke") {
+            return Err(BoundaryPolicyWriteError::Conflict);
+        }
+        let mut rules = if let Some(id) = active {
+            let current: serde_json::Value = sqlx::query_scalar(
+                "SELECT document FROM boundary_policy_revisions WHERE id = $1 AND system = $2",
+            )
+            .bind(id)
+            .bind(system)
+            .fetch_one(&mut *tx)
+            .await?;
+            current["rules"]
+                .as_array()
+                .cloned()
+                .ok_or(BoundaryPolicyWriteError::Conflict)?
+        } else {
+            Vec::new()
+        };
+        match operation {
+            "append" if !rules.contains(rule) => rules.push(rule.clone()),
+            "revoke" => {
+                let Some(index) = rules.iter().position(|existing| existing == rule) else {
+                    return Err(BoundaryPolicyWriteError::Conflict);
+                };
+                rules.remove(index);
+            }
+            _ => return Err(BoundaryPolicyWriteError::Conflict),
+        }
+        if document["rules"].as_array() != Some(&rules) {
             return Err(BoundaryPolicyWriteError::Conflict);
         }
         // Identical rules may be proposed by different maintainers for
@@ -2056,8 +2090,8 @@ impl Store {
         // own proposer subject for the two-person activation check.
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO boundary_policy_revisions
-               (system, digest, document, reason, proposed_by, proposed_by_sub)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+               (system, digest, document, reason, proposed_by, proposed_by_sub, base_revision_id, operation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
         )
         .bind(system)
         .bind(digest)
@@ -2065,6 +2099,8 @@ impl Store {
         .bind(reason)
         .bind(actor)
         .bind(subject)
+        .bind(active)
+        .bind(operation)
         .fetch_one(&mut *tx)
         .await?;
         let row = sqlx::query(&format!("{POLICY_SELECT} WHERE r.id = $1"))
@@ -2078,15 +2114,15 @@ impl Store {
         )
         .bind(actor)
         .bind(format!("{system}:{}", proposal.id))
-        .bind(serde_json::json!({"system":system,"revision":proposal.id,"digest":digest}))
+        .bind(serde_json::json!({"system":system,"revision":proposal.id,"digest":digest,"base_revision_id":active,"operation":operation}))
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(proposal)
     }
 
-    /// Re-selecting a prior immutable revision is rollback. The active pointer
-    /// and audit event commit together, with a two-person sign-in guard.
+    /// Activates only the proposal based on the current revision, preventing
+    /// stale changes and historical whole-document rollback.
     pub async fn boundary_policy_activate(
         &self,
         system: &str,
@@ -2125,6 +2161,9 @@ impl Store {
         if active == Some(id) {
             tx.commit().await?;
             return Ok(proposal);
+        }
+        if proposal.base_revision_id != active {
+            return Err(BoundaryPolicyWriteError::Conflict);
         }
         sqlx::query(
             "UPDATE boundary_policy_revisions SET
@@ -2539,21 +2578,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boundary_policy_activation_is_two_person_atomic_and_reversible() {
+    async fn scoped_rule_appends_revocations_and_stale_bases_are_atomic() {
         let Some(store) = store_under_test().await else {
             eprintln!("skipped: DEJA_TEST_DB_URL is not set");
             return;
         };
-        let system = unique("policy-system");
-        let strict = serde_json::json!({"rules":[]});
+        let system = unique("rule-append");
+        let first = serde_json::json!({
+            "selector":{"boundary":"api","trait_name":"service","method_name":"send"},
+            "source_path":"/request/data",
+            "target":{"kind":"scalar","json_pointer":"/signature"}
+        });
+        let second = serde_json::json!({
+            "selector":{"boundary":"api","trait_name":"service","method_name":"send"},
+            "source_path":"/request/data",
+            "target":{"kind":"header_group","json_pointer":"/headers"}
+        });
+        let one = serde_json::json!({"rules":[first.clone()]});
+        let two = serde_json::json!({"rules":[first.clone(),second.clone()]});
+        let without_first = serde_json::json!({"rules":[second.clone()]});
+
         let proposed = store
             .boundary_policy_propose(
                 &system,
-                "strict",
-                &strict,
-                "Disable entropy allowances",
+                "d1",
+                &one,
+                "Approve one scalar",
                 "alice@example.test",
                 "alice-sub",
+                &first,
+                "append",
                 None,
             )
             .await
@@ -2575,40 +2629,37 @@ mod tests {
                 .await,
             Err(super::BoundaryPolicyWriteError::SameActor)
         ));
-        assert!(store
-            .boundary_policy_active(&system)
-            .await
-            .unwrap()
-            .is_none());
-        let activated = store
+        store
             .boundary_policy_activate(&system, proposed.id, None, "bob@example.test", "bob-sub")
             .await
             .unwrap();
-        assert_eq!(activated.id, proposed.id);
-        assert_eq!(activated.confirmed_by.as_deref(), Some("bob@example.test"));
-        assert!(matches!(
-            store
-                .boundary_policy_propose(
-                    &system,
-                    "stale",
-                    &strict,
-                    "Stale request",
-                    "alice@example.test",
-                    "alice-sub",
-                    None
-                )
-                .await,
-            Err(super::BoundaryPolicyWriteError::Conflict)
-        ));
-        let permissive = serde_json::json!({"rules":[{"boundary":"km"}]});
-        let second = store
+
+        // Both proposals name the same base. Only the first one activated may
+        // land; the other cannot replace its intervening append.
+        let appended = store
             .boundary_policy_propose(
                 &system,
-                "allowance",
-                &permissive,
-                "Controlled allowance",
-                "bob@example.test",
-                "bob-sub",
+                "d2",
+                &two,
+                "Approve header presentation",
+                "carol@example.test",
+                "carol-sub",
+                &second,
+                "append",
+                Some(proposed.id),
+            )
+            .await
+            .unwrap();
+        let stale = store
+            .boundary_policy_propose(
+                &system,
+                "d3",
+                &serde_json::json!({"rules":[]}),
+                "Revoke first, based on old revision",
+                "eve@example.test",
+                "eve-sub",
+                &first,
+                "revoke",
                 Some(proposed.id),
             )
             .await
@@ -2616,114 +2667,55 @@ mod tests {
         store
             .boundary_policy_activate(
                 &system,
-                second.id,
+                appended.id,
                 Some(proposed.id),
-                "alice@example.test",
-                "alice-sub",
+                "dave@example.test",
+                "dave-sub",
             )
             .await
             .unwrap();
+        assert!(matches!(
+            store
+                .boundary_policy_activate(
+                    &system,
+                    stale.id,
+                    Some(appended.id),
+                    "frank@example.test",
+                    "frank-sub"
+                )
+                .await,
+            Err(super::BoundaryPolicyWriteError::Conflict)
+        ));
         assert_eq!(
             store
                 .boundary_policy_active(&system)
                 .await
                 .unwrap()
                 .unwrap()
-                .id,
-            second.id
+                .document,
+            two
         );
-        // Rollback points to the immutable old revision, not a rewritten rule.
-        store
-            .boundary_policy_activate(
-                &system,
-                proposed.id,
-                Some(second.id),
-                "bob@example.test",
-                "bob-sub",
-            )
-            .await
-            .unwrap();
-        let restored = store
-            .boundary_policy_active(&system)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(restored.document, strict);
-        // Same content from another maintainer is a distinct audited act, not
-        // an alias for Alice's old proposal with Alice still named proposer.
-        let duplicate = store
-            .boundary_policy_propose(
-                &system,
-                "strict",
-                &strict,
-                "Independent strict proposal",
-                "carol@example.test",
-                "carol-sub",
-                Some(proposed.id),
-            )
-            .await
-            .unwrap();
-        assert_ne!(duplicate.id, proposed.id);
-        assert_eq!(duplicate.proposed_by_sub, "carol-sub");
         assert!(matches!(
             store
-                .boundary_policy_activate(
+                .boundary_policy_propose(
                     &system,
-                    duplicate.id,
-                    Some(proposed.id),
-                    "carol@example.test",
-                    "carol-sub"
+                    "bad",
+                    &one,
+                    "Attempt whole-set replacement",
+                    "eve@example.test",
+                    "eve-sub",
+                    &first,
+                    "append",
+                    Some(appended.id)
                 )
                 .await,
-            Err(super::BoundaryPolicyWriteError::SameActor)
+            Err(super::BoundaryPolicyWriteError::Conflict)
         ));
-        let audit_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM audit_events WHERE object_type = 'boundary_policy'
-             AND object_id LIKE $1",
-        )
-        .bind(format!("{system}:%"))
-        .fetch_one(&store.pool)
-        .await
-        .unwrap();
-        assert_eq!(audit_count, 6); // Three proposals and three activations.
-    }
 
-    #[tokio::test]
-    async fn revoking_noise_activates_new_rules_without_rewriting_older_runs() {
-        let Some(store) = store_under_test().await else {
-            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
-            return;
-        };
-        let system = unique("policy-revoke");
-        let with_noise = serde_json::json!({"rules":[{
-            "selector":{"boundary":"api","trait_name":"service","method_name":"send"},
-            "source_path":"/request/data",
-            "target":{"kind":"scalar","json_pointer":"/signature"}
-        }]});
-        let allowed = store
-            .boundary_policy_propose(
-                &system,
-                "digest-allowed",
-                &with_noise,
-                "Known volatile signature",
-                "alice@example.test",
-                "alice-sub",
-                None,
-            )
-            .await
-            .unwrap();
-        store
-            .boundary_policy_activate(&system, allowed.id, None, "bob@example.test", "bob-sub")
-            .await
-            .unwrap();
-        let run_id = unique("run-policy");
-        let pinned = serde_json::json!({
-            "boundary_policy":{
-                "revision_id":allowed.id,
-                "digest":allowed.digest,
-                "rules":with_noise["rules"]
-            }
-        });
+        let run_id = unique("run-rule-append");
+        let pinned = serde_json::json!({"boundary_policy":{
+            "revision_id":appended.id,"digest":"d2","rules":two["rules"]
+        }});
         store
             .insert_run_with_audit(
                 &run_id,
@@ -2732,22 +2724,22 @@ mod tests {
                 &serde_json::json!({"kind":"prebuilt_image"}),
                 &pinned,
                 None,
-                "alice@example.test",
+                "dave@example.test",
                 &serde_json::json!({"system":system}),
             )
             .await
             .unwrap();
-
-        let strict = serde_json::json!({"rules":[]});
-        let removed = store
+        let revoked = store
             .boundary_policy_propose(
                 &system,
-                "digest-revoked",
-                &strict,
-                "Root entropy bug fixed",
-                "carol@example.test",
-                "carol-sub",
-                Some(allowed.id),
+                "d4",
+                &without_first,
+                "Entropy source was fixed",
+                "alice@example.test",
+                "alice-sub",
+                &first,
+                "revoke",
+                Some(appended.id),
             )
             .await
             .unwrap();
@@ -2758,16 +2750,16 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .id,
-            allowed.id,
-            "a proposal alone does not change future scoring"
+            appended.id,
+            "proposal does not change effective rules"
         );
         store
             .boundary_policy_activate(
                 &system,
-                removed.id,
-                Some(allowed.id),
-                "dave@example.test",
-                "dave-sub",
+                revoked.id,
+                Some(appended.id),
+                "bob@example.test",
+                "bob-sub",
             )
             .await
             .unwrap();
@@ -2778,25 +2770,34 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .document,
-            strict
+            without_first
         );
-        let revisions = store.boundary_policy_revisions(&system).await.unwrap();
         assert_eq!(
-            revisions
-                .iter()
-                .find(|revision| revision.id == allowed.id)
+            store
+                .boundary_policy_revisions(&system)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|row| row.id == appended.id)
                 .unwrap()
                 .document,
-            with_noise,
-            "old approved revision remains immutable"
+            two
         );
         assert_eq!(
             store.get_run(&run_id).await.unwrap().unwrap().params,
             pinned,
-            "revocation cannot rewrite a run's pinned scoring policy"
+            "previous run snapshot cannot be revoked retroactively"
         );
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events WHERE object_type = 'boundary_policy'
+             AND object_id LIKE $1",
+        )
+        .bind(format!("{system}:%"))
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 7); // Four proposals and three activations.
     }
-
     /// A settlement against the old baseline that was in flight when the run
     /// was re-pointed must not land: the row would say A's verdict while
     /// naming B. The verdict update is conditioned on the baseline it was

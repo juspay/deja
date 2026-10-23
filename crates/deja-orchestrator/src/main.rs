@@ -56,6 +56,9 @@ struct WebAssets;
 struct AppState {
     root: Arc<HarnessRoot>,
     store: Option<Arc<Store>>,
+    /// Explicit `DEJA_DB_URL` opts into authoritative maintainer rule storage.
+    /// The optional localhost dashboard store does not change file-only replay.
+    noise_store_configured: bool,
     mutation_auth: MutationAuth,
     executor: Arc<ExecutorSelection>,
     /// Sign-in for the gated actions (acknowledging, later promoting). Off
@@ -182,6 +185,7 @@ async fn main() {
     // still execute without it (file-backed worker state); store-backed
     // surfaces return 503 until it is up (demo/lib.sh boots the orchestrator
     // pg).
+    let noise_store_configured = std::env::var_os("DEJA_DB_URL").is_some();
     let db_url =
         std::env::var("DEJA_DB_URL").unwrap_or_else(|_| deja_store::DEFAULT_DB_URL.to_string());
     let store = match Store::connect(&db_url).await {
@@ -260,6 +264,7 @@ async fn main() {
     let state = AppState {
         root: root.clone(),
         store,
+        noise_store_configured,
         mutation_auth: MutationAuth::from_env(),
         executor,
         auth,
@@ -697,6 +702,9 @@ async fn require_boundary_policy_maintainer(
     if session.sub.is_empty() {
         return error_resp(401, "sign-in has no stable subject");
     }
+    if !st.noise_store_configured {
+        return error_resp(503, "maintainer rule storage needs an explicit DEJA_DB_URL");
+    }
     req.extensions_mut()
         .insert(AuthenticatedActor(session.email));
     req.extensions_mut().insert(ActorSubject(Some(session.sub)));
@@ -1038,57 +1046,49 @@ async fn v1_create_run(
         }
     }
     let mut spec = spec;
-    // Callers cannot choose an older/more permissive policy by posting their
-    // own snapshot. The store is mandatory even for systems with no active
-    // revision: that absence is a pinned, explicit strict policy.
+    // Callers never choose maintainer decisions. Unconfigured file-only
+    // replays keep their legacy admission path and carry no noise snapshot.
     if body_has_boundary_policy {
         return error_resp(
             400,
             "boundary_policy is selected by the maintainer, not the caller",
         );
     }
-    if spec.mode == deja_orchestrator::RunMode::Replay {
-        // Only replay scoring consumes boundary policy. Recording remains
-        // independent of Postgres, as it was before this feature.
+    if spec.mode == deja_orchestrator::RunMode::Replay && st.noise_store_configured {
+        // An explicitly configured rule store is authoritative: if it is
+        // unavailable, do not silently replay without its active allowances.
         let store = match require_store(&st) {
             Ok(store) => store,
             Err(response) => return response,
         };
-        let active_policy = match store.boundary_policy_active(spec.system()).await {
+        let active = match store.boundary_policy_active(spec.system()).await {
             Ok(active) => active,
-            Err(e) => return error_resp(503, &format!("read active boundary policy: {e}")),
+            Err(e) => return error_resp(503, &format!("read active noise rules: {e}")),
         };
-        let (revision_id, document) = match active_policy {
-            Some(row) => {
-                let document = match serde_json::from_value::<
-                    deja_orchestrator::policy::BoundaryPolicyDocument,
-                >(row.document)
-                {
+        if let Some(row) = active {
+            let document: deja_orchestrator::policy::BoundaryPolicyDocument =
+                match serde_json::from_value(row.document) {
                     Ok(document) => document,
-                    Err(e) => return error_resp(503, &format!("invalid active policy: {e}")),
+                    Err(e) => return error_resp(503, &format!("invalid active noise rules: {e}")),
                 };
-                (Some((row.id, row.digest)), document)
+            let digest = match document.canonical_digest() {
+                Ok(digest) => digest,
+                Err(why) => return error_resp(503, &format!("invalid active noise rules: {why}")),
+            };
+            if digest != row.digest {
+                return error_resp(503, "active noise rule digest does not match its document");
             }
-            None => (
-                None,
-                deja_orchestrator::policy::BoundaryPolicyDocument { rules: Vec::new() },
-            ),
-        };
-        let digest = match document.canonical_digest() {
-            Ok(digest) => digest,
-            Err(why) => return error_resp(503, &format!("invalid active policy: {why}")),
-        };
-        if revision_id
-            .as_ref()
-            .is_some_and(|(_, stored_digest)| stored_digest != &digest)
-        {
-            return error_resp(503, "active policy digest does not match its document");
+            // No approved rules must not invent a policy digest. Untouched
+            // systems can keep their prior baseline identity; the generic
+            // encoded-JSON comparison remains a separate scorer change.
+            if !document.rules.is_empty() {
+                spec.boundary_policy = Some(deja_orchestrator::policy::BoundaryPolicySnapshot {
+                    revision_id: Some(row.id),
+                    digest,
+                    rules: document.rules,
+                });
+            }
         }
-        spec.boundary_policy = Some(deja_orchestrator::policy::BoundaryPolicySnapshot {
-            revision_id: revision_id.map(|(id, _)| id),
-            digest,
-            rules: document.rules,
-        });
     }
     if let Err(e) = admit_github(&mut spec) {
         return error_resp(400, &format!("github: {e}"));
@@ -1101,8 +1101,8 @@ async fn v1_create_run(
         let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
         let params =
             deja_orchestrator::RunParams::resolved(&run.spec, expectation.as_deref()).to_json();
-        if run.spec.mode == deja_orchestrator::RunMode::Replay {
-            // For policy-pinned replays, row and audit commit before launch.
+        if run.spec.mode == deja_orchestrator::RunMode::Replay && st.noise_store_configured {
+            // Explicit rule storage commits the run and audit before launch.
             if let Err(e) = store
                 .insert_run_with_audit(
                     &run.run_id,
@@ -1125,8 +1125,8 @@ async fn v1_create_run(
                 return error_resp(503, &format!("create run store transaction: {e}"));
             }
         } else {
-            // A recording is not judged under replay policy; preserve its
-            // original file-only and best-effort catalog behavior.
+            // Legacy file-only replay and recording admission retain their
+            // best-effort catalog writes when rule storage was not configured.
             if let Err(e) = store
                 .insert_run(
                     &run.run_id,
@@ -4504,6 +4504,7 @@ fn policy_revision_view(row: deja_store::BoundaryPolicyRow) -> Result<serde_json
     snapshot.validate()?;
     Ok(serde_json::json!({
         "id": row.id,
+        "base_revision_id": row.base_revision_id,
         "system": row.system,
         "snapshot": snapshot,
         "reason": row.reason,
@@ -4565,8 +4566,16 @@ fn boundary_policy_write_error(error: deja_store::BoundaryPolicyWriteError) -> R
 }
 
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RuleChange {
+    Append,
+    Revoke,
+}
+
+#[derive(serde::Deserialize)]
 struct BoundaryPolicyProposal {
-    rules: Vec<deja_orchestrator::policy::BoundaryRule>,
+    action: RuleChange,
+    rule: deja_orchestrator::policy::BoundaryRule,
     reason: String,
     expected_active_revision: Option<i64>,
 }
@@ -4593,9 +4602,46 @@ async fn v1_boundary_policy_propose(
     if reason.is_empty() || reason.len() > 1024 {
         return error_resp(400, "policy reason must be 1–1024 characters");
     }
-    let document = deja_orchestrator::policy::BoundaryPolicyDocument {
-        rules: proposal.rules,
+    let rule_json = match serde_json::to_value(&proposal.rule) {
+        Ok(rule) => rule,
+        Err(e) => return error_resp(500, &format!("serialize proposed rule: {e}")),
     };
+    let active = match store.boundary_policy_active(&system).await {
+        Ok(active) => active,
+        Err(e) => return error_resp(500, &format!("read active rules: {e}")),
+    };
+    let base_revision_id = active.as_ref().map(|row| row.id);
+    if base_revision_id != proposal.expected_active_revision {
+        return error_resp(409, "active rules changed: refresh before proposing");
+    }
+    let mut rules = match active {
+        Some(row) => {
+            match serde_json::from_value::<deja_orchestrator::policy::BoundaryPolicyDocument>(
+                row.document,
+            ) {
+                Ok(document) => document.rules,
+                Err(e) => return error_resp(500, &format!("invalid stored rules: {e}")),
+            }
+        }
+        None => Vec::new(),
+    };
+    let operation = match proposal.action {
+        RuleChange::Append => {
+            if rules.contains(&proposal.rule) {
+                return error_resp(409, "this exact rule is already active");
+            }
+            rules.push(proposal.rule);
+            "append"
+        }
+        RuleChange::Revoke => {
+            let Some(index) = rules.iter().position(|rule| rule == &proposal.rule) else {
+                return error_resp(404, "this exact rule is not active");
+            };
+            rules.remove(index);
+            "revoke"
+        }
+    };
+    let document = deja_orchestrator::policy::BoundaryPolicyDocument { rules };
     let digest = match document.canonical_digest() {
         Ok(digest) => digest,
         Err(why) => return error_resp(400, &why),
@@ -4615,6 +4661,8 @@ async fn v1_boundary_policy_propose(
             reason,
             &actor.0,
             subject,
+            &rule_json,
+            operation,
             proposal.expected_active_revision,
         )
         .await
@@ -6815,6 +6863,7 @@ mod tests {
         AppState {
             root: Arc::new(HarnessRoot::new(dir).unwrap()),
             store: None,
+            noise_store_configured: false,
             mutation_auth: MutationAuth {
                 service_token: None,
             },
@@ -6824,6 +6873,56 @@ mod tests {
             cd: None,
             repoints: Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn replay_without_configured_noise_store_keeps_file_only_admission() {
+        let body = serde_json::json!({
+            "mode":"replay",
+            "candidate_spec":{"kind":"prebuilt_image","image":"local/no-store-smoke:unavailable"},
+            "recording_id":"rec-not-on-disk"
+        })
+        .to_string();
+        let request = |payload: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/runs")
+                .header("x-deja-actor", "file-only-test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_owned()))
+                .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let st = test_state(dir.path());
+        let response = app_router(st.clone())
+            .oneshot(request(&body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id = created["run_id"].as_str().expect("created run id");
+        let run: Run = deja_orchestrator::read_json(&st.root.run_path(id)).unwrap();
+        assert_eq!(run.spec.mode, deja_orchestrator::RunMode::Replay);
+        assert!(run.spec.boundary_policy.is_none());
+
+        let configured_dir = tempfile::tempdir().unwrap();
+        let mut configured = test_state(configured_dir.path());
+        configured.noise_store_configured = true;
+        let response = app_router(configured.clone())
+            .oneshot(request(&body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            std::fs::read_dir(configured.root.root.join("runs"))
+                .unwrap()
+                .count(),
+            0,
+            "an unavailable configured rule store refuses before persisting a run"
+        );
     }
 
     fn pending_run(run_id: &str) -> Run {
@@ -8361,6 +8460,7 @@ mod sign_in {
         AppState {
             root,
             store: None,
+            noise_store_configured: true,
             mutation_auth: MutationAuth {
                 service_token: service_token.map(Arc::<str>::from),
             },
@@ -8519,9 +8619,17 @@ mod sign_in {
         assert_eq!(status, StatusCode::OK, "{body}");
         let active: serde_json::Value = serde_json::from_str(&body).unwrap();
         let previous = active["active"]["id"].as_i64();
+        let original_rules = active["active"]["snapshot"]["rules"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock")
+            .as_nanos();
         let rule = serde_json::json!({
             "selector":{
-                "boundary":"api","trait_name":"service","method_name":"send"
+                "boundary":"api","trait_name":"service","method_name":format!("send-{suffix}")
             },
             "source_path":"/request/data",
             "target":{"kind":"header_group","json_pointer":"/headers"}
@@ -8541,7 +8649,7 @@ mod sign_in {
                 format!("{base}/revisions"),
                 "alice@juspay.in",
                 serde_json::json!({
-                    "rules":[rule.clone()],
+                    "action":"append","rule":rule.clone(),
                     "reason":"Header presentation from unstable collection order",
                     "expected_active_revision":previous
                 }),
@@ -8578,7 +8686,7 @@ mod sign_in {
                 format!("{base}/revisions"),
                 "carol@juspay.in",
                 serde_json::json!({
-                    "rules":[],
+                    "action":"revoke","rule":rule.clone(),
                     "reason":"Source became deterministic; revoke allowance",
                     "expected_active_revision":id
                 }),
@@ -8610,13 +8718,19 @@ mod sign_in {
         assert_eq!(status, StatusCode::OK, "{body}");
         let policy: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(policy["active"]["id"], revoked_id);
-        assert_eq!(policy["active"]["snapshot"]["rules"], serde_json::json!([]));
+        assert_eq!(
+            policy["active"]["snapshot"]["rules"],
+            serde_json::json!(original_rules)
+        );
         assert!(policy["revisions"]
             .as_array()
             .unwrap()
             .iter()
             .any(|revision| {
-                revision["id"] == id && revision["snapshot"]["rules"] == serde_json::json!([rule])
+                revision["id"] == id
+                    && revision["snapshot"]["rules"]
+                        .as_array()
+                        .is_some_and(|rules| rules.contains(&rule))
             }));
     }
 

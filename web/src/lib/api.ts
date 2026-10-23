@@ -631,6 +631,7 @@ export type BoundaryPolicySnapshot = {
 
 export type BoundaryPolicyRevision = {
   id: number;
+  base_revision_id: number | null;
   system: string;
   snapshot: BoundaryPolicySnapshot;
   reason: string;
@@ -664,10 +665,20 @@ export const boundaryPolicyApi = {
       `/api/v1/systems/${encodeURIComponent(system)}/boundary-policy/preview`,
       { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ run_id, rules }) },
     ),
-  propose: (system: string, rules: BoundaryRule[], reason: string, expected_active_revision: number | null) =>
+  propose: (
+    system: string,
+    action: "append" | "revoke",
+    rule: BoundaryRule,
+    reason: string,
+    expected_active_revision: number | null,
+  ) =>
     request<BoundaryPolicyRevision>(
       `/api/v1/systems/${encodeURIComponent(system)}/boundary-policy/revisions`,
-      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rules, reason, expected_active_revision }) },
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action, rule, reason, expected_active_revision }),
+      },
     ),
   activate: (system: string, id: number, expected_active_revision: number | null) =>
     request<BoundaryPolicyRevision>(
