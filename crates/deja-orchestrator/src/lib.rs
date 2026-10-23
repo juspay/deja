@@ -519,6 +519,7 @@ pub struct RunSpec {
     /// same recording. Set by the pipeline that created both runs. The report
     /// shows the delta beside the tape-relative verdict; nothing that decides
     /// the tape-relative verdict reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta_against: Option<String>,
     /// Immutable maintainer policy pinned when the run is admitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
