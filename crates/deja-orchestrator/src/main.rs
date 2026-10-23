@@ -356,7 +356,17 @@ fn app_router(state: AppState) -> Router {
     let cd_read = |h: MethodRouter<AppState>| h.route_layer(reader.clone());
     let post_cd_version = post(v1_cd_post_version).route_layer(service.clone());
     let post_cd_deployment = post(v1_cd_post_deployment).route_layer(service.clone());
-    let post_cd_observed = post(v1_cd_post_observed).route_layer(service);
+    let post_cd_observed = post(v1_cd_post_observed).route_layer(service.clone());
+    let post_cd_promotion_replay = post(v1_cd_post_promotion_replay).route_layer(service);
+    let session = || middleware::from_fn_with_state(state.clone(), require_session);
+    let promote = post(v1_cd_promote).route_layer(session());
+    let promotions = cd_read(get(v1_cd_promotions_list));
+    let promotion_step = post(v1_cd_promotion_step).route_layer(middleware::from_fn_with_state(
+        state.mutation_auth.clone(),
+        require_service_auth,
+    ));
+    let promotion_cancel = delete(v1_cd_promotion_cancel).route_layer(session());
+    let promotion_fail = post(v1_cd_promotion_mark_failed).route_layer(session());
     let cd_pause = cd_read(get(v1_cd_pause)).merge(post(v1_cd_set_pause).route_layer(
         middleware::from_fn_with_state(state.clone(), require_session),
     ));
@@ -420,10 +430,26 @@ fn app_router(state: AppState) -> Router {
         .route("/cd/config", cd_read(get(v1_cd_config)))
         .route("/cd/pause", cd_pause)
         .route(
+            "/cd/environments/{env}/promotion-check",
+            cd_read(get(v1_cd_promotion_check)),
+        )
+        .route("/cd/environments/{env}/promotions", promote)
+        .route("/cd/promotion-requests", promotions)
+        .route(
+            "/cd/promotion-requests/{id}",
+            cd_read(get(v1_cd_promotion_get)).merge(promotion_cancel),
+        )
+        .route("/cd/promotion-requests/{id}/fail", promotion_fail)
+        .route("/cd/promotion-requests/{id}/{step}", promotion_step)
+        .route(
             "/cd/versions",
             cd_read(get(v1_cd_versions)).merge(post_cd_version),
         )
         .route("/cd/versions/{version}", cd_read(get(v1_cd_version)))
+        .route(
+            "/cd/versions/{version}/promotion-replays",
+            cd_read(get(v1_cd_version_promotion_replays)).merge(post_cd_promotion_replay),
+        )
         .route("/cd/deployments", post_cd_deployment)
         .route("/cd/environments", cd_read(get(v1_cd_environments)))
         .route("/cd/environments/{env}/observed", post_cd_observed)
@@ -623,17 +649,23 @@ async fn require_cd_reader(
     if !cfg.enabled {
         return error_resp(
             401,
-            "Deployments is in beta for maintainers, and sign-in is not configured on this deployment",
+            "Deployments is in beta for maintainers and environment upgraders, and sign-in is not configured on this deployment",
         );
     }
     let Some(session) = session_from_headers(&st, req.headers()) else {
-        return error_resp(401, "Deployments is in beta for maintainers: sign in");
+        return error_resp(
+            401,
+            "Deployments is in beta for maintainers and environment upgraders: sign in",
+        );
     };
     if !cfg.domain_allowed(&session.email) {
         return error_resp(401, "this account is no longer allowed to sign in");
     }
-    if !cfg.has_role(&session.email, deja_orchestrator::auth::ROLE_MAINTAINER) {
-        return error_resp(403, "Deployments is in beta for maintainers only");
+    if !reads_deployments(&cfg, &session.email) {
+        return error_resp(
+            403,
+            "Deployments is in beta for maintainers and environment upgraders only",
+        );
     }
     req.extensions_mut()
         .insert(AuthenticatedActor(session.email));
@@ -669,6 +701,16 @@ async fn require_boundary_policy_maintainer(
         .insert(AuthenticatedActor(session.email));
     req.extensions_mut().insert(ActorSubject(Some(session.sub)));
     next.run(req).await
+}
+
+/// Who reads Deployments while it is in beta: a maintainer, or anyone who may
+/// promote to some environment (`<environment>_upgrader`). An upgrader has to
+/// see what runs where and the checks before pressing Promote; what they may
+/// change is decided per action (`promote_refusal`, `pause_refusal`), not here.
+fn reads_deployments(cfg: &deja_orchestrator::auth::AuthConfig, email: &str) -> bool {
+    cfg.roles_for(email)
+        .iter()
+        .any(|r| r == deja_orchestrator::auth::ROLE_MAINTAINER || r.ends_with("_upgrader"))
 }
 
 /// Why a pause or resume is refused, or None. A person's act: a signed-in
@@ -4983,6 +5025,503 @@ async fn v1_cd_pause(State(st): State<AppState>, axum::extract::Query(q): Query)
     }
 }
 
+/// Who may promote to an environment: a signed-in person holding
+/// `<environment>_upgrader`, or, while Deployments is in beta, `maintainer`.
+/// Never the pipeline's token.
+fn promote_refusal(
+    cfg: &deja_orchestrator::auth::AuthConfig,
+    target: &str,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Option<String> {
+    if !cfg.enabled {
+        return Some("promoting needs sign-in, which is not configured on this deployment".into());
+    }
+    if actor == SERVICE_ACTOR || actor_sub.filter(|s| !s.is_empty()).is_none() {
+        return Some("promoting needs a signed-in person".into());
+    }
+    let role = format!("{target}_upgrader");
+    if cfg.has_role(actor, &role) || cfg.has_role(actor, deja_orchestrator::auth::ROLE_MAINTAINER) {
+        return None;
+    }
+    Some(format!(
+        "only a {role} (or, in beta, a maintainer) may promote to {target}"
+    ))
+}
+
+/// Everything the promotion checks read, for one version and target.
+#[allow(clippy::too_many_arguments)]
+async fn promotion_facts(
+    st: &AppState,
+    store: &deja_store::Store,
+    cd: &deja_orchestrator::cd::CdConfig,
+    system: &str,
+    target: &str,
+    version: &str,
+    actor: &str,
+    actor_sub: Option<&str>,
+) -> Result<deja_orchestrator::cd::PromotionFacts, String> {
+    let source = cd.source_of(target).unwrap_or_default().to_owned();
+    let v = store
+        .cd_version_get(system, version)
+        .await
+        .map_err(|e| e.to_string())?;
+    let live = store
+        .cd_latest_live_per_environment(system)
+        .await
+        .map_err(|e| e.to_string())?;
+    let target_live = live
+        .iter()
+        .find(|r| r.environment == target)
+        .map(|r| r.version.clone());
+    let target_merged_at = match &target_live {
+        Some(t) => store
+            .cd_version_get(system, t)
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|v| v.merged_at),
+        None => None,
+    };
+    let promotion_replay = store
+        .cd_promotion_replays_of_version(system, version, 1)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .next()
+        .map(|h| (h.state, h.against_version));
+    Ok(deja_orchestrator::cd::PromotionFacts {
+        refused: promote_refusal(&st.auth.config(), target, actor, actor_sub),
+        live_on_source_since: if source.is_empty() {
+            None
+        } else {
+            store
+                .cd_first_live(system, &source, version)
+                .await
+                .map_err(|e| e.to_string())?
+        },
+        source,
+        target: target.to_owned(),
+        version_kind: v.as_ref().map(|v| v.kind.clone()),
+        version_merged_at: v.and_then(|v| v.merged_at),
+        target_live,
+        target_merged_at,
+        promotion_replay,
+        in_flight: store
+            .cd_promotion_in_flight(system, target)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|r| r.id),
+        paused: store
+            .cd_control_get(system)
+            .await
+            .map_err(|e| e.to_string())?
+            .filter(|c| c.paused)
+            .map(|c| c.reason.unwrap_or_default()),
+        now: chrono::Utc::now(),
+    })
+}
+
+/// `GET /api/v1/cd/environments/{env}/promotion-check?system=&version=`:
+/// the checks a promotion of `version` to `env` would be accepted under,
+/// for the person asking, each with its reason.
+async fn v1_cd_promotion_check(
+    State(st): State<AppState>,
+    Path(env): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if cd.source_of(&env).is_none() {
+        return error_resp(400, &format!("{env:?} is not promotable"));
+    }
+    let Some(version) = q.get("version").map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+        return error_resp(400, "version is required");
+    };
+    let facts = match promotion_facts(
+        &st,
+        &store,
+        &cd,
+        &system,
+        &env,
+        version,
+        &actor.0,
+        subject.0.as_deref(),
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(e) => return error_resp(500, &format!("promotion check: {e}")),
+    };
+    let checks = deja_orchestrator::cd::promotion_checks(&cd, &facts);
+    json_ok(serde_json::json!({
+        "system": system,
+        "environment": env,
+        "from": facts.source,
+        "version": version,
+        "target_live": facts.target_live,
+        "ok": checks.iter().all(|c| c.ok),
+        "checks": checks,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct Promote {
+    system: String,
+    version: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// `POST /api/v1/cd/environments/{env}/promotions` `{system, version, note}`:
+/// a signed-in upgrader asks for `version` on `env`. Every check runs again
+/// here; the request is written only when all pass. The promote job picks
+/// it up by polling: deja never calls Jenkins.
+async fn v1_cd_promote(
+    State(st): State<AppState>,
+    Path(env): Path<String>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let b: Promote = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if !cd.knows_system(&b.system) {
+        return error_resp(400, &format!("unknown system {:?}", b.system));
+    }
+    if cd.source_of(&env).is_none() {
+        return error_resp(400, &format!("{env:?} is not promotable"));
+    }
+    let facts = match promotion_facts(
+        &st,
+        &store,
+        &cd,
+        &b.system,
+        &env,
+        &b.version,
+        &actor.0,
+        subject.0.as_deref(),
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(e) => return error_resp(500, &format!("promotion check: {e}")),
+    };
+    let checks = deja_orchestrator::cd::promotion_checks(&cd, &facts);
+    if let Some(person) = checks.iter().find(|c| c.id == "person" && !c.ok) {
+        return error_resp(403, &person.why);
+    }
+    if !checks.iter().all(|c| c.ok) {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({ "error": "not every check passes", "checks": checks })),
+        )
+            .into_response();
+    }
+    let note = b.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let evidence = serde_json::json!({
+        "checks": checks,
+        "from": facts.source,
+        "target_live": facts.target_live,
+        "promotion_replay": facts.promotion_replay.map(|(state, against)| serde_json::json!({ "state": state, "against": against })),
+    });
+    let row = match store
+        .cd_promotion_create(
+            &b.system,
+            &env,
+            &b.version,
+            &actor.0,
+            subject.0.as_deref(),
+            note,
+            &evidence,
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) if deja_store::is_unique_violation(&e) => {
+            return error_resp(409, &format!("another promotion to {env} is in flight"))
+        }
+        Err(e) => return error_resp(500, &format!("promotion: {e}")),
+    };
+    cd_audit(
+        &store,
+        &actor.0,
+        "cd.promote",
+        "environment",
+        &format!("{}/{}", b.system, env),
+        &serde_json::json!({ "request": row.id, "version": b.version, "note": note }),
+    )
+    .await;
+    json_ok_ser(&row)
+}
+
+/// `GET /api/v1/cd/promotion-requests?system=&state=&environment=&limit=`:
+/// with `state`, that queue oldest first (what the promote job polls);
+/// without, the newest requests.
+async fn v1_cd_promotions_list(
+    State(st): State<AppState>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let state = q.get("state").map(String::as_str).filter(|s| !s.is_empty());
+    let environment = q
+        .get("environment")
+        .map(String::as_str)
+        .filter(|s| !s.is_empty());
+    match store
+        .cd_promotions_list(&system, state, environment, cd_limit(&q, 50))
+        .await
+    {
+        Ok(rows) => json_ok_ser(&rows),
+        Err(e) => error_resp(500, &format!("promotions: {e}")),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct PromotionStep {
+    #[serde(default)]
+    release: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    jenkins_build: Option<String>,
+    #[serde(default)]
+    detail: serde_json::Value,
+}
+
+fn step_refusal(e: deja_store::CdStepRefusal, step: &str) -> Response {
+    match e {
+        deja_store::CdStepRefusal::NoSuchRequest => error_resp(404, "no such promotion request"),
+        deja_store::CdStepRefusal::WrongState(s) => {
+            error_resp(409, &format!("the request is {s}; it cannot go to {step}"))
+        }
+        deja_store::CdStepRefusal::Db(e) => error_resp(500, &format!("promotion: {e}")),
+    }
+}
+
+/// `POST /api/v1/cd/promotion-requests/{id}/{step}`: the promote job reports
+/// a step (`picked`, `tagged` with the release, `built`, `committed`,
+/// `live`, `failed` with a reason). Each is accepted only after the step
+/// before it; `picked` therefore succeeds once, and a second job that loses
+/// the race gets 409.
+async fn v1_cd_promotion_step(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path((id, step)): Path<(i64, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if !["picked", "tagged", "built", "committed", "live", "failed"].contains(&step.as_str()) {
+        return error_resp(400, &format!("no step {step:?}"));
+    }
+    let b: PromotionStep = if body.is_empty() {
+        PromotionStep::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(b) => b,
+            Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+        }
+    };
+    if step == "tagged" && b.release.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return error_resp(400, "tagged needs the release");
+    }
+    if step == "failed" && b.reason.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return error_resp(400, "failed needs a reason");
+    }
+    let detail = serde_json::json!({
+        "reason": b.reason,
+        "jenkins_build": b.jenkins_build,
+        "by": actor.0,
+        "at": chrono::Utc::now(),
+        "detail": if b.detail.is_null() { serde_json::json!({}) } else { b.detail },
+    });
+    let picked_by = (step == "picked")
+        .then_some(b.jenkins_build.as_deref())
+        .flatten();
+    match store
+        .cd_promotion_step(id, &step, b.release.as_deref(), picked_by, &detail)
+        .await
+    {
+        Ok(row) => {
+            cd_audit(
+                &store,
+                &actor.0,
+                &format!("cd.promotion.{step}"),
+                "promotion",
+                &id.to_string(),
+                &serde_json::json!({ "release": row.release, "reason": b.reason }),
+            )
+            .await;
+            json_ok_ser(&row)
+        }
+        Err(e) => step_refusal(e, &step),
+    }
+}
+
+/// `GET /api/v1/cd/promotion-requests/{id}`: one request with every step it
+/// has reached, for the promotion page.
+async fn v1_cd_promotion_get(State(st): State<AppState>, Path(id): Path<i64>) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store.cd_promotion_get(id).await {
+        Ok(Some(row)) => json_ok_ser(&row),
+        Ok(None) => error_resp(404, "no such promotion request"),
+        Err(e) => error_resp(500, &format!("promotion: {e}")),
+    }
+}
+
+/// `DELETE /api/v1/cd/promotion-requests/{id}`: its requester, or a
+/// maintainer, takes back a request the job has not picked yet.
+async fn v1_cd_promotion_cancel(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    Path(id): Path<i64>,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let row = match store.cd_promotion_get(id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return error_resp(404, "no such promotion request"),
+        Err(e) => return error_resp(500, &format!("promotion: {e}")),
+    };
+    let cfg = st.auth.config();
+    let mine = matches!((row.requested_by_sub.as_deref(), subject.0.as_deref()), (Some(a), Some(b)) if !a.is_empty() && a == b);
+    let maintainer =
+        subject.0.is_some() && cfg.has_role(&actor.0, deja_orchestrator::auth::ROLE_MAINTAINER);
+    if !cfg.enabled || !(mine || maintainer) {
+        return error_resp(
+            403,
+            "only its requester or a maintainer may cancel a promotion",
+        );
+    }
+    let detail = serde_json::json!({ "by": actor.0, "at": chrono::Utc::now() });
+    match store
+        .cd_promotion_step(id, "cancelled", None, None, &detail)
+        .await
+    {
+        Ok(row) => {
+            cd_audit(
+                &store,
+                &actor.0,
+                "cd.promotion.cancelled",
+                "promotion",
+                &id.to_string(),
+                &serde_json::json!({}),
+            )
+            .await;
+            json_ok_ser(&row)
+        }
+        Err(e) => step_refusal(e, "cancelled"),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MarkFailed {
+    reason: String,
+}
+
+/// `POST /api/v1/cd/promotion-requests/{id}/fail` `{reason}`: a maintainer
+/// ends a request the job has started but will not finish (its build died),
+/// so it no longer holds the environment. A request still `pending` has no
+/// job behind it: that one is cancelled (`DELETE`), not marked failed, so
+/// the two outcomes keep their meaning in the history.
+async fn v1_cd_promotion_mark_failed(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Extension(subject): Extension<ActorSubject>,
+    Path(id): Path<i64>,
+    body: axum::body::Bytes,
+) -> Response {
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    if let Some(why) = pause_refusal(&st.auth.config(), &actor.0, subject.0.as_deref()) {
+        return error_resp(
+            403,
+            &why.replace("pause or resume the pipeline", "mark a promotion failed")
+                .replace("pausing", "marking a promotion failed"),
+        );
+    }
+    let b: MarkFailed = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    if b.reason.trim().is_empty() {
+        return error_resp(400, "say why");
+    }
+    match store.cd_promotion_get(id).await {
+        Ok(Some(row)) if row.state == "pending" => {
+            return error_resp(
+                409,
+                "this request is still pending, no job has picked it up: cancel it instead",
+            )
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => return error_resp(404, "no such promotion request"),
+        Err(e) => return error_resp(500, &format!("promotion request: {e}")),
+    }
+    let detail = serde_json::json!({ "reason": b.reason.trim(), "by": actor.0, "at": chrono::Utc::now(), "marked_by_person": true });
+    match store
+        .cd_promotion_step(id, "failed", None, None, &detail)
+        .await
+    {
+        Ok(row) => {
+            cd_audit(
+                &store,
+                &actor.0,
+                "cd.promotion.marked_failed",
+                "promotion",
+                &id.to_string(),
+                &serde_json::json!({ "reason": b.reason.trim() }),
+            )
+            .await;
+            json_ok_ser(&row)
+        }
+        Err(e) => step_refusal(e, "failed"),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct SetPause {
     system: String,
@@ -5297,21 +5836,39 @@ async fn v1_cd_environments(
             }
         }
     }
-    let environments: Vec<serde_json::Value> = cd
-        .environments
-        .iter()
-        .map(|env| {
-            let l = latest.iter().find(|r| &r.environment == env);
-            let v = live.iter().find(|r| &r.environment == env);
-            serde_json::json!({
-                "environment": env,
-                "latest": l,
-                "live": v,
-                "latest_version": l.and_then(|r| versions.get(&r.version)).cloned().flatten(),
-                "live_version": v.and_then(|r| versions.get(&r.version)).cloned().flatten(),
-            })
-        })
-        .collect();
+    // Each environment's card carries the promotion replay of its live version
+    // against what the NEXT environment runs now: the pair the card is about.
+    // A replay against an older release of that environment is history, shown
+    // on the version page, not current evidence; the last environment has
+    // nothing to be promoted to, so no replay.
+    let mut environments: Vec<serde_json::Value> = Vec::with_capacity(cd.environments.len());
+    for (i, env) in cd.environments.iter().enumerate() {
+        let l = latest.iter().find(|r| &r.environment == env);
+        let v = live.iter().find(|r| &r.environment == env);
+        let next_live = cd
+            .environments
+            .get(i + 1)
+            .and_then(|n| live.iter().find(|r| &r.environment == n));
+        let live_promotion_replay = match (v, next_live) {
+            (Some(v), Some(n)) => match store
+                .cd_promotion_replay_of_pair(&system, &v.version, &n.version)
+                .await
+            {
+                Ok(h) => h,
+                Err(e) => return error_resp(500, &format!("promotion replays: {e}")),
+            },
+            _ => None,
+        };
+        environments.push(serde_json::json!({
+            "environment": env,
+            "next_environment": cd.environments.get(i + 1),
+            "latest": l,
+            "live": v,
+            "latest_version": l.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+            "live_version": v.and_then(|r| versions.get(&r.version)).cloned().flatten(),
+            "live_promotion_replay": live_promotion_replay,
+        }));
+    }
     json_ok(serde_json::json!({ "system": system, "environments": environments }))
 }
 
@@ -5368,12 +5925,17 @@ async fn v1_cd_versions(State(st): State<AppState>, axum::extract::Query(q): Que
         Ok(p) => p,
         Err(e) => return error_resp(500, &format!("deployments: {e}")),
     };
+    let promotion_replays = match store.cd_latest_promotion_replay_per_version(&system).await {
+        Ok(h) => h,
+        Err(e) => return error_resp(500, &format!("promotion replays: {e}")),
+    };
     let out: Vec<serde_json::Value> = versions
         .into_iter()
         .map(|v| {
             let where_: Vec<&deja_store::CdDeploymentRow> =
                 places.iter().filter(|p| p.version == v.version).collect();
-            serde_json::json!({ "version": v, "where": where_ })
+            let promotion_replay = promotion_replays.iter().find(|h| h.version == v.version);
+            serde_json::json!({ "version": v, "where": where_, "promotion_replay": promotion_replay })
         })
         .collect();
     json_ok(serde_json::json!({ "system": system, "versions": out }))
@@ -5402,13 +5964,116 @@ async fn v1_cd_version(
         Ok(None) => return error_resp(404, "no such version"),
         Err(e) => return error_resp(500, &format!("version: {e}")),
     };
-    match store
+    let rows = match store
         .cd_deployments_of_version(&system, &version, 200)
         .await
     {
-        Ok(rows) => json_ok(serde_json::json!({ "version": v, "deployments": rows })),
-        Err(e) => error_resp(500, &format!("deployments: {e}")),
+        Ok(rows) => rows,
+        Err(e) => return error_resp(500, &format!("deployments: {e}")),
+    };
+    match store
+        .cd_promotion_replays_of_version(&system, &version, 50)
+        .await
+    {
+        Ok(promotion_replays) => json_ok(
+            serde_json::json!({ "version": v, "deployments": rows, "promotion_replays": promotion_replays }),
+        ),
+        Err(e) => error_resp(500, &format!("promotion replays: {e}")),
     }
+}
+
+/// `GET /api/v1/cd/versions/{version}/promotion-replays?system=`: a version's promotion replays
+/// replays, newest first.
+async fn v1_cd_version_promotion_replays(
+    State(st): State<AppState>,
+    Path(version): Path<String>,
+    axum::extract::Query(q): Query,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let system = match cd_system(&cd, &q) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    match store
+        .cd_promotion_replays_of_version(&system, &version, cd_limit(&q, 50))
+        .await
+    {
+        Ok(promotion_replays) => json_ok_ser(&promotion_replays),
+        Err(e) => error_resp(500, &format!("promotion replays: {e}")),
+    }
+}
+
+/// `POST /api/v1/cd/versions/{version}/promotion-replays`: the promotion-replay job records
+/// that it is replaying a version against the next environment's release,
+/// and then how that went. Append-only; the version must be known.
+async fn v1_cd_post_promotion_replay(
+    State(st): State<AppState>,
+    Extension(actor): Extension<AuthenticatedActor>,
+    Path(version): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let cd = match require_cd(&st) {
+        Ok(c) => c,
+        Err(r) => return r,
+    };
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let mut h: deja_store::NewCdPromotionReplay = match serde_json::from_slice(&body) {
+        Ok(h) => h,
+        Err(e) => return error_resp(400, &format!("invalid body: {e}")),
+    };
+    h.version = version;
+    if !cd.knows_system(&h.system) {
+        return error_resp(400, &format!("unknown system {:?}", h.system));
+    }
+    if h.against_version.trim().is_empty() {
+        return error_resp(400, "against_version is required");
+    }
+    for (name, run) in [
+        ("candidate_run", h.candidate_run.as_deref()),
+        ("baseline_run", h.baseline_run.as_deref()),
+    ] {
+        if let Some(run) = run {
+            if let Err(e) = run.parse::<RunId>() {
+                return error_resp(400, &format!("{name}: {e}"));
+            }
+        }
+    }
+    if h.requested_by.trim().is_empty() {
+        h.requested_by = actor.0.clone();
+    }
+    if h.detail.is_null() {
+        h.detail = serde_json::json!({});
+    }
+    match store.cd_version_get(&h.system, &h.version).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error_resp(
+                409,
+                &format!(
+                    "unknown version {:?}: post it to /cd/versions first",
+                    h.version
+                ),
+            )
+        }
+        Err(e) => return error_resp(500, &format!("version: {e}")),
+    }
+    let row = match store.cd_promotion_replay_append(&h).await {
+        Ok(r) => r,
+        Err(e) => return error_resp(500, &format!("promotion replay: {e}")),
+    };
+    cd_audit(&store, &actor.0, "cd.promotion_replay", "version", &format!("{}/{}", h.system, h.version),
+        &serde_json::json!({ "against_version": h.against_version, "state": h.state, "verdict": h.verdict, "candidate_run": h.candidate_run, "baseline_run": h.baseline_run, "jenkins_build": h.jenkins_build })).await;
+    json_ok_ser(&row)
 }
 
 /// `GET /api/v1/cd/pull-requests/{owner}/{repo}/{number}`: the versions
@@ -7720,6 +8385,14 @@ mod sign_in {
     }
 
     fn enabled(maintainers: &[&str]) -> (Arc<AuthState>, session::Signer) {
+        enabled_with(maintainers, &[])
+    }
+
+    /// Sign-in on, with the maintainer list and any other role lists.
+    fn enabled_with(
+        maintainers: &[&str],
+        roles: &[(&str, &[&str])],
+    ) -> (Arc<AuthState>, session::Signer) {
         let mut cfg = AuthConfig {
             enabled: true,
             client_id: "cid".into(),
@@ -7730,6 +8403,12 @@ mod sign_in {
             auth::ROLE_MAINTAINER.to_owned(),
             maintainers.iter().map(|m| m.to_string()).collect(),
         );
+        for (role, members) in roles {
+            cfg.roles.insert(
+                (*role).to_owned(),
+                members.iter().map(|m| m.to_string()).collect(),
+            );
+        }
         let state = AuthState::with_parts(
             cfg,
             session::Signer::new(b"test-key"),
@@ -8004,6 +8683,37 @@ mod sign_in {
         .await;
         assert_eq!(code, StatusCode::UNAUTHORIZED);
     }
+    /// The person who presses Promote is an environment's upgrader, often not a
+    /// maintainer; the dialog's reads must answer them, and nobody else who is
+    /// merely signed in.
+    #[tokio::test]
+    async fn an_upgrader_reads_deployments_without_being_a_maintainer() {
+        let (auth, signer) = enabled_with(
+            &["ravi@juspay.in"],
+            &[("sandbox_upgrader", &["qa-1@juspay.in"])],
+        );
+        let st = state(auth, Some("tok"));
+        let (code, body) = call(
+            cd_reader_router(st.clone()),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "qa-1@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!((code, body.as_str()), (StatusCode::OK, "qa-1@juspay.in"));
+        let (code, body) = call(
+            cd_reader_router(st),
+            get_cd_read()
+                .header(header::COOKIE, session_cookie(&signer, "asha@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("upgraders"), "{body}");
+    }
+
     #[tokio::test]
     async fn absent_service_token_rejects_bearer_but_allows_maintainer_cookie() {
         let (auth, signer) = enabled(&["ravi@juspay.in"]);
@@ -8052,6 +8762,28 @@ mod sign_in {
         )
         .await;
         assert_eq!(code, StatusCode::OK);
+    }
+
+    #[test]
+    fn upgraders_and_in_beta_maintainers_promote() {
+        let (auth, _) = enabled(&["ravi@juspay.in"]);
+        let mut cfg = auth.config();
+        cfg.roles
+            .insert("sandbox_upgrader".into(), vec!["qa-1@example.com".into()]);
+        assert_eq!(
+            promote_refusal(&cfg, "sandbox", "qa-1@example.com", Some("s-qa")),
+            None
+        );
+        assert_eq!(
+            promote_refusal(&cfg, "sandbox", "ravi@juspay.in", Some("s-ravi")),
+            None
+        );
+        assert!(promote_refusal(&cfg, "sandbox", "asha@juspay.in", Some("s-asha")).is_some());
+        assert!(promote_refusal(&cfg, "sandbox", "qa-1@example.com", None).is_some());
+        assert!(promote_refusal(&cfg, "sandbox", SERVICE_ACTOR, None).is_some());
+        assert!(
+            promote_refusal(&AuthState::disabled().config(), "sandbox", "qa", Some("s")).is_some()
+        );
     }
 
     #[test]

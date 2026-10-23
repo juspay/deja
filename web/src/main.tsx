@@ -29,6 +29,8 @@ import AuditPage from "./pages/AuditPage";
 import DeploymentsPage, {
   EnvironmentPage,
   EnvironmentsPage,
+  PromotionPage,
+  PromotionsPage,
   PullRequestPage,
   VersionPage,
   VersionsPage,
@@ -129,9 +131,12 @@ function Shell() {
   const loc = useLocation();
   const me = useMe();
   const systems = useSystems();
-  // Deployments is in beta for maintainers: the tab is drawn for a signed-in
-  // maintainer only (the API refuses everyone else anyway).
-  const maintainer = !!me.data?.configured && !!me.data.authenticated && (me.data.roles ?? []).includes("maintainer");
+  // Policy changes require a maintainer. Deployment readers also include
+  // environment upgraders, whose API actions have separate authorization.
+  const roles = me.data?.roles ?? [];
+  const signedIn = !!me.data?.configured && !!me.data.authenticated;
+  const maintainer = signedIn && roles.includes("maintainer");
+  const deploymentsReader = signedIn && roles.some((role) => role === "maintainer" || role.endsWith("_upgrader"));
   const tab = (path: string, label: string, exact = false, beta = false) => {
     const on = exact ? loc.pathname === path : loc.pathname.startsWith(path);
     return (
@@ -149,7 +154,7 @@ function Shell() {
           {tab("/", "New run", true)}
           {tab("/runs", "Runs")}
           {tab("/recordings", "Recordings")}
-          {maintainer && tab("/deployments", "Deployments", false, true)}
+          {deploymentsReader && tab("/deployments", "Deployments", false, true)}
           {maintainer && <Link className={loc.pathname.startsWith("/systems/") ? "tab active" : "tab"} to={systems.defaultSystem ? `/systems/${encodeURIComponent(systems.defaultSystem.name)}/boundary-policy` : "/"}>Boundary policy<span className="beta">beta</span></Link>}
           {tab("/audit", "Audit")}
         </nav>
@@ -197,6 +202,8 @@ const router = createBrowserRouter([
       { path: "/deployments/versions/:version", element: <VersionPage /> },
       { path: "/deployments/environments", element: <EnvironmentsPage /> },
       { path: "/deployments/environments/:env", element: <EnvironmentPage /> },
+      { path: "/deployments/promotions", element: <PromotionsPage /> },
+      { path: "/deployments/promotions/:id", element: <PromotionPage /> },
       { path: "/deployments/pull-requests/:owner/:repo/:number", element: <PullRequestPage /> },
     ],
   },
