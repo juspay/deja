@@ -1183,6 +1183,8 @@ export type CdPromotionPreview = {
   /** False when the merges that ride along cannot be known (the target's
    *  release names no merge); `carried` then holds the picked version alone. */
   carried_known: boolean;
+  /** How many merges are listed at most when `carried_known` is false. */
+  carried_at_most?: number;
   carried: CdCarried[];
   promotion_replay: CdPromotionReplayRow | null;
   diff: CdPromotionDiff;

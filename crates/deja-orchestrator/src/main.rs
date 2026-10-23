@@ -5673,7 +5673,15 @@ async fn v1_cd_promotion_preview(
     let carried: Option<Vec<deja_store::CdVersionRow>> =
         carried_by(&versions, &version, target_live.as_ref())
             .map(|c| c.into_iter().cloned().collect());
-    let merges: Vec<deja_store::CdVersionRow> = carried.clone().unwrap_or_else(|| vec![v.clone()]);
+    // When where to stop is not known, every merge up to this one: an upper
+    // bound, said so on the page, rather than this merge alone.
+    let merges: Vec<deja_store::CdVersionRow> = match &carried {
+        Some(c) => c.clone(),
+        None => deja_orchestrator::cd::carried_at_most(&versions, &version, CARRIED_AT_MOST)
+            .into_iter()
+            .cloned()
+            .collect(),
+    };
 
     fn rows_of(body: &serde_json::Value) -> Vec<Row> {
         body.get("rows")
@@ -5778,11 +5786,16 @@ async fn v1_cd_promotion_preview(
         "environment": environment,
         "target_live": target_live,
         "carried_known": carried.is_some(),
+        "carried_at_most": CARRIED_AT_MOST,
         "carried": carried_out,
         "promotion_replay": replay,
         "diff": diff,
     }))
 }
+
+/// How many merges a preview lists when it cannot tell where the target's
+/// release sits: each one's runs are looked up, so the page stays quick.
+const CARRIED_AT_MOST: usize = 30;
 
 /// The run that says what a merge changed: its merge-queue replay (the
 /// queue sha against main's base), else its newest pull-request run that

@@ -347,8 +347,15 @@ function Preview({ cfg, system, version }: { cfg: Extract<CdConfig, { enabled: t
                 <b>
                   {p.carried.length} merge{p.carried.length === 1 ? "" : "s"}
                 </b>
+              ) : p.carried.length > 1 ? (
+                <>
+                  <b>up to {p.carried.length} merges</b>{" "}
+                  <span className="hint">
+                    · {p.target_live ? `${p.target_live.version} is not placed on main yet` : "nothing runs there yet"}, so every merge up to this one is listed; some may already be on {target}
+                  </span>
+                </>
               ) : (
-                <span className="hint">not known: {p.target_live ? `${p.target_live.version} names no merge it was cut on` : "nothing to count from"}</span>
+                <span className="hint">not known: {p.target_live ? `${p.target_live.version} is not placed on main yet` : "nothing to count from"}</span>
               )}
               {p.carried_known && p.target_live?.released_from && (
                 <span className="hint">
@@ -379,7 +386,7 @@ function Preview({ cfg, system, version }: { cfg: Extract<CdConfig, { enabled: t
         <div className="cd-panelhead">
           <h2>Pull requests riding along</h2>
           <span className="hint">
-            {p.carried_known ? `${p.carried.length} merge${p.carried.length === 1 ? "" : "s"}, newest first · each ran on ${source}` : "only this one can be listed"} · open a row for what it changed
+            {p.carried_known ? `${p.carried.length} merge${p.carried.length === 1 ? "" : "s"}, newest first · each ran on ${source}` : p.carried.length > 1 ? `up to ${p.carried.length} merges, newest first · where ${target}'s release sits is not known, so some may already be there` : "only this one can be listed"} · open a row for what it changed
           </span>
           <div className="cd-panelright hint">This PR changed = its merge-queue run against main · vs {target} = its own promotion replay</div>
         </div>
@@ -439,7 +446,7 @@ function Preview({ cfg, system, version }: { cfg: Extract<CdConfig, { enabled: t
             })}
           </tbody>
         </table>
-        {p.carried_known && p.carried.length > 1 && (
+        {p.carried.length > 1 && (
           <div className="hint cd-panelbody">
             <b>Pick an older merge</b> to promote fewer:{" "}
             {p.carried

@@ -352,19 +352,23 @@ pub const QUEUE_LABEL: &str = "MQ · ";
 /// The merges a promotion of `picked` carries to an environment running
 /// `target_live`: `picked` and every merge before it, back to (not
 /// including) the merge the target's release was cut on, newest first.
-/// `None` when that cannot be known: the target runs nothing, or a release
-/// that names no merge (one first seen by reconcile), or a merge déjà has no
-/// merge time for, or `picked` is not after it.
+/// The release is dated by that merge's time, else by its own `merged_at`
+/// (reconcile places a release cut outside the pipeline on main, and the
+/// merge it names may predate what déjà tracks). `None` when that cannot be
+/// known: the target runs nothing, or a release with neither (one reconcile
+/// has not placed yet), or `picked` has no merge time or is not after it.
 pub fn carried_by<'a>(
     versions: &'a [deja_store::CdVersionRow],
     picked: &str,
     target_live: Option<&deja_store::CdVersionRow>,
 ) -> Option<Vec<&'a deja_store::CdVersionRow>> {
-    let base_name = target_live?.released_from.as_deref()?;
-    let since = versions
-        .iter()
-        .find(|v| v.version == base_name)?
-        .merged_at?;
+    let live = target_live?;
+    let since = live
+        .released_from
+        .as_deref()
+        .and_then(|base| versions.iter().find(|v| v.version == base))
+        .and_then(|v| v.merged_at)
+        .or(live.merged_at)?;
     let until = versions.iter().find(|v| v.version == picked)?.merged_at?;
     if until <= since {
         return None;
@@ -375,6 +379,30 @@ pub fn carried_by<'a>(
         .collect();
     out.sort_by_key(|v| std::cmp::Reverse(v.merged_at));
     Some(out)
+}
+
+/// Every merge up to and including `picked`, newest first, at most `cap`:
+/// what a promotion carries at most, when `carried_by` cannot say where to
+/// stop. Some of these may already be on the target.
+pub fn carried_at_most<'a>(
+    versions: &'a [deja_store::CdVersionRow],
+    picked: &str,
+    cap: usize,
+) -> Vec<&'a deja_store::CdVersionRow> {
+    let Some(until) = versions
+        .iter()
+        .find(|v| v.version == picked)
+        .and_then(|v| v.merged_at)
+    else {
+        return versions.iter().filter(|v| v.version == picked).collect();
+    };
+    let mut out: Vec<&deja_store::CdVersionRow> = versions
+        .iter()
+        .filter(|v| v.kind == "merge" && v.merged_at.is_some_and(|m| m <= until))
+        .collect();
+    out.sort_by_key(|v| std::cmp::Reverse(v.merged_at));
+    out.truncate(cap);
+    out
 }
 
 /// One divergence of the promotion delta, laid on the merge that first
@@ -1003,5 +1031,43 @@ mod preview_tests {
         let a = attribute(vec![row("x", "$.a", Bucket::Introduced, None)], &[]);
         assert!(a.groups.is_empty());
         assert_eq!(a.unattributed.len(), 1);
+    }
+
+    #[test]
+    fn a_release_placed_on_a_merge_deja_never_saw_counts_from_its_own_time() {
+        // 2026.10.16.2 sits on 21e6bdad4c, older than anything déjà tracks;
+        // reconcile records the release's commit time as its merged_at.
+        let versions = vec![
+            version("e5", "merge", None, Some(15)),
+            version("d4", "merge", None, Some(14)),
+            version("c3", "merge", None, Some(9)),
+        ];
+        let live = version("2026.10.16.2", "release", Some("21e6bdad4c"), Some(10));
+        let got: Vec<&str> = carried_by(&versions, "e5", Some(&live))
+            .expect("the release's own time dates it")
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["e5", "d4"],
+            "c3 merged before the release was cut"
+        );
+    }
+
+    #[test]
+    fn at_most_is_every_merge_up_to_the_picked_one() {
+        let versions = vec![
+            version("e5", "merge", None, Some(15)),
+            version("d4", "merge", None, Some(14)),
+            version("r", "release", None, Some(13)),
+            version("c3", "merge", None, Some(9)),
+        ];
+        let got: Vec<&str> = carried_at_most(&versions, "d4", 10)
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(got, vec!["d4", "c3"]);
+        assert_eq!(carried_at_most(&versions, "d4", 1).len(), 1, "capped");
     }
 }

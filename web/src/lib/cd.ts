@@ -27,6 +27,9 @@ export function carries(v: CdVersionRow): string {
     // A release the pipeline never posted (first seen on an environment)
     // has no recorded contents; saying "0 pull requests" would be a claim.
     if (n === 0 && !v.released_from) return "contents not recorded";
+    // Placed on main by reconcile but cut outside the pipeline: where it
+    // sits is known, the pull requests it carries were never posted.
+    if (n === 0) return `cut on ${v.released_from}`;
     const from = v.released_from ? `, from ${v.released_from}` : "";
     return `${n} pull request${n === 1 ? "" : "s"}${from}`;
   }
@@ -73,10 +76,14 @@ export function mergesSince(
   versions: CdVersionRow[],
   liveRelease: CdVersionRow | null | undefined,
 ): CdVersionRow[] | null {
-  if (!liveRelease?.released_from) return null;
-  const base = versions.find((v) => v.version === liveRelease.released_from);
-  if (!base?.merged_at) return null;
-  const since = Date.parse(base.merged_at);
+  if (!liveRelease) return null;
+  // Dated by the merge it was cut on, else by its own time: reconcile places
+  // a release cut outside the pipeline on main, and that merge may predate
+  // what déjà tracks.
+  const base = liveRelease.released_from ? versions.find((v) => v.version === liveRelease.released_from) : undefined;
+  const at = base?.merged_at ?? (liveRelease.released_from ? liveRelease.merged_at : null);
+  if (!at) return null;
+  const since = Date.parse(at);
   return versions
     .filter((v) => v.kind === "merge" && v.merged_at && Date.parse(v.merged_at) > since)
     .sort((a, b) => Date.parse(b.merged_at!) - Date.parse(a.merged_at!));
