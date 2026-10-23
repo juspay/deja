@@ -386,14 +386,19 @@ newer append. Revocation removes the rule from future runs without mutating
 previous revisions, pinned run snapshots, or raw ledger arguments. When no
 rules are active, new runs carry no noise-policy digest.
 
-An explicit `DEJA_DB_URL` configures Deja's authoritative rule store: a
-replay refuses admission if that configured service store is unavailable.
-This is independent of whether the system under test (Hyperswitch, Prism,
-or another service) has an application database. Without an explicitly
-configured Deja rule store, replay keeps its prior file-only admission
-behavior and cannot silently activate maintainer rules. Dashboard preview
-streams bounded historical ledger classifications without payloads and
-refuses to promise absorption without trusted pairing. Only a new replay
+An explicit `DEJA_DB_URL` enables maintainer rules in **Deja's** state
+Postgres, independently of any system-under-test database. If Deja's rule
+store is unreachable, replay proceeds from its file-backed run record with
+**no newly loaded allowances**: previously approved noise may reappear as
+divergence, but no difference is silently approved. Catalog/audit writes
+are best-effort during an outage. A validated rule snapshot already read for
+a run remains pinned even if a later catalog write fails; a fetched but
+invalid rule document or digest is an integrity error and still refuses
+admission. Maintainer changes and policy preview require the connected Deja
+store. Without an explicitly configured rule store, replay retains its prior
+file-only behavior and no maintainer rules can be activated. Dashboard
+preview streams bounded historical ledger classifications without payloads
+and refuses to promise absorption without trusted pairing. Only a new replay
 proves the full effect. Three-way delta refuses comparisons across different
 pinned rule digests rather than presenting differently judged runs as one
 candidate change.

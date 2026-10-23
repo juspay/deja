@@ -1046,8 +1046,8 @@ async fn v1_create_run(
         }
     }
     let mut spec = spec;
-    // Callers never choose maintainer decisions. Unconfigured file-only
-    // replays keep their legacy admission path and carry no noise snapshot.
+    // Callers never choose maintainer decisions. A rule-store outage uses the
+    // same strict, file-only replay admission as an unconfigured store.
     if body_has_boundary_policy {
         return error_resp(
             400,
@@ -1055,15 +1055,25 @@ async fn v1_create_run(
         );
     }
     if spec.mode == deja_orchestrator::RunMode::Replay && st.noise_store_configured {
-        // An explicitly configured rule store is authoritative: if it is
-        // unavailable, do not silently replay without its active allowances.
-        let store = match require_store(&st) {
-            Ok(store) => store,
-            Err(response) => return response,
-        };
-        let active = match store.boundary_policy_active(spec.system()).await {
-            Ok(active) => active,
-            Err(e) => return error_resp(503, &format!("read active noise rules: {e}")),
+        let active = if let Some(store) = &st.store {
+            match store.boundary_policy_active(spec.system()).await {
+                Ok(active) => active,
+                Err(e) => {
+                    eprintln!(
+                        "deja-orchestrator: read noise rules for {} failed: {e}; \
+                         replaying without maintainer allowances",
+                        spec.system()
+                    );
+                    None
+                }
+            }
+        } else {
+            eprintln!(
+                "deja-orchestrator: noise rule store unavailable for {}; \
+                 replaying without maintainer allowances",
+                spec.system()
+            );
+            None
         };
         if let Some(row) = active {
             let document: deja_orchestrator::policy::BoundaryPolicyDocument =
@@ -1101,8 +1111,10 @@ async fn v1_create_run(
         let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
         let params =
             deja_orchestrator::RunParams::resolved(&run.spec, expectation.as_deref()).to_json();
+        let mut file_only = false;
         if run.spec.mode == deja_orchestrator::RunMode::Replay && st.noise_store_configured {
-            // Explicit rule storage commits the run and audit before launch.
+            // Catalog and audit are best-effort during a Deja DB outage.
+            // The run file already pins any successfully loaded rule snapshot.
             if let Err(e) = store
                 .insert_run_with_audit(
                     &run.run_id,
@@ -1116,13 +1128,12 @@ async fn v1_create_run(
                 )
                 .await
             {
-                if let Err(cleanup) = std::fs::remove_file(st.root.run_path(&run.run_id)) {
-                    eprintln!(
-                        "deja-orchestrator: remove unadmitted run {}: {cleanup}",
-                        run.run_id
-                    );
-                }
-                return error_resp(503, &format!("create run store transaction: {e}"));
+                eprintln!(
+                    "deja-orchestrator: create run store transaction failed for {}: {e}; \
+                     continuing file-only",
+                    run.run_id
+                );
+                file_only = true;
             }
         } else {
             // Legacy file-only replay and recording admission retain their
@@ -1151,10 +1162,14 @@ async fn v1_create_run(
                 )
                 .await;
         }
-        deja_orchestrator::lifecycle::StoreCtx::new(
-            &run.run_id,
-            Some((tokio::runtime::Handle::current(), store.clone())),
-        )
+        if file_only {
+            deja_orchestrator::lifecycle::StoreCtx::disabled(&run.run_id)
+        } else {
+            deja_orchestrator::lifecycle::StoreCtx::new(
+                &run.run_id,
+                Some((tokio::runtime::Handle::current(), store.clone())),
+            )
+        }
     } else {
         deja_orchestrator::lifecycle::StoreCtx::disabled(&run.run_id)
     };
@@ -2337,7 +2352,10 @@ async fn v1_get_run(State(st): State<AppState>, id: RunId) -> Response {
     let row = match &st.store {
         Some(store) => match store.get_run(&id).await {
             Ok(row) => row,
-            Err(e) => return error_resp(500, &format!("get run: {e}")),
+            Err(e) => {
+                eprintln!("deja-orchestrator: get run {id} from store failed: {e}; reading file");
+                None
+            }
         },
         None => None,
     };
@@ -6876,7 +6894,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replay_without_configured_noise_store_keeps_file_only_admission() {
+    async fn replay_with_unavailable_noise_store_keeps_strict_file_only_admission() {
         let body = serde_json::json!({
             "mode":"replay",
             "candidate_spec":{"kind":"prebuilt_image","image":"local/no-store-smoke:unavailable"},
@@ -6915,13 +6933,31 @@ mod tests {
             .oneshot(request(&body))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let id = created["run_id"].as_str().expect("created run id");
+        let run: Run = deja_orchestrator::read_json(&configured.root.run_path(id)).unwrap();
+        assert_eq!(run.spec.mode, deja_orchestrator::RunMode::Replay);
+        assert!(
+            run.spec.boundary_policy.is_none(),
+            "an unavailable configured rule store cannot approve differences"
+        );
+        let response = app_router(configured)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/runs/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            std::fs::read_dir(configured.root.root.join("runs"))
-                .unwrap()
-                .count(),
-            0,
-            "an unavailable configured rule store refuses before persisting a run"
+            response.status(),
+            StatusCode::OK,
+            "file-only run remains readable"
         );
     }
 
@@ -8605,7 +8641,7 @@ mod sign_in {
         st.store = Some(Arc::new(
             Store::connect(&db_url).await.expect("test Postgres"),
         ));
-        let app = app_router(st);
+        let app = app_router(st.clone());
         let base = "/api/v1/systems/hyperswitch/boundary-policy";
         let (status, body) = call(
             app.clone(),
@@ -8679,6 +8715,35 @@ mod sign_in {
         )
         .await;
         assert_eq!(activated, StatusCode::OK, "{body}");
+        let activated_snapshot: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let (status, body) = call(
+            app.clone(),
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-deja-actor", "alice@juspay.in")
+                .header(header::COOKIE, session_cookie(&signer, "alice@juspay.in"))
+                .body(Body::from(
+                    serde_json::json!({
+                        "mode":"replay",
+                        "system_under_test":"hyperswitch",
+                        "recording_id":"rec-not-on-disk",
+                        "candidate_spec":{"kind":"prebuilt_image","image":"local/policy-smoke:unavailable"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let run_id = created["run_id"].as_str().unwrap();
+        let pinned: Run = deja_orchestrator::read_json(&st.root.run_path(run_id)).unwrap();
+        let snapshot = serde_json::to_value(pinned.spec.boundary_policy.as_ref().unwrap()).unwrap();
+        assert_eq!(snapshot["revision_id"], id);
+        assert_eq!(snapshot["digest"], activated_snapshot["snapshot"]["digest"]);
+        assert!(snapshot["rules"].as_array().unwrap().contains(&rule));
 
         let (status, body) = call(
             app.clone(),
@@ -8706,6 +8771,11 @@ mod sign_in {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        let unchanged: Run = deja_orchestrator::read_json(&st.root.run_path(run_id)).unwrap();
+        assert_eq!(
+            unchanged.spec.boundary_policy, pinned.spec.boundary_policy,
+            "revocation must not rewrite a previously admitted replay"
+        );
         let (status, body) = call(
             app,
             Request::builder()
