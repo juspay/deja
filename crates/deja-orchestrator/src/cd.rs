@@ -405,6 +405,41 @@ pub fn carried_at_most<'a>(
     out
 }
 
+/// The pull requests a release carries: those of `merges`, each once,
+/// newest merge first.
+pub fn prs_of(merges: &[&deja_store::CdVersionRow]) -> Vec<deja_store::CdVersionPr> {
+    let mut seen = std::collections::HashSet::new();
+    merges
+        .iter()
+        .flat_map(|m| m.prs.iter())
+        .filter(|p| seen.insert((p.repo.to_lowercase(), p.pr_number)))
+        .cloned()
+        .collect()
+}
+
+/// The merges a release placed on main carries, when nothing better is
+/// known: those after the newest other dated release before it, up to its
+/// own time. `None` when there is no earlier dated release to count from:
+/// the list is then left empty rather than guessed.
+pub fn merges_since_previous_release<'a>(
+    versions: &'a [deja_store::CdVersionRow],
+    release: &deja_store::CdVersionRow,
+) -> Option<Vec<&'a deja_store::CdVersionRow>> {
+    let until = release.merged_at?;
+    let since = versions
+        .iter()
+        .filter(|v| v.kind == "release" && v.version != release.version)
+        .filter_map(|v| v.merged_at)
+        .filter(|t| *t < until)
+        .max()?;
+    let mut out: Vec<&deja_store::CdVersionRow> = versions
+        .iter()
+        .filter(|v| v.kind == "merge" && v.merged_at.is_some_and(|m| m > since && m <= until))
+        .collect();
+    out.sort_by_key(|v| std::cmp::Reverse(v.merged_at));
+    Some(out)
+}
+
 /// One divergence of the promotion delta, laid on the merge that first
 /// showed it.
 #[derive(Debug, Clone, Serialize)]
@@ -1069,5 +1104,52 @@ mod preview_tests {
             .collect();
         assert_eq!(got, vec!["d4", "c3"]);
         assert_eq!(carried_at_most(&versions, "d4", 1).len(), 1, "capped");
+    }
+
+    fn merge_pr(name: &str, hour: u32, pr: i64) -> deja_store::CdVersionRow {
+        let mut v = version(name, "merge", None, Some(hour));
+        v.prs = vec![deja_store::CdVersionPr {
+            repo: "example/repo".into(),
+            pr_number: pr,
+            title: Some(format!("change {pr}")),
+            author: None,
+            merged_at: v.merged_at,
+        }];
+        v
+    }
+
+    #[test]
+    fn a_release_carries_the_prs_of_its_merges_once_each() {
+        let a = merge_pr("a", 12, 7);
+        let b = merge_pr("b", 13, 8);
+        let again = merge_pr("c", 14, 7);
+        let got: Vec<i64> = prs_of(&[&again, &b, &a])
+            .iter()
+            .map(|p| p.pr_number)
+            .collect();
+        assert_eq!(got, vec![7, 8]);
+    }
+
+    #[test]
+    fn a_placed_release_carries_the_merges_since_the_release_before_it() {
+        let versions = vec![
+            merge_pr("e5", 15, 5),
+            merge_pr("d4", 13, 4),
+            merge_pr("c3", 11, 3),
+            version("r-old", "release", None, Some(12)),
+            merge_pr("b2", 9, 2),
+        ];
+        let release = version("r-new", "release", Some("d4"), Some(14));
+        let got: Vec<&str> = merges_since_previous_release(&versions, &release)
+            .expect("r-old dates the start")
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(got, vec!["d4"], "c3 is in r-old, e5 came after r-new");
+        let alone = vec![merge_pr("d4", 13, 4)];
+        assert!(
+            merges_since_previous_release(&alone, &release).is_none(),
+            "nothing before it to count from"
+        );
     }
 }
