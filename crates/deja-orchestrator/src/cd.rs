@@ -878,7 +878,7 @@ mod preview_tests {
         ];
         let live = version("cd-2026.10.23.1", "release", Some("b2"), Some(12));
         let got: Vec<&str> = carried_by(&versions, "d4", Some(&live))
-            .unwrap()
+            .expect("the release names its merge, so what rides along is known")
             .iter()
             .map(|v| v.version.as_str())
             .collect();
