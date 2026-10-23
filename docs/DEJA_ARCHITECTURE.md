@@ -350,48 +350,51 @@ After the replay run, the observed and shadow boundary calls are compared agains
 
 The orchestrator adds cause-vs-consequence lanes: `ValueDivergedOrigin` marks the originating read so downstream consequences are attributed to it, alongside omitted/novel/environmental/`inconclusive_race` lanes.
 
-For the fixed Hyperswitch candidate image, an args-free serve of
-`km/common_utils::keymanager/call_encryption_service` can be classified by a
-**system-owned, versioned boundary policy**. A signed-in maintainer proposes an
-immutable revision from the dashboard; a different signed-in maintainer
-activates it. Every new **replay** run pins the active revision (or an explicit
-strict empty policy if none is active) before its worker starts. The policy is
-stored with the replay parameters and audit event; store failure prevents a
-replay launch. Recording remains independent of this policy and can run
-file-only. Re-activating an older revision rolls back the policy. Proposing an
-empty ruleset and activating it disables all KM allowances in one change.
-Activation does not rewrite published runs; explicitly re-scoring older raw
-artifacts still uses the legacy #286 classifier.
+Argument identity is evaluated **before the scorer declares a request
+divergent**. The comparison-only chain recognizes a bounded standard-base64
+string containing UTF-8 JSON, parses its document, and compares JSON object
+members structurally; decoded arrays remain positional. Inline JSON already
+has structural comparison. Malformed encodings, non-document text, changed
+JSON values, and changed surrounding arguments are not treated as equal.
+This scorer rule has no boundary, operation, or vendor condition.
 
-The rule applies only to the exact KM selector and the recorded event that
-was actually served, never to arbitrary KM calls or response values.
-`plain_base64_json_order` parses a base64-encoded plain JSON document and
-compares object keys structurally, with arrays positional.
-`http_response_header_groups` compares equivalent JSON bodies and header
-groups in an unsigned or signed HTTP response envelope; repeated values
-within a header name retain their order, and `status_code` and
-`error_message` remain exact. `signed_body_derived_signature` can absorb
-a changed `X-Webhook-Signature-512` only if the raw body bytes changed,
-the parsed JSON body and all other arguments/non-signature headers agree.
-When non-signature header order/rendering also changes, both the signature
-and header-groups treatments must be enabled; one rule cannot silently enable
-the other.
-It **declares a derived dependency, not verified HMAC authenticity**:
-Deja has no signing key. Different JSON values, mismatched non-signature
-headers, malformed arguments, unrelated call/serve pairing, and mismatched
-status/error fields still block. An already-published ledger or scorecard
-is never rewritten; preview streams a historical run's call ledger and
-counts a row as absorbable only if its ledger semantic-pair evidence excludes
-an independent call-order mismatch. It reports bounded counts without raw
-payloads, but only a new replay proves the policy's full effect.
+A fixed candidate image still executes its own compiled lookup policy. If it
+used the args-free fallback, it will have stamped `arg_divergent` before the
+orchestrator observes the call. The scorer checks that the call paired with
+the *recorded event it actually served*, then evaluates the generic semantic
+chain **before its own divergence verdict**. It does not change lookup keys,
+the candidate's flag, the recording, or the candidate image. An unpaired
+serve or independent order mismatch remains blocking.
 
-The scorecard and cached behavior tree carry the pinned policy digest.
-Three-way delta refuses to compare runs with different digests (including
-legacy/no-policy versus a new pinned run), rather than presenting different
-scoring rules as a candidate change. The call ledger retains the raw
-recorded/observed arguments under the run's pinned policy provenance.
-This is a scorer-only rule: the lookup/runtime, recording, candidate image,
-and independent omitted/novel calls are unaffected.
+For residual differences whose semantics cannot be proved by decoding, an
+authenticated maintainer can propose a **per-system noise rule** selecting an
+exact boundary/trait/method and one typed target: a scalar JSON Pointer,
+header-name group presentation, or one named header value. The source can be
+raw arguments or a declared JSON Pointer to base64-encoded UTF-8 JSON.
+Everything outside approved targets is still compared; repeated values of
+one header name retain their order. Approving a signature value declares
+noise; Deja has no signing key and does **not** verify its HMAC.
+
+Proposals are immutable and audited; a different signed-in maintainer must
+activate one. A run pins the revision at admission. To **revoke** an allowance
+once its root cause is fixed, propose a new revision without that rule and
+have a different maintainer activate it; existing run snapshots and raw
+ledger arguments remain unchanged. An empty revision disables all approved
+noise. Dashboard preview streams bounded historical ledger classifications
+without returning payloads and refuses to promise absorption without trusted
+paired-serve evidence. Only a new replay proves the full effect. Scorecards
+and cached behavior trees record the policy digest; three-way delta refuses
+comparison across different digests instead of presenting differently
+judged runs as one candidate change.
+
+When both replays make the same genuine JSON change from the tape but encode
+it differently, a trustworthy paired ledger row carries a semantic digest of
+the observed arguments. The digest canonicalizes decoded documents and only
+the active revision's approved noise targets. The behavior tree uses that
+digest for a still-divergent call, so three-way delta inherits common semantic
+drift instead of comparing base64 renderings or declared volatile header
+values. Untrusted pairing falls back to the raw hash; no signature is
+cryptographically verified.
 
 The blocking-vs-drift policy is **built, declared, and judged** — not open. Boundaries declare canonicalization presets applied by the scorer before judging (never by runtime routing): `final_state`, `absent_after`, `project{include,exclude}`. Volatile columns are declared `project:!created_at,!last_synced,!modified_at` on the DB row seams with a matching `reply_canon` on `http_incoming`. Blocking vs non-blocking is explicit in the verdict: seed gaps, order-nondeterminism, and idempotent-delete lines are non-blocking; evidence-gated `inconclusive_race` rows (recognized only when the run's HTTP layer is clean) make the verdict `inconclusive` with an auto-rerun recommendation — a race-only run can never pass.
 

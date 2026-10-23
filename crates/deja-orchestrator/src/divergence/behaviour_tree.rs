@@ -42,8 +42,9 @@ use super::ledger::CallRecord;
 /// 5: a whole-body difference the kernel could only report as raw bytes is
 ///    hashed by the candidate's decoded body, so the map order serialised
 ///    into those bytes is not behaviour either.
-/// 7: a run's immutable boundary policy is part of its comparison identity.
-pub const CANON_VERSION: u32 = 7;
+/// 8: semantic argument/noise verdicts project from the ledger; obsolete
+///    boundary-specific evidence is no longer stored in the tree.
+pub const CANON_VERSION: u32 = 8;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -117,10 +118,6 @@ pub struct Entry {
     /// Whether this address blocks a verdict when it diverges — mirrors the
     /// ledger row's `blocking` for calls; responses always block.
     pub blocking: bool,
-    /// KM evidence for delta's pairwise check. Raw args remain in the call
-    /// ledger; this tree holds only digests.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) km_entropy: Option<super::km_entropy::KmEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,36 +320,21 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             lanes.entry(correlation.clone()).or_insert(lane);
         }
         let observed_hash = || {
-            row.observed
-                .as_ref()
-                .and_then(|s| s.args.as_ref())
-                .map(hash_of)
-                .unwrap_or_else(|| "∅".to_owned())
-        };
-        let km_entropy = if row.source_event_global_sequence.is_some()
-            && (row.served_event_global_sequence.is_none()
-                || row.served_event_global_sequence == row.source_event_global_sequence)
-        {
-            row.observed
-                .as_ref()
-                .and_then(|side| side.args.as_ref())
-                .and_then(|args| {
-                    super::km_entropy::evidence(
-                        &row.boundary,
-                        &row.trait_name,
-                        &row.method_name,
-                        args,
-                        row.km_semantic_pair,
-                    )
-                })
-        } else {
-            None
+            row.semantic_digest.as_ref().map_or_else(
+                || {
+                    row.observed
+                        .as_ref()
+                        .and_then(|side| side.args.as_ref())
+                        .map(hash_of)
+                        .unwrap_or_else(|| "∅".to_owned())
+                },
+                |digest| format!("semantic:{digest}"),
+            )
         };
         let value = match row.kind.as_str() {
             // A served call returned exactly the value the recording holds.
             "matched"
-            | "km_rendering_absorbed"
-            | "km_derived_absorbed"
+            | "approved_noise"
             | "recovered"
             | "identity_skew"
             | "deterministic"
@@ -415,7 +397,6 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             },
             value,
             blocking: row.blocking,
-            km_entropy,
         });
     }
     for d in diffs {
@@ -433,7 +414,6 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                 }
             },
             blocking: true,
-            km_entropy: None,
         });
         for p in &d.body_diff {
             entries.push(Entry {
@@ -445,7 +425,6 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                     hash: hash_of(body_diff_value(d, p)),
                 },
                 blocking: true,
-                km_entropy: None,
             });
         }
     }
@@ -588,7 +567,8 @@ mod tests {
             correlation_id: Some(corr.to_owned()),
             source_event_global_sequence: source_seq,
             served_event_global_sequence: None,
-            km_semantic_pair: false,
+            semantic_pair: false,
+            semantic_digest: None,
             boundary: "http_outgoing".to_owned(),
             trait_name: "svc".to_owned(),
             method_name: "call_connector_api".to_owned(),

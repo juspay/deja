@@ -47,16 +47,15 @@ use crate::HarnessRoot;
 pub mod acknowledgement;
 pub mod behaviour_tree;
 pub mod delta;
-pub(crate) mod km_entropy;
 pub mod ledger;
+mod noise;
 pub mod span_shape;
 pub mod tape;
 pub use ledger::CallRecord;
 
-/// Preview one recorded/observed KM argument pair under a proposed policy.
-/// This returns only a class, never the captured payload; the API bounds its
-/// example list and leaves the published run's scorecard unchanged.
-pub fn classify_km_args_with_policy(
+/// Preview the same generic argument verdict used by the scorer, without
+/// exposing captured payloads or rewriting an old run's scorecard.
+pub fn classify_boundary_args_with_policy(
     boundary: &str,
     trait_name: &str,
     method_name: &str,
@@ -64,19 +63,21 @@ pub fn classify_km_args_with_policy(
     observed: &serde_json::Value,
     snapshot: Option<&crate::policy::BoundaryPolicySnapshot>,
 ) -> &'static str {
-    match km_entropy::classify_with_policy(
+    if recorded == observed {
+        "equal"
+    } else if deja::identity::semantic_differences(recorded, observed).is_some() {
+        "semantic_equivalent"
+    } else if noise::equivalent(
+        recorded,
+        observed,
         boundary,
         trait_name,
         method_name,
-        recorded,
-        observed,
         snapshot,
     ) {
-        km_entropy::KmClass::NotApplicable => "not_applicable",
-        km_entropy::KmClass::Equal => "equal",
-        km_entropy::KmClass::Rendering => "rendering_absorbed",
-        km_entropy::KmClass::DeclaredDerived => "derived_absorbed",
-        km_entropy::KmClass::Different => "different",
+        "approved_noise"
+    } else {
+        "different"
     }
 }
 
@@ -2596,13 +2597,9 @@ enum ValueAbsorption {
     /// A paired request whose args have the recorded call's identity: an array
     /// in another order, or an embedded document written in another order.
     ArgsIdentity,
-    /// An args-free KM serve whose request differs only by an encoded JSON
-    /// rendering (including a permutation of identical header pairs).
-    KmRendering,
-    /// An args-free KM serve whose only other change is the signature declared
-    /// derived from equivalent JSON rendered into different body bytes. This
-    /// is a declaration, not cryptographic HMAC verification.
-    KmDerived,
+    /// A system maintainer approved this exact argument path/shape as noise.
+    /// Raw arguments remain in the call ledger for inspection and revocation.
+    ApprovedNoise,
     /// A value holding a JSON document in a string written differently: the
     /// document is the recording's, its text is not. With the source of any
     /// ordering beside it.
@@ -2625,11 +2622,34 @@ enum ValueVerdict {
 /// it — so a pair whose arguments agree missed its address by position alone,
 /// and is a match whatever it got back.
 ///
-/// Order-only KM encryption args can miss the fixed candidate's lookup and
-/// receive its recorded result via the args-free arm. The scorer alone may
-/// demote that serve, but only when it was paired to the event it actually
-/// served, and only after the narrow classifier proves that all other inputs
-/// remained the same. An unpaired serve or a different value stays blocking.
+/// What a request's arguments mean, before any divergence is declared.
+/// `None` means the arguments are genuinely different under the generic
+/// identity chain and the run's pinned, maintainer-approved noise rules.
+fn argument_verdict(
+    recorded: &serde_json::Value,
+    call: &ObservedCall,
+    policy: Option<&crate::policy::BoundaryPolicySnapshot>,
+) -> Option<ValueVerdict> {
+    match deja::identity::semantic_differences(recorded, &call.args).as_deref() {
+        Some([]) => return Some(ValueVerdict::Equal),
+        Some(_) => return Some(ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity)),
+        None => {}
+    }
+    noise::equivalent(
+        recorded,
+        &call.args,
+        &call.boundary,
+        &call.trait_name,
+        &call.method_name,
+        policy,
+    )
+    .then_some(ValueVerdict::Absorbed(ValueAbsorption::ApprovedNoise))
+}
+
+/// The candidate's fixed runtime may already have taken its args-free fallback.
+/// Before Deja JUDGES that observation as divergent, compare its arguments
+/// with the recorded event it actually served. Fallback value canonicalization
+/// is NOT enough to pardon a genuinely different outgoing request.
 fn pair_request_verdict(
     call: &ObservedCall,
     twin: Option<&deja::BoundaryEvent>,
@@ -2642,35 +2662,23 @@ fn pair_request_verdict(
         if call.served_event_global_sequence != Some(event.global_sequence) {
             return ValueVerdict::Diverged;
         }
-        return match km_entropy::classify_with_policy(
-            &call.boundary,
-            &call.trait_name,
-            &call.method_name,
-            &event.args,
-            &call.args,
-            policy,
-        ) {
-            km_entropy::KmClass::Rendering => ValueVerdict::Absorbed(ValueAbsorption::KmRendering),
-            km_entropy::KmClass::DeclaredDerived => {
-                ValueVerdict::Absorbed(ValueAbsorption::KmDerived)
-            }
-            _ => ValueVerdict::Diverged,
-        };
+        return argument_verdict(&event.args.to_value(), call, policy)
+            .unwrap_or(ValueVerdict::Diverged);
     }
-    request_verdict(call, twin)
+    request_verdict(call, twin, policy)
 }
 
 /// What [`pair_request_verdict`] would say of a call's arguments if it had not
 /// been served by its address alone: the absorber that would have forgiven
 /// them, named on the warning so the reason stays visible.
-fn request_verdict(call: &ObservedCall, twin: Option<&deja::BoundaryEvent>) -> ValueVerdict {
+fn request_verdict(
+    call: &ObservedCall,
+    twin: Option<&deja::BoundaryEvent>,
+    policy: Option<&crate::policy::BoundaryPolicySnapshot>,
+) -> ValueVerdict {
     let recorded = twin.map_or(serde_json::Value::Null, |event| event.args.to_value());
-    match deja::identity::identity_differences(&recorded, &call.args).as_deref() {
-        // The same identity as written: the request is the recording's, even
-        // where its renderings differ (a form body's field order).
-        Some([]) => return ValueVerdict::Equal,
-        Some(_) => return ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity),
-        None => {}
+    if let Some(verdict) = argument_verdict(&recorded, call, policy) {
+        return verdict;
     }
     // Different identities: the diff's own order rule is the same identity,
     // so it cannot forgive them as order; a declared clause or replay-local
@@ -2808,11 +2816,11 @@ fn account_lookups(
 /// Why a served call's arguments would otherwise have passed, for its warning.
 fn args_served_reason(verdict: ValueVerdict) -> &'static str {
     match verdict {
-        ValueVerdict::Absorbed(ValueAbsorption::KmRendering) => {
-            "the key-manager request differs only by encoded JSON rendering"
+        ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity) => {
+            "the arguments have the same semantic identity despite different rendering"
         }
-        ValueVerdict::Absorbed(ValueAbsorption::KmDerived) => {
-            "the signature is declared derived from equivalent JSON rendered into different body bytes; HMAC correctness was not verified"
+        ValueVerdict::Absorbed(ValueAbsorption::ApprovedNoise) => {
+            "the pinned system policy approves this narrowly scoped difference as noise"
         }
         ValueVerdict::Absorbed(ValueAbsorption::DbInfrastructure) => {
             "its arguments differ only where replay-local database infrastructure is \
@@ -6425,16 +6433,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .entry((call_site_label(obs), source.label()))
                     .or_insert(0) += 1;
             }
-            if let ValueVerdict::Absorbed(ValueAbsorption::KmRendering) = verdict {
-                stats.note_kind("KmRenderingAbsorbed");
-            }
-            if let ValueVerdict::Absorbed(ValueAbsorption::KmDerived) = verdict {
-                stats.note_kind("KmDerivedAbsorbed");
+            if let ValueVerdict::Absorbed(ValueAbsorption::ApprovedNoise) = verdict {
+                stats.note_kind("ApprovedNoise");
             }
             if let ValueVerdict::Absorbed(ValueAbsorption::ArgsIdentity) = verdict {
                 let recorded = twin_event.map_or(serde_json::Value::Null, |e| e.args.to_value());
                 for change in
-                    deja::identity::identity_differences(&recorded, &obs.args).unwrap_or_default()
+                    deja::identity::semantic_differences(&recorded, &obs.args).unwrap_or_default()
                 {
                     note_identity_site(stats, &mut args_identity_seen, obs, &change);
                 }
@@ -6451,12 +6456,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                 let reason = if matches!(
                     verdict,
                     ValueVerdict::Absorbed(
-                        ValueAbsorption::KmRendering | ValueAbsorption::KmDerived
+                        ValueAbsorption::ArgsIdentity | ValueAbsorption::ApprovedNoise
                     )
                 ) {
                     args_served_reason(verdict)
                 } else {
-                    args_served_reason(request_verdict(obs, twin_event))
+                    args_served_reason(request_verdict(
+                        obs,
+                        twin_event,
+                        art.boundary_policy.as_ref(),
+                    ))
                 };
                 *args_served_seen
                     .entry((call_site_label(obs), reason, value_diverged))
@@ -21055,251 +21064,278 @@ mod tests {
             card.verdict.reason
         );
     }
-    fn km_args(body: &str, signature: &str, reversed_headers: bool) -> serde_json::Value {
+    fn encoded_args(raw_json: &str) -> serde_json::Value {
         use base64::Engine as _;
-        let mut headers = vec![
-            serde_json::json!(["content-type", "application/json"]),
-            serde_json::json!(["X-Webhook-Signature-512", signature]),
-        ];
-        if reversed_headers {
-            headers.reverse();
-        }
-        let data = serde_json::json!({"body": body, "headers": headers}).to_string();
         serde_json::json!({
             "method": "POST",
-            "endpoint": "data/encrypt",
             "request": {
-                "data_identifier": "Merchant",
-                "key_identifier": "merchant_1",
-                "data": base64::engine::general_purpose::STANDARD.encode(data)
+                "data": base64::engine::general_purpose::STANDARD.encode(raw_json),
+                "key_identifier": "merchant_1"
             }
         })
     }
 
-    fn km_plain_args(raw_json: &str) -> serde_json::Value {
-        use base64::Engine as _;
-        serde_json::json!({
-            "method": "POST",
-            "endpoint": "data/encrypt",
-            "request": {
-                "data_identifier": "Merchant",
-                "key_identifier": "merchant_1",
-                "data": base64::engine::general_purpose::STANDARD.encode(raw_json)
-            }
-        })
-    }
-
-    fn km_served_artifacts(
+    fn served_encoded_artifacts(
         recorded: serde_json::Value,
         observed: serde_json::Value,
         served_from: u64,
     ) -> RunArtifacts {
-        let mut call = added_draw(
-            "km",
-            "call_encryption_service",
-            deja::SubstituteOutcome::Substituted,
-        );
-        call.trait_name = "common_utils::keymanager".to_owned();
+        let mut call = added_draw("api", "send", deja::SubstituteOutcome::Substituted);
+        call.trait_name = "service".to_owned();
         call.args = observed;
         call.resolved = false;
         call.arg_divergent = true;
         call.source_event_global_sequence = None;
         call.served_event_global_sequence = Some(served_from);
-        let mut artifacts = one_span_recording(("km", "call_encryption_service"), recorded, call);
-        artifacts.events[0].trait_name = "common_utils::keymanager".to_owned();
+        let mut artifacts = one_span_recording(("api", "send"), recorded, call);
+        artifacts.events[0].trait_name = "service".to_owned();
         artifacts.http_diffs[0].status_match = true;
         artifacts
     }
 
     #[test]
-    fn pinned_km_policy_changes_the_scorecard_ledger_and_tree_together() {
-        use crate::policy::{
-            BoundaryPolicyDocument, BoundaryPolicySnapshot, BoundaryRule, BoundarySelector,
-            Treatment,
-        };
-        let recorded = km_plain_args(r#"{"X-A":"a","X-B":"b"}"#);
-        let observed = km_plain_args(r#"{"X-B":"b","X-A":"a"}"#);
-        for allowed in [false, true] {
-            let rules = if allowed {
-                vec![BoundaryRule {
-                    selector: BoundarySelector {
-                        boundary: "km".into(),
-                        trait_name: "common_utils::keymanager".into(),
-                        method_name: "call_encryption_service".into(),
-                    },
-                    treatments: vec![Treatment::PlainBase64JsonOrder],
-                }]
-            } else {
-                Vec::new()
-            };
-            let document = BoundaryPolicyDocument { rules };
-            let snapshot = BoundaryPolicySnapshot {
-                revision_id: Some(if allowed { 2 } else { 1 }),
-                digest: document.canonical_digest().expect("valid KM policy"),
-                rules: document.rules,
-            };
-            let mut art = km_served_artifacts(recorded.clone(), observed.clone(), UPSTREAM_CALL);
-            art.boundary_policy = Some(snapshot.clone());
-            let card = detect(&art);
-            let rows = build_ledger(&art).expect("ledger builds");
-            let row = rows.iter().find(|r| r.boundary == "km").expect("km row");
-            let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
-            let km = tree.entries.iter().find(|entry| {
-                matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "km")
-            }).expect("KM tree entry");
-            assert_eq!(
-                card.policy_digest.as_deref(),
-                Some(snapshot.digest.as_str())
-            );
-            assert_eq!(card.summary.value_divergences, u64::from(!allowed));
-            assert_eq!(row.blocking, !allowed);
-            assert_eq!(
-                row.kind,
-                if allowed {
-                    "km_rendering_absorbed"
-                } else {
-                    "value_diverged"
-                }
-            );
-            assert_eq!(
-                matches!(km.value, behaviour_tree::Value::Reproduced),
-                allowed
-            );
-        }
-    }
-
-    #[test]
-    fn km_args_free_serve_is_absorbed_only_for_rendering_or_declared_derivation() {
-        let recorded = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);
-        for (observed, kind, row_kind) in [
-            (
-                km_args(r#"{"a":1,"b":2}"#, "sig-a", true),
-                "KmRenderingAbsorbed",
-                "km_rendering_absorbed",
-            ),
-            (
-                km_args(r#"{"b":2,"a":1}"#, "sig-b", true),
-                "KmDerivedAbsorbed",
-                "km_derived_absorbed",
-            ),
-        ] {
-            for (tier, art) in in_both_tiers(|| {
-                km_served_artifacts(recorded.clone(), observed.clone(), UPSTREAM_CALL)
-            }) {
-                let card = detect(&art);
-                assert_eq!(
-                    card.summary.value_divergences, 0,
-                    "{tier}: {}",
-                    card.verdict.reason
-                );
-                assert_eq!(kind_count(&card, "km", kind), 1, "{tier}");
-                assert_eq!(card.summary.arg_divergent_serves, 1, "{tier}");
-                assert!(card.counter_disagreements().is_empty(), "{tier}");
-                let rows = build_ledger(&art).expect("ledger builds");
-                let km: Vec<_> = rows.iter().filter(|r| r.boundary == "km").collect();
-                assert_eq!(km.len(), 1, "{tier}");
-                assert_eq!(km[0].kind, row_kind, "{tier}");
-                assert!(!km[0].blocking, "{tier}");
-                assert_eq!(km[0].source_event_global_sequence, Some(UPSTREAM_CALL));
-                assert_eq!(km[0].served_event_global_sequence, Some(UPSTREAM_CALL));
-                assert!(
-                    km[0].km_semantic_pair,
-                    "{tier}: pair is safe for semantic delta"
-                );
-                let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
-                assert!(tree.entries.iter().any(|entry| {
-                    matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "km")
-                        && matches!(entry.value, behaviour_tree::Value::Reproduced)
-                        && entry.km_entropy.is_some()
-                }), "{tier}");
-            }
-        }
-    }
-
-    #[test]
-    fn profile_header_map_order_from_batch_0004_is_absorbed_without_a_signed_envelope() {
-        let recorded =
-            km_plain_args(r#"{"X-Custom-Header":"value","X-Short":"short","X-Tiny":"tiny"}"#);
-        let observed =
-            km_plain_args(r#"{"X-Tiny":"tiny","X-Custom-Header":"value","X-Short":"short"}"#);
-        for (tier, art) in
-            in_both_tiers(|| km_served_artifacts(recorded.clone(), observed.clone(), UPSTREAM_CALL))
-        {
+    fn encoded_json_rendering_is_judged_before_arg_divergence() {
+        // The archived ProfileUpdate shape was an encoded JSON header map.
+        // This fixture uses a generic API boundary: the rule is not tied to
+        // that producer or to key-manager naming.
+        let recorded = encoded_args(r#"{"X-A":"a","X-B":"b"}"#);
+        let observed = encoded_args(r#"{"X-B":"b","X-A":"a"}"#);
+        for (tier, art) in in_both_tiers(|| {
+            served_encoded_artifacts(recorded.clone(), observed.clone(), UPSTREAM_CALL)
+        }) {
             let card = detect(&art);
             assert_eq!(card.summary.value_divergences, 0, "{tier}");
-            assert_eq!(kind_count(&card, "km", "KmRenderingAbsorbed"), 1, "{tier}");
+            assert_eq!(card.summary.arg_divergent_serves, 1, "{tier}");
+            assert!(card.counter_disagreements().is_empty(), "{tier}");
             let rows = build_ledger(&art).expect("ledger builds");
-            let row = rows.iter().find(|r| r.boundary == "km").expect("km row");
-            assert_eq!(row.kind, "km_rendering_absorbed", "{tier}");
+            let row = rows.iter().find(|r| r.boundary == "api").expect("api row");
+            assert_eq!(row.kind, "matched", "{tier}");
             assert!(!row.blocking, "{tier}");
+            assert_ne!(
+                row.recorded.as_ref().and_then(|s| s.args.as_ref()),
+                row.observed.as_ref().and_then(|s| s.args.as_ref())
+            );
             let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
-            let km = tree
-                .entries
-                .iter()
-                .find(|entry| matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "km"))
-                .expect("km tree entry");
-            assert!(matches!(km.value, behaviour_tree::Value::Reproduced));
-            assert_eq!(km.km_entropy.as_ref().map(|e| e.signed), Some(false));
+            assert!(tree.entries.iter().any(|entry| {
+                matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "api")
+                    && matches!(entry.value, behaviour_tree::Value::Reproduced)
+            }), "{tier}");
         }
+        let changed = served_encoded_artifacts(
+            recorded.clone(),
+            encoded_args(r#"{"X-A":"changed","X-B":"b"}"#),
+            UPSTREAM_CALL,
+        );
+        assert_eq!(detect(&changed).summary.value_divergences, 1);
+        let wrong_serve = served_encoded_artifacts(recorded, observed, UPSTREAM_CALL + 1);
+        assert_eq!(detect(&wrong_serve).summary.value_divergences, 1);
     }
 
     #[test]
-    fn response_header_group_order_from_latest_run_is_absorbed() {
-        let recorded = km_plain_args(
-            &serde_json::json!({
-                "body": r#"{"success":true}"#,
-                "headers": [["date", "today"], ["set-cookie", "a=1"], ["set-cookie", "b=2"], ["content-type", "application/json"]],
-                "status_code": 200,
-                "error_message": null
-            })
-            .to_string(),
+    fn approved_header_noise_is_nondivergent_until_a_new_revision_revokes_it() {
+        use crate::policy::{
+            BoundaryPolicyDocument, BoundaryPolicySnapshot, BoundaryRule, BoundarySelector,
+            NoiseTarget,
+        };
+        let encoded = |headers: serde_json::Value, status: u16| {
+            encoded_args(
+                &serde_json::json!({
+                    "body": r#"{"success":true}"#,
+                    "headers": headers,
+                    "status_code": status
+                })
+                .to_string(),
+            )
+        };
+        let recorded = encoded(
+            serde_json::json!([
+                ["date", "today"],
+                ["set-cookie", "a=1"],
+                ["set-cookie", "b=2"],
+                ["content-type", "application/json"]
+            ]),
+            200,
         );
-        let observed = km_plain_args(
-            &serde_json::json!({
-                "body": r#"{"success":true}"#,
-                "headers": [["content-type", "application/json"], ["set-cookie", "a=1"], ["set-cookie", "b=2"], ["date", "today"]],
-                "status_code": 200,
-                "error_message": null
-            })
-            .to_string(),
+        let reordered = encoded(
+            serde_json::json!([
+                ["content-type", "application/json"],
+                ["set-cookie", "a=1"],
+                ["set-cookie", "b=2"],
+                ["date", "today"]
+            ]),
+            200,
         );
-        let art = km_served_artifacts(recorded, observed, UPSTREAM_CALL);
+        let mut art = served_encoded_artifacts(recorded.clone(), reordered.clone(), UPSTREAM_CALL);
+        assert_eq!(detect(&art).summary.value_divergences, 1);
+
+        let rule = BoundaryRule {
+            selector: BoundarySelector {
+                boundary: "api".into(),
+                trait_name: "service".into(),
+                method_name: "send".into(),
+            },
+            source_path: Some("/request/data".into()),
+            target: NoiseTarget::HeaderGroup {
+                json_pointer: "/headers".into(),
+            },
+        };
+        let document = BoundaryPolicyDocument { rules: vec![rule] };
+        let active = BoundaryPolicySnapshot {
+            revision_id: Some(1),
+            digest: document.canonical_digest().expect("valid revision"),
+            rules: document.rules,
+        };
+        art.boundary_policy = Some(active.clone());
         let card = detect(&art);
         assert_eq!(card.summary.value_divergences, 0);
-        assert_eq!(kind_count(&card, "km", "KmRenderingAbsorbed"), 1);
+        assert_eq!(kind_count(&card, "api", "ApprovedNoise"), 1);
         let rows = build_ledger(&art).expect("ledger builds");
-        let row = rows.iter().find(|r| r.boundary == "km").expect("km row");
-        assert_eq!(row.kind, "km_rendering_absorbed");
+        let row = rows
+            .iter()
+            .find(|r| r.boundary == "api")
+            .expect("paired API row");
+        assert_eq!(row.kind, "approved_noise");
         assert!(!row.blocking);
         let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
-        let km = tree.entries.iter().find(|entry| matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "km")).expect("km tree entry");
-        assert!(matches!(km.value, behaviour_tree::Value::Reproduced));
-        assert_eq!(km.km_entropy.as_ref().map(|e| e.signed), Some(false));
+        assert!(tree.entries.iter().any(|entry| {
+            matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "api")
+                && matches!(entry.value, behaviour_tree::Value::Reproduced)
+        }));
+
+        let changed_status = served_encoded_artifacts(
+            recorded.clone(),
+            encoded(
+                serde_json::json!([
+                    ["date", "today"],
+                    ["set-cookie", "a=1"],
+                    ["set-cookie", "b=2"],
+                    ["content-type", "application/json"]
+                ]),
+                201,
+            ),
+            UPSTREAM_CALL,
+        );
+        let mut changed_status = changed_status;
+        changed_status.boundary_policy = Some(active);
+        assert_eq!(detect(&changed_status).summary.value_divergences, 1);
+
+        let disabled = BoundaryPolicyDocument { rules: Vec::new() };
+        art.boundary_policy = Some(BoundaryPolicySnapshot {
+            revision_id: Some(2),
+            digest: disabled.canonical_digest().expect("valid empty revision"),
+            rules: disabled.rules,
+        });
+        assert_eq!(detect(&art).summary.value_divergences, 1);
     }
 
     #[test]
-    fn km_semantic_signature_and_pairing_changes_still_block() {
-        let recorded = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);
-        let mut changed_key = km_args(r#"{"a":1,"b":2}"#, "sig-a", false);
-        changed_key["request"]["key_identifier"] = serde_json::json!("merchant_2");
-        for observed in [
-            km_args(r#"{"a":1,"b":2}"#, "sig-b", false),
-            km_args(r#"{"a":1,"b":2,"enable_avs_check":true}"#, "sig-b", false),
-            changed_key,
-        ] {
-            let art = km_served_artifacts(recorded.clone(), observed, UPSTREAM_CALL);
-            let card = detect(&art);
-            assert_eq!(card.summary.value_divergences, 1);
-            let rows = build_ledger(&art).expect("ledger builds");
-            let row = rows.iter().find(|r| r.boundary == "km").expect("km row");
-            assert_eq!(row.kind, "value_diverged");
-            assert!(row.blocking);
-        }
-        let wrong_twin = km_served_artifacts(
-            recorded,
-            km_args(r#"{"b":2,"a":1}"#, "sig-b", false),
-            UPSTREAM_CALL + 1,
+    fn two_replays_inherit_common_semantic_drift_despite_encoded_rendering() {
+        use crate::policy::{
+            BoundaryPolicyDocument, BoundaryPolicySnapshot, BoundaryRule, BoundarySelector,
+            NoiseTarget,
+        };
+        let recorded = encoded_args(r#"{"amount":1}"#);
+        let main = served_encoded_artifacts(
+            recorded.clone(),
+            encoded_args(r#"{"amount":2,"avs":true}"#),
+            UPSTREAM_CALL,
         );
-        assert_eq!(detect(&wrong_twin).summary.value_divergences, 1);
+        let candidate = served_encoded_artifacts(
+            recorded,
+            encoded_args(r#"{"avs":true,"amount":2}"#),
+            UPSTREAM_CALL,
+        );
+        assert_eq!(detect(&main).summary.value_divergences, 1);
+        assert_eq!(detect(&candidate).summary.value_divergences, 1);
+        let main_rows = build_ledger(&main).expect("main ledger");
+        let candidate_rows = build_ledger(&candidate).expect("candidate ledger");
+        let main_call = main_rows
+            .iter()
+            .find(|r| r.boundary == "api")
+            .expect("main call");
+        let candidate_call = candidate_rows
+            .iter()
+            .find(|r| r.boundary == "api")
+            .expect("candidate call");
+        assert_eq!(main_call.semantic_digest, candidate_call.semantic_digest);
+        assert!(main_call.semantic_digest.is_some());
+        let main_tree = behaviour_tree::build("m", &main_rows, &main.http_diffs);
+        let candidate_tree = behaviour_tree::build("y", &candidate_rows, &candidate.http_diffs);
+        let delta = delta::three_way(&main_tree, &candidate_tree).expect("same run policy");
+        assert!(delta.verdict.pass, "{delta:?}");
+        assert_eq!(
+            delta
+                .rows
+                .iter()
+                .filter(|row| row.bucket == delta::Bucket::Inherited)
+                .count(),
+            1
+        );
+
+        // A maintainer may separately declare ONE volatile header value.
+        // That declaration removes signing/rendering noise from the delta key
+        // but cannot erase the changed amount/AVS content versus the tape.
+        let signed_args =
+            |body: &str, signature: &str| {
+                encoded_args(&serde_json::json!({
+                "body": body,
+                "headers": [["x-signature", signature], ["content-type", "application/json"]]
+            }).to_string())
+            };
+        let signed_recorded = signed_args(r#"{"amount":1}"#, "recorded");
+        let mut signed_main = served_encoded_artifacts(
+            signed_recorded.clone(),
+            signed_args(r#"{"amount":2,"avs":true}"#, "sig-main"),
+            UPSTREAM_CALL,
+        );
+        let mut signed_candidate = served_encoded_artifacts(
+            signed_recorded,
+            signed_args(r#"{"avs":true,"amount":2}"#, "sig-candidate"),
+            UPSTREAM_CALL,
+        );
+        let rule = BoundaryRule {
+            selector: BoundarySelector {
+                boundary: "api".into(),
+                trait_name: "service".into(),
+                method_name: "send".into(),
+            },
+            source_path: Some("/request/data".into()),
+            target: NoiseTarget::HeaderValue {
+                json_pointer: "/headers".into(),
+                name: "x-signature".into(),
+            },
+        };
+        let document = BoundaryPolicyDocument { rules: vec![rule] };
+        let snapshot = BoundaryPolicySnapshot {
+            revision_id: Some(3),
+            digest: document.canonical_digest().expect("valid noise revision"),
+            rules: document.rules,
+        };
+        signed_main.boundary_policy = Some(snapshot.clone());
+        signed_candidate.boundary_policy = Some(snapshot.clone());
+        assert_eq!(detect(&signed_main).summary.value_divergences, 1);
+        assert_eq!(detect(&signed_candidate).summary.value_divergences, 1);
+        let m_rows = build_ledger(&signed_main).expect("signed main ledger");
+        let y_rows = build_ledger(&signed_candidate).expect("signed candidate ledger");
+        assert_eq!(
+            m_rows
+                .iter()
+                .find(|r| r.boundary == "api")
+                .and_then(|r| r.semantic_digest.as_deref()),
+            y_rows
+                .iter()
+                .find(|r| r.boundary == "api")
+                .and_then(|r| r.semantic_digest.as_deref())
+        );
+        let mut m_tree = behaviour_tree::build("m", &m_rows, &signed_main.http_diffs);
+        let mut y_tree = behaviour_tree::build("y", &y_rows, &signed_candidate.http_diffs);
+        m_tree.policy_digest = Some(snapshot.digest.clone());
+        y_tree.policy_digest = Some(snapshot.digest);
+        assert!(
+            delta::three_way(&m_tree, &y_tree)
+                .expect("matching policy")
+                .verdict
+                .pass
+        );
     }
 }

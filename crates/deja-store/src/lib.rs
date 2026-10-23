@@ -2185,6 +2185,115 @@ mod tests {
         assert_eq!(audit_count, 6); // Three proposals and three activations.
     }
 
+    #[tokio::test]
+    async fn revoking_noise_activates_new_rules_without_rewriting_older_runs() {
+        let Some(store) = store_under_test().await else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let system = unique("policy-revoke");
+        let with_noise = serde_json::json!({"rules":[{
+            "selector":{"boundary":"api","trait_name":"service","method_name":"send"},
+            "source_path":"/request/data",
+            "target":{"kind":"scalar","json_pointer":"/signature"}
+        }]});
+        let allowed = store
+            .boundary_policy_propose(
+                &system,
+                "digest-allowed",
+                &with_noise,
+                "Known volatile signature",
+                "alice@example.test",
+                "alice-sub",
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .boundary_policy_activate(&system, allowed.id, None, "bob@example.test", "bob-sub")
+            .await
+            .unwrap();
+        let run_id = unique("run-policy");
+        let pinned = serde_json::json!({
+            "boundary_policy":{
+                "revision_id":allowed.id,
+                "digest":allowed.digest,
+                "rules":with_noise["rules"]
+            }
+        });
+        store
+            .insert_run_with_audit(
+                &run_id,
+                "replay",
+                None,
+                &serde_json::json!({"kind":"prebuilt_image"}),
+                &pinned,
+                None,
+                "alice@example.test",
+                &serde_json::json!({"system":system}),
+            )
+            .await
+            .unwrap();
+
+        let strict = serde_json::json!({"rules":[]});
+        let removed = store
+            .boundary_policy_propose(
+                &system,
+                "digest-revoked",
+                &strict,
+                "Root entropy bug fixed",
+                "carol@example.test",
+                "carol-sub",
+                Some(allowed.id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .boundary_policy_active(&system)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            allowed.id,
+            "a proposal alone does not change future scoring"
+        );
+        store
+            .boundary_policy_activate(
+                &system,
+                removed.id,
+                Some(allowed.id),
+                "dave@example.test",
+                "dave-sub",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .boundary_policy_active(&system)
+                .await
+                .unwrap()
+                .unwrap()
+                .document,
+            strict
+        );
+        let revisions = store.boundary_policy_revisions(&system).await.unwrap();
+        assert_eq!(
+            revisions
+                .iter()
+                .find(|revision| revision.id == allowed.id)
+                .unwrap()
+                .document,
+            with_noise,
+            "old approved revision remains immutable"
+        );
+        assert_eq!(
+            store.get_run(&run_id).await.unwrap().unwrap().params,
+            pinned,
+            "revocation cannot rewrite a run's pinned scoring policy"
+        );
+    }
+
     /// A settlement against the old baseline that was in flight when the run
     /// was re-pointed must not land: the row would say A's verdict while
     /// naming B. The verdict update is conditioned on the baseline it was

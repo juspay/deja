@@ -611,16 +611,16 @@ export const api = {
     });
   },
 };
-export type BoundaryTreatment =
-  | "plain_base64_json_order"
-  | "http_response_header_groups"
-  | "signed_body_derived_signature";
+export type NoiseTarget =
+  | { kind: "scalar"; json_pointer: string }
+  | { kind: "header_group"; json_pointer: string }
+  | { kind: "header_value"; json_pointer: string; name: string };
 
 export type BoundaryRule = {
-  boundary: "km";
-  trait_name: "common_utils::keymanager";
-  method_name: "call_encryption_service";
-  treatments: BoundaryTreatment[];
+  selector: { boundary: string; trait_name: string; method_name: string };
+  /** Optional JSON Pointer to a base64 UTF-8 JSON document in the arguments. */
+  source_path?: string | null;
+  target: NoiseTarget;
 };
 
 export type BoundaryPolicySnapshot = {
@@ -642,10 +642,16 @@ export type BoundaryPolicyRevision = {
 
 export type BoundaryPolicyPreview = {
   run_id: string;
-  total_km_rows: number;
+  total_rows: number;
   would_absorb: number;
   would_remain_blocking: number;
-  examples: { correlation_id: string | null; classification: string }[];
+  examples: {
+    correlation_id: string | null;
+    boundary: string;
+    trait_name: string;
+    method_name: string;
+    classification: string;
+  }[];
 };
 
 export const boundaryPolicyApi = {

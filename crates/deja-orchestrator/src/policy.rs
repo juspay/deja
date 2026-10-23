@@ -1,30 +1,44 @@
-//! Typed, versioned replay argument policy. A run carries the exact snapshot
-//! selected at admission; scorer and delta never consult a mutable "current"
-//! policy. This version supports only the KM encryption-service selector and
-//! three fail-closed argument treatments, not arbitrary ignore paths.
+//! Immutable, per-system replay argument-noise policy. A run carries the
+//! revision chosen at admission; scoring never rereads a mutable active rule.
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Treatment {
-    PlainBase64JsonOrder,
-    HttpResponseHeaderGroups,
-    SignedBodyDerivedSignature,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BoundarySelector {
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One exact difference a maintainer approves. The JSON Pointer is relative
+/// to the decoded source document, or to the root arguments when no source is
+/// declared. Header rules require `[name, value]` pairs, never arbitrary bags.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NoiseTarget {
+    Scalar { json_pointer: String },
+    HeaderGroup { json_pointer: String },
+    HeaderValue { json_pointer: String, name: String },
+}
+
+impl NoiseTarget {
+    fn pointer(&self) -> &str {
+        match self {
+            Self::Scalar { json_pointer }
+            | Self::HeaderGroup { json_pointer }
+            | Self::HeaderValue { json_pointer, .. } => json_pointer,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BoundaryRule {
-    #[serde(flatten)]
     pub selector: BoundarySelector,
-    pub treatments: Vec<Treatment>,
+    /// JSON Pointer to a base64 UTF-8 JSON document within the call arguments.
+    /// Absent means the target pointer is relative to the raw argument value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    pub target: NoiseTarget,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,60 +53,87 @@ pub struct BoundaryPolicySnapshot {
     pub rules: Vec<BoundaryRule>,
 }
 
+fn valid_pointer(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    let mut chars = path.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' && !matches!(chars.next(), Some('0' | '1')) {
+            return false;
+        }
+    }
+    true
+}
+
 impl BoundaryPolicyDocument {
     pub fn validate(&self) -> Result<(), String> {
-        if self.rules.len() > 16 {
-            return Err("too many boundary policy rules".into());
+        if self.rules.len() > 32 {
+            return Err("too many boundary noise rules".into());
         }
-        let mut selectors = std::collections::BTreeSet::new();
-        for rule in &self.rules {
-            if rule.selector.boundary != "km"
-                || rule.selector.trait_name != "common_utils::keymanager"
-                || rule.selector.method_name != "call_encryption_service"
+        for (index, rule) in self.rules.iter().enumerate() {
+            let selector = &rule.selector;
+            if [
+                selector.boundary.as_str(),
+                selector.trait_name.as_str(),
+                selector.method_name.as_str(),
+            ]
+            .iter()
+            .any(|name| {
+                name.is_empty() || name.trim() != *name || name.len() > 256 || name.contains('*')
+            }) {
+                return Err("boundary selector needs bounded, exact names".into());
+            }
+            if rule
+                .source_path
+                .as_ref()
+                .is_some_and(|path| path.len() > 256 || (!path.is_empty() && !valid_pointer(path)))
             {
-                return Err("unsupported boundary policy selector".into());
+                return Err("invalid encoded source JSON Pointer".into());
             }
-            if !selectors.insert((
-                rule.selector.boundary.as_str(),
-                rule.selector.trait_name.as_str(),
-                rule.selector.method_name.as_str(),
-            )) {
-                return Err("duplicate boundary selector".into());
+            let pointer = rule.target.pointer();
+            if pointer.len() > 256 || !valid_pointer(pointer) {
+                return Err("noise target needs a non-root JSON Pointer".into());
             }
-            if rule.treatments.is_empty() {
-                return Err("each rule must specify at least one treatment".into());
+            if let NoiseTarget::HeaderValue { name, .. } = &rule.target {
+                if name.is_empty() || name.len() > 256 {
+                    return Err("invalid named header".into());
+                }
             }
-            let mut treatments = std::collections::BTreeSet::new();
-            for treatment in &rule.treatments {
-                if !treatments.insert(*treatment) {
-                    return Err("duplicate treatment".into());
+            for prior in &self.rules[..index] {
+                if prior.selector != rule.selector {
+                    continue;
+                }
+                if prior.source_path != rule.source_path {
+                    return Err("one operation's noise rules need the same encoded source".into());
+                }
+                if prior.target.pointer() != pointer {
+                    continue;
+                }
+                // One header-group presentation rule can compose with one
+                // named-value rule. Any other overlap is ambiguous or broad.
+                if !matches!(
+                    (&prior.target, &rule.target),
+                    (
+                        NoiseTarget::HeaderGroup { .. },
+                        NoiseTarget::HeaderValue { .. }
+                    ) | (
+                        NoiseTarget::HeaderValue { .. },
+                        NoiseTarget::HeaderGroup { .. }
+                    )
+                ) {
+                    return Err("overlapping boundary noise targets".into());
                 }
             }
         }
         Ok(())
     }
 
-    /// Reordering rules or treatments does not change which arguments are
-    /// allowed. The digest is over the typed policy, never unvalidated JSON.
     pub fn canonical_digest(&self) -> Result<String, String> {
         self.validate()?;
         let mut rules = self.rules.clone();
-        rules.sort_by(|a, b| {
-            (
-                &a.selector.boundary,
-                &a.selector.trait_name,
-                &a.selector.method_name,
-            )
-                .cmp(&(
-                    &b.selector.boundary,
-                    &b.selector.trait_name,
-                    &b.selector.method_name,
-                ))
-        });
-        for rule in &mut rules {
-            rule.treatments.sort_unstable();
-        }
-        let bytes = serde_json::to_vec(&Self { rules }).map_err(|e| e.to_string())?;
+        rules.sort_unstable();
+        let bytes = serde_json::to_vec(&Self { rules }).map_err(|error| error.to_string())?;
         use sha2::Digest;
         Ok(format!(
             "sha256:{}",
@@ -111,96 +152,94 @@ impl BoundaryPolicySnapshot {
         }
         Ok(())
     }
-
-    pub fn allows(
-        &self,
-        boundary: &str,
-        trait_name: &str,
-        method_name: &str,
-        treatment: Treatment,
-    ) -> bool {
-        self.rules.iter().any(|rule| {
-            rule.selector.boundary == boundary
-                && rule.selector.trait_name == trait_name
-                && rule.selector.method_name == method_name
-                && rule.treatments.contains(&treatment)
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn km_rule(treatments: Vec<Treatment>) -> BoundaryRule {
+    fn rule(target: NoiseTarget) -> BoundaryRule {
         BoundaryRule {
             selector: BoundarySelector {
-                boundary: "km".into(),
-                trait_name: "common_utils::keymanager".into(),
-                method_name: "call_encryption_service".into(),
+                boundary: "http_client".into(),
+                trait_name: "client::Request".into(),
+                method_name: "send".into(),
             },
-            treatments,
+            source_path: None,
+            target,
         }
     }
 
     #[test]
-    fn the_policy_digest_names_typed_semantics_not_list_order() {
-        let rule = km_rule(vec![
-            Treatment::PlainBase64JsonOrder,
-            Treatment::HttpResponseHeaderGroups,
-        ]);
-        let reordered = km_rule(vec![
-            Treatment::HttpResponseHeaderGroups,
-            Treatment::PlainBase64JsonOrder,
-        ]);
-        let a = BoundaryPolicyDocument { rules: vec![rule] };
-        let b = BoundaryPolicyDocument {
-            rules: vec![reordered],
+    fn immutable_revisions_are_order_independent_and_removable() {
+        let document = BoundaryPolicyDocument {
+            rules: vec![
+                rule(NoiseTarget::Scalar {
+                    json_pointer: "/signature".into(),
+                }),
+                rule(NoiseTarget::HeaderGroup {
+                    json_pointer: "/headers".into(),
+                }),
+            ],
         };
-        assert_eq!(a.canonical_digest(), b.canonical_digest());
-        let snapshot = BoundaryPolicySnapshot {
+        let mut reordered = document.clone();
+        reordered.rules.reverse();
+        assert_eq!(document.canonical_digest(), reordered.canonical_digest());
+        let old = BoundaryPolicySnapshot {
             revision_id: Some(1),
-            digest: a.canonical_digest().expect("valid policy"),
-            rules: a.rules,
+            digest: document.canonical_digest().expect("valid policy"),
+            rules: document.rules,
         };
-        assert!(snapshot.validate().is_ok());
-        assert!(snapshot.allows(
-            "km",
-            "common_utils::keymanager",
-            "call_encryption_service",
-            Treatment::PlainBase64JsonOrder
-        ));
-        assert!(!snapshot.allows(
-            "km",
-            "common_utils::keymanager",
-            "call_encryption_service",
-            Treatment::SignedBodyDerivedSignature
-        ));
+        let disabled = BoundaryPolicyDocument { rules: Vec::new() };
+        let new = BoundaryPolicySnapshot {
+            revision_id: Some(2),
+            digest: disabled.canonical_digest().expect("valid empty revision"),
+            rules: Vec::new(),
+        };
+        assert!(old.validate().is_ok() && new.validate().is_ok());
+        assert_eq!(old.rules.len(), 2);
+        assert!(new.rules.is_empty());
     }
 
     #[test]
-    fn unsupported_and_duplicate_rules_fail_closed() {
-        let mut unknown = km_rule(vec![Treatment::PlainBase64JsonOrder]);
-        unknown.selector.method_name = "other".into();
+    fn invalid_or_overlapping_paths_and_selectors_fail_closed() {
+        let duplicate = rule(NoiseTarget::Scalar {
+            json_pointer: "/x".into(),
+        });
         assert!(BoundaryPolicyDocument {
-            rules: vec![unknown]
+            rules: vec![duplicate.clone(), duplicate]
         }
         .validate()
         .is_err());
         assert!(BoundaryPolicyDocument {
-            rules: vec![km_rule(vec![Treatment::PlainBase64JsonOrder; 2])]
+            rules: vec![rule(NoiseTarget::HeaderGroup {
+                json_pointer: "not-a-pointer".into()
+            })]
         }
         .validate()
         .is_err());
-        let rule = km_rule(vec![Treatment::PlainBase64JsonOrder]);
+        let mut wildcard = rule(NoiseTarget::Scalar {
+            json_pointer: "/x".into(),
+        });
+        wildcard.selector.boundary = "*".into();
         assert!(BoundaryPolicyDocument {
-            rules: vec![rule.clone(), rule]
+            rules: vec![wildcard]
         }
         .validate()
         .is_err());
-        assert!(
-            BoundaryPolicyDocument { rules: vec![] }.validate().is_ok(),
-            "an explicit empty policy means strict treatment"
-        );
+        let mut different_source = rule(NoiseTarget::Scalar {
+            json_pointer: "/x".into(),
+        });
+        different_source.source_path = Some("/request/data".into());
+        assert!(BoundaryPolicyDocument {
+            rules: vec![
+                rule(NoiseTarget::HeaderGroup {
+                    json_pointer: "/headers".into()
+                }),
+                different_source
+            ]
+        }
+        .validate()
+        .is_err());
     }
 }

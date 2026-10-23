@@ -4649,9 +4649,12 @@ fn preview_boundary_policy_file(
         }
         let row: divergence::CallRecord = serde_json::from_str(&line)
             .map_err(|e| format!("call ledger line {}: {e}", line_number + 1))?;
-        if row.boundary != "km"
-            || row.trait_name != "common_utils::keymanager"
-            || row.method_name != "call_encryption_service"
+        if !snapshot.rules.is_empty()
+            && !snapshot.rules.iter().any(|rule| {
+                rule.selector.boundary == row.boundary
+                    && rule.selector.trait_name == row.trait_name
+                    && rule.selector.method_name == row.method_name
+            })
         {
             continue;
         }
@@ -4665,14 +4668,17 @@ fn preview_boundary_policy_file(
             continue; // Exact match is neither an allowance nor a blocker.
         }
         total += 1;
-        // The ledger withholds semantic equivalence when a separate call-order
-        // mismatch exists, even if this row's source and served ids agree.
-        let class = if row.km_semantic_pair
+        // `semantic_pair` rules out an independent order mismatch. A paired
+        // Execute call has no served sequence; an args-free serve must have
+        // served its paired source event.
+        let class = if row.semantic_pair
             && row.source_event_global_sequence.is_some()
-            && row.served_event_global_sequence == row.source_event_global_sequence
+            && row
+                .served_event_global_sequence
+                .is_none_or(|served| Some(served) == row.source_event_global_sequence)
             && !row.stopped
         {
-            divergence::classify_km_args_with_policy(
+            divergence::classify_boundary_args_with_policy(
                 &row.boundary,
                 &row.trait_name,
                 &row.method_name,
@@ -4683,7 +4689,7 @@ fn preview_boundary_policy_file(
         } else {
             "untrusted_pair"
         };
-        if matches!(class, "rendering_absorbed" | "derived_absorbed") {
+        if matches!(class, "semantic_equivalent" | "approved_noise") {
             absorbed += 1;
         } else {
             blocking += 1;
@@ -4691,13 +4697,16 @@ fn preview_boundary_policy_file(
         if examples.len() < 12 {
             examples.push(serde_json::json!({
                 "correlation_id": row.correlation_id,
+                "boundary": row.boundary,
+                "trait_name": row.trait_name,
+                "method_name": row.method_name,
                 "classification": class
             }));
         }
     }
     Ok(serde_json::json!({
         "run_id": run_id,
-        "total_km_rows": total,
+        "total_rows": total,
         "would_absorb": absorbed,
         "would_remain_blocking": blocking,
         "examples": examples
@@ -5801,80 +5810,89 @@ mod tests {
     const LEDGER_ROW: &str = r#"{"correlation_id":"c1","boundary":"redis","trait_name":"Cache","method_name":"get","kind":"matched","blocking":false}"#;
 
     #[test]
-    fn maintainer_preview_streams_paired_km_rows_and_respects_draft_policy() {
+    fn preview_reuses_semantic_identity_and_revocable_noise_rules() {
         use base64::Engine as _;
         use deja_orchestrator::policy::{
             BoundaryPolicyDocument, BoundaryPolicySnapshot, BoundaryRule, BoundarySelector,
-            Treatment,
+            NoiseTarget,
         };
         let args = |raw: &str| {
             serde_json::json!({
-                "method": "POST",
-                "endpoint": "data/encrypt",
-                "request": {
-                    "data_identifier": "Merchant",
-                    "key_identifier": "merchant_1",
-                    "data": base64::engine::general_purpose::STANDARD.encode(raw)
-                }
+                "method":"POST",
+                "request":{"data":base64::engine::general_purpose::STANDARD.encode(raw)}
             })
         };
-        let row = serde_json::json!({
-            "correlation_id": "c1",
-            "boundary": "km",
-            "trait_name": "common_utils::keymanager",
-            "method_name": "call_encryption_service",
-            "kind": "arg_divergent_serve",
-            "blocking": true,
-            "source_event_global_sequence": 7,
-            "served_event_global_sequence": 7,
-            "km_semantic_pair": true,
-            "recorded": {"args": args(r#"{"X-A":"a","X-B":"b"}"#)},
-            "observed": {"args": args(r#"{"X-B":"b","X-A":"a"}"#)}
+        let mut row = serde_json::json!({
+            "correlation_id":"c1",
+            "boundary":"api",
+            "trait_name":"service",
+            "method_name":"send",
+            "kind":"value_diverged",
+            "blocking":true,
+            "source_event_global_sequence":7,
+            "served_event_global_sequence":7,
+            "semantic_pair":true,
+            "recorded":{"args":args(r#"{"X-A":"a","X-B":"b"}"#)},
+            "observed":{"args":args(r#"{"X-B":"b","X-A":"a"}"#)}
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("call-ledger.jsonl");
-        std::fs::write(&path, format!("{row}\n")).unwrap();
         let snapshot = |rules: Vec<BoundaryRule>| {
             let doc = BoundaryPolicyDocument { rules };
             BoundaryPolicySnapshot {
                 revision_id: None,
-                digest: doc.canonical_digest().unwrap(),
+                digest: doc.canonical_digest().expect("valid policy"),
                 rules: doc.rules,
             }
         };
+        std::fs::write(&path, format!("{row}\n")).unwrap();
         let strict = preview_boundary_policy_file(&path, "run-1", &snapshot(Vec::new())).unwrap();
-        assert_eq!(strict["total_km_rows"], 1);
-        assert_eq!(strict["would_absorb"], 0);
-        assert_eq!(strict["would_remain_blocking"], 1);
+        assert_eq!(strict["total_rows"], 1);
+        assert_eq!(strict["would_absorb"], 1);
+        assert_eq!(
+            strict["examples"][0]["classification"],
+            "semantic_equivalent"
+        );
+
+        row["observed"]["args"] = args(r#"{"X-B":"b","X-A":"changed"}"#);
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let blocked = preview_boundary_policy_file(&path, "run-1", &snapshot(Vec::new())).unwrap();
+        assert_eq!(blocked["would_remain_blocking"], 1);
         let rule = BoundaryRule {
             selector: BoundarySelector {
-                boundary: "km".into(),
-                trait_name: "common_utils::keymanager".into(),
-                method_name: "call_encryption_service".into(),
+                boundary: "api".into(),
+                trait_name: "service".into(),
+                method_name: "send".into(),
             },
-            treatments: vec![Treatment::PlainBase64JsonOrder],
+            source_path: Some("/request/data".into()),
+            target: NoiseTarget::Scalar {
+                json_pointer: "/X-A".into(),
+            },
         };
         let allowed =
             preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule.clone()])).unwrap();
         assert_eq!(allowed["would_absorb"], 1);
-        assert_eq!(allowed["would_remain_blocking"], 0);
-        assert_eq!(
-            allowed["examples"][0]["classification"],
-            "rendering_absorbed"
-        );
-        assert!(allowed.to_string().contains("c1"));
+        assert_eq!(allowed["examples"][0]["classification"], "approved_noise");
         assert!(
-            !allowed.to_string().contains("X-A"),
-            "preview does not expose raw args"
+            !allowed.to_string().contains("changed"),
+            "preview exposes no raw args"
         );
-        let mut order_mismatch = row;
-        order_mismatch["km_semantic_pair"] = serde_json::json!(false);
-        std::fs::write(&path, format!("{order_mismatch}\n")).unwrap();
-        let preview = preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule])).unwrap();
-        assert_eq!(preview["total_km_rows"], 1);
-        assert_eq!(preview["would_absorb"], 0);
-        assert_eq!(preview["would_remain_blocking"], 1);
-        assert_eq!(preview["examples"][0]["classification"], "untrusted_pair");
+        row["served_event_global_sequence"] = serde_json::Value::Null;
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let execute_pair =
+            preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule.clone()])).unwrap();
+        assert_eq!(execute_pair["would_absorb"], 1);
+        assert_eq!(
+            execute_pair["examples"][0]["classification"],
+            "approved_noise"
+        );
+        row["semantic_pair"] = serde_json::json!(false);
+        std::fs::write(&path, format!("{row}\n")).unwrap();
+        let untrusted =
+            preview_boundary_policy_file(&path, "run-1", &snapshot(vec![rule])).unwrap();
+        assert_eq!(untrusted["would_absorb"], 0);
+        assert_eq!(untrusted["would_remain_blocking"], 1);
+        assert_eq!(untrusted["examples"][0]["classification"], "untrusted_pair");
     }
 
     /// A compose run in `status`, with `ledger` as its call ledger if given.
@@ -7787,6 +7805,137 @@ mod sign_in {
             StatusCode::SERVICE_UNAVAILABLE,
             "the signed-in maintainer reached the handler, whose test store is absent"
         );
+    }
+
+    #[tokio::test]
+    async fn maintainer_can_activate_and_revoke_scoped_noise_through_api() {
+        let Ok(db_url) = std::env::var("DEJA_TEST_DB_URL") else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let (auth, signer) = enabled(&[
+            "alice@juspay.in",
+            "bob@juspay.in",
+            "carol@juspay.in",
+            "dave@juspay.in",
+        ]);
+        let mut st = state(auth, None);
+        st.store = Some(Arc::new(
+            Store::connect(&db_url).await.expect("test Postgres"),
+        ));
+        let app = app_router(st);
+        let base = "/api/v1/systems/hyperswitch/boundary-policy";
+        let (status, body) = call(
+            app.clone(),
+            Request::builder()
+                .uri(base)
+                .header(header::COOKIE, session_cookie(&signer, "alice@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let active: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let previous = active["active"]["id"].as_i64();
+        let rule = serde_json::json!({
+            "selector":{
+                "boundary":"api","trait_name":"service","method_name":"send"
+            },
+            "source_path":"/request/data",
+            "target":{"kind":"header_group","json_pointer":"/headers"}
+        });
+        let post = |path: String, email: &str, body: serde_json::Value| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, session_cookie(&signer, email))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (status, body) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions"),
+                "alice@juspay.in",
+                serde_json::json!({
+                    "rules":[rule.clone()],
+                    "reason":"Header presentation from unstable collection order",
+                    "expected_active_revision":previous
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let proposed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let id = proposed["id"].as_i64().expect("revision id");
+        let (same_actor, _) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions/{id}/activate"),
+                "alice@juspay.in",
+                serde_json::json!({"expected_active_revision":previous}),
+            ),
+        )
+        .await;
+        assert_eq!(same_actor, StatusCode::FORBIDDEN);
+        let (activated, body) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions/{id}/activate"),
+                "bob@juspay.in",
+                serde_json::json!({"expected_active_revision":previous}),
+            ),
+        )
+        .await;
+        assert_eq!(activated, StatusCode::OK, "{body}");
+
+        let (status, body) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions"),
+                "carol@juspay.in",
+                serde_json::json!({
+                    "rules":[],
+                    "reason":"Source became deterministic; revoke allowance",
+                    "expected_active_revision":id
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let revoked: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let revoked_id = revoked["id"].as_i64().expect("new revision id");
+        let (status, body) = call(
+            app.clone(),
+            post(
+                format!("{base}/revisions/{revoked_id}/activate"),
+                "dave@juspay.in",
+                serde_json::json!({"expected_active_revision":id}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = call(
+            app,
+            Request::builder()
+                .uri(base)
+                .header(header::COOKIE, session_cookie(&signer, "bob@juspay.in"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let policy: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(policy["active"]["id"], revoked_id);
+        assert_eq!(policy["active"]["snapshot"]["rules"], serde_json::json!([]));
+        assert!(policy["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|revision| {
+                revision["id"] == id && revision["snapshot"]["rules"] == serde_json::json!([rule])
+            }));
     }
 
     fn get_cd_read() -> axum::http::request::Builder {
