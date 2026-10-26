@@ -339,6 +339,210 @@ pub fn transition(
     }
 }
 
+// ---- a promotion preview: what rides along, and whose change each
+//      divergence is -----------------------------------------------------------
+
+/// How the pipeline marks a merge-queue run today: its label starts with
+/// this. Mirrors `QUEUE_LABEL` in `web/src/lib/scope.ts`, the only other
+/// place the label is read rather than displayed. When the pipeline sends a
+/// structured field, test it first and keep this as the fallback for the
+/// runs already stored.
+pub const QUEUE_LABEL: &str = "MQ · ";
+
+/// The merges a promotion of `picked` carries to an environment running
+/// `target_live`: `picked` and every merge before it, back to (not
+/// including) the merge the target's release was cut on, newest first.
+/// The release is dated by that merge's time, else by its own `merged_at`
+/// (reconcile places a release cut outside the pipeline on main, and the
+/// merge it names may predate what déjà tracks). `None` when that cannot be
+/// known: the target runs nothing, or a release with neither (one reconcile
+/// has not placed yet), or `picked` has no merge time or is not after it.
+pub fn carried_by<'a>(
+    versions: &'a [deja_store::CdVersionRow],
+    picked: &str,
+    target_live: Option<&deja_store::CdVersionRow>,
+) -> Option<Vec<&'a deja_store::CdVersionRow>> {
+    let live = target_live?;
+    let since = live
+        .released_from
+        .as_deref()
+        .and_then(|base| versions.iter().find(|v| v.version == base))
+        .and_then(|v| v.merged_at)
+        .or(live.merged_at)?;
+    let until = versions.iter().find(|v| v.version == picked)?.merged_at?;
+    if until <= since {
+        return None;
+    }
+    let mut out: Vec<&deja_store::CdVersionRow> = versions
+        .iter()
+        .filter(|v| v.kind == "merge" && v.merged_at.is_some_and(|m| m > since && m <= until))
+        .collect();
+    out.sort_by_key(|v| std::cmp::Reverse(v.merged_at));
+    Some(out)
+}
+
+/// Every merge up to and including `picked`, newest first, at most `cap`:
+/// what a promotion carries at most, when `carried_by` cannot say where to
+/// stop. Some of these may already be on the target.
+pub fn carried_at_most<'a>(
+    versions: &'a [deja_store::CdVersionRow],
+    picked: &str,
+    cap: usize,
+) -> Vec<&'a deja_store::CdVersionRow> {
+    let Some(until) = versions
+        .iter()
+        .find(|v| v.version == picked)
+        .and_then(|v| v.merged_at)
+    else {
+        return versions.iter().filter(|v| v.version == picked).collect();
+    };
+    let mut out: Vec<&deja_store::CdVersionRow> = versions
+        .iter()
+        .filter(|v| v.kind == "merge" && v.merged_at.is_some_and(|m| m <= until))
+        .collect();
+    out.sort_by_key(|v| std::cmp::Reverse(v.merged_at));
+    out.truncate(cap);
+    out
+}
+
+/// The pull requests a release carries: those of `merges`, each once,
+/// newest merge first.
+pub fn prs_of(merges: &[&deja_store::CdVersionRow]) -> Vec<deja_store::CdVersionPr> {
+    let mut seen = std::collections::HashSet::new();
+    merges
+        .iter()
+        .flat_map(|m| m.prs.iter())
+        .filter(|p| seen.insert((p.repo.to_lowercase(), p.pr_number)))
+        .cloned()
+        .collect()
+}
+
+/// The merges a release placed on main carries, when nothing better is
+/// known: those after the newest other dated release before it, up to its
+/// own time. `None` when there is no earlier dated release to count from:
+/// the list is then left empty rather than guessed.
+pub fn merges_since_previous_release<'a>(
+    versions: &'a [deja_store::CdVersionRow],
+    release: &deja_store::CdVersionRow,
+) -> Option<Vec<&'a deja_store::CdVersionRow>> {
+    let until = release.merged_at?;
+    let since = versions
+        .iter()
+        .filter(|v| v.kind == "release" && v.version != release.version)
+        .filter_map(|v| v.merged_at)
+        .filter(|t| *t < until)
+        .max()?;
+    let mut out: Vec<&deja_store::CdVersionRow> = versions
+        .iter()
+        .filter(|v| v.kind == "merge" && v.merged_at.is_some_and(|m| m > since && m <= until))
+        .collect();
+    out.sort_by_key(|v| std::cmp::Reverse(v.merged_at));
+    Some(out)
+}
+
+/// One divergence of the promotion delta, laid on the merge that first
+/// showed it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AttributedRow {
+    #[serde(flatten)]
+    pub row: crate::divergence::delta::Row,
+    /// Later merges whose queue run showed the same shape: they changed it
+    /// again on top of the first.
+    pub also_changed_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AttributedGroup {
+    pub version: String,
+    pub rows: Vec<AttributedRow>,
+}
+
+/// The promotion delta's rows, by whose change they are.
+#[derive(Debug, Default, Serialize)]
+pub struct Attribution {
+    /// One group per merge, in the order given (oldest first), holding the
+    /// charged rows first seen on its queue run.
+    pub groups: Vec<AttributedGroup>,
+    /// Charged rows no queue run showed: several merges together, or a
+    /// merge without a queue run.
+    pub unattributed: Vec<crate::divergence::delta::Row>,
+    /// Rows the target has and this version does not: a promotion removes
+    /// them.
+    pub fixed: Vec<crate::divergence::delta::Row>,
+}
+
+/// A row's shape: its lane and its address with the request-specific parts
+/// dropped, the key acknowledgements are matched on too.
+pub fn shape_of(row: &crate::divergence::delta::Row) -> crate::divergence::acknowledgement::Key {
+    crate::divergence::acknowledgement::Key {
+        lane: row.lane.clone(),
+        pattern: crate::divergence::acknowledgement::Pattern::of(&row.address),
+    }
+}
+
+/// Lay the promotion delta's rows on the merges that ride along. `queues`
+/// is each merge with its merge-queue run's rows, OLDEST FIRST: a shape two
+/// queue runs show is the older merge's, since the newer one's base already
+/// carried it and it changed it again. A matched row takes the queue row's
+/// acknowledgement, because the promotion replay names no pull request and
+/// so has none of its own.
+pub fn attribute(
+    promotion_rows: Vec<crate::divergence::delta::Row>,
+    queues: &[(String, Vec<crate::divergence::delta::Row>)],
+) -> Attribution {
+    use std::collections::HashMap;
+    let index: Vec<
+        HashMap<crate::divergence::acknowledgement::Key, &crate::divergence::delta::Row>,
+    > = queues
+        .iter()
+        .map(|(_, rows)| {
+            rows.iter()
+                .filter(|r| r.bucket.charges_y())
+                .map(|r| (shape_of(r), r))
+                .collect()
+        })
+        .collect();
+    let mut groups: Vec<AttributedGroup> = queues
+        .iter()
+        .map(|(version, _)| AttributedGroup {
+            version: version.clone(),
+            rows: Vec::new(),
+        })
+        .collect();
+    let mut out = Attribution::default();
+    for mut row in promotion_rows {
+        if row.bucket.family() == "resolved" {
+            out.fixed.push(row);
+            continue;
+        }
+        if !row.bucket.charges_y() {
+            continue;
+        }
+        let key = shape_of(&row);
+        let hits: Vec<usize> = index
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.contains_key(&key))
+            .map(|(i, _)| i)
+            .collect();
+        match hits.split_first() {
+            None => out.unattributed.push(row),
+            Some((&first, rest)) => {
+                if row.acknowledgement.is_none() {
+                    row.acknowledgement = index[first][&key].acknowledgement.clone();
+                }
+                let also_changed_by = rest.iter().map(|&i| queues[i].0.clone()).collect();
+                groups[first].rows.push(AttributedRow {
+                    row,
+                    also_changed_by,
+                });
+            }
+        }
+    }
+    out.groups = groups;
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -694,5 +898,258 @@ mod promotion {
         assert!(failing(&cfg(0, false), &f).is_empty());
         assert!(failing(&cfg(24, true), &good()).is_empty());
         assert_eq!(failing(&cfg(48, true), &good()), vec!["soak"]);
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use crate::divergence::acknowledgement::{RowAcknowledgement, State};
+    use crate::divergence::behaviour_tree::{Address, Lane};
+    use crate::divergence::delta::{Bucket, Row, Side};
+    use chrono::{TimeZone, Utc};
+
+    fn version(
+        name: &str,
+        kind: &str,
+        released_from: Option<&str>,
+        merged_hour: Option<u32>,
+    ) -> deja_store::CdVersionRow {
+        deja_store::CdVersionRow {
+            system: "prism".into(),
+            version: name.into(),
+            kind: kind.into(),
+            commit_sha: None,
+            image_tag: None,
+            chart: None,
+            released_from: released_from.map(str::to_owned),
+            merged_at: merged_hour.map(|h| Utc.with_ymd_and_hms(2026, 10, 23, h, 0, 0).unwrap()),
+            created_at: Utc.with_ymd_and_hms(2026, 10, 23, 0, 0, 0).unwrap(),
+            prs: vec![],
+        }
+    }
+
+    #[test]
+    fn carried_is_the_picked_merge_and_the_ones_back_to_the_release_s_merge() {
+        let versions = vec![
+            version("e5", "merge", None, Some(15)),
+            version("d4", "merge", None, Some(14)),
+            version("c3", "merge", None, Some(13)),
+            version("cd-2026.10.23.1", "release", Some("b2"), Some(12)),
+            version("b2", "merge", None, Some(12)),
+            version("a1", "merge", None, Some(11)),
+        ];
+        let live = version("cd-2026.10.23.1", "release", Some("b2"), Some(12));
+        let got: Vec<&str> = carried_by(&versions, "d4", Some(&live))
+            .expect("the release names its merge, so what rides along is known")
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["d4", "c3"],
+            "newest first, e5 stays on integ, b2 is the release's own merge"
+        );
+    }
+
+    #[test]
+    fn carried_is_unknown_without_a_merge_to_count_from() {
+        let versions = vec![
+            version("d4", "merge", None, Some(14)),
+            version("2026.10.16.2", "release", None, None),
+        ];
+        assert!(
+            carried_by(
+                &versions,
+                "d4",
+                Some(&version("2026.10.16.2", "release", None, None))
+            )
+            .is_none(),
+            "a release first seen on the environment names no merge"
+        );
+        assert!(carried_by(&versions, "d4", None).is_none(), "nothing live");
+        let v2 = vec![
+            version("d4", "merge", None, Some(14)),
+            version("r", "release", Some("x"), Some(15)),
+            version("x", "merge", None, Some(15)),
+        ];
+        assert!(
+            carried_by(&v2, "d4", Some(&v2[1])).is_none(),
+            "picked is not after the release's merge"
+        );
+    }
+
+    fn row(connector: &str, path: &str, bucket: Bucket, ack: Option<&str>) -> Row {
+        Row {
+            address: Address::Body {
+                correlation: "corr-1".into(),
+                json_path: path.into(),
+            },
+            bucket,
+            m: Side::Tape,
+            y: Side::Hash("h1".into()),
+            blocking: true,
+            lane: Some(Lane {
+                connector: connector.into(),
+                flow: "authorize".into(),
+            }),
+            acknowledgement: ack.map(|by| RowAcknowledgement {
+                id: 1,
+                state: State::Acknowledged,
+                by: by.into(),
+                note: "intended".into(),
+                value_changed: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_shape_goes_to_the_oldest_merge_that_showed_it_and_names_the_later_ones() {
+        let promotion = vec![
+            row("ilixium", "$.error_reason", Bucket::Introduced, None),
+            row("tamara", "$.order.tax", Bucket::Introduced, None),
+            row("jpmorgan", "$.initiator", Bucket::Changed, None),
+            row("adyen", "$.status", Bucket::Resolved, None),
+            row("adyen", "$.inherited", Bucket::Inherited, None),
+        ];
+        let queues = vec![
+            (
+                "older".to_owned(),
+                vec![row(
+                    "tamara",
+                    "$.order.tax",
+                    Bucket::Introduced,
+                    Some("dev-a"),
+                )],
+            ),
+            (
+                "newer".to_owned(),
+                vec![
+                    row("tamara", "$.order.tax", Bucket::Changed, None),
+                    row(
+                        "ilixium",
+                        "$.error_reason",
+                        Bucket::Introduced,
+                        Some("dev-b"),
+                    ),
+                ],
+            ),
+        ];
+        let a = attribute(promotion, &queues);
+        assert_eq!(a.groups[0].version, "older");
+        assert_eq!(a.groups[0].rows.len(), 1);
+        assert_eq!(
+            a.groups[0].rows[0].also_changed_by,
+            vec!["newer".to_owned()]
+        );
+        assert_eq!(
+            a.groups[0].rows[0]
+                .row
+                .acknowledgement
+                .as_ref()
+                .map(|k| k.by.as_str()),
+            Some("dev-a"),
+            "the matched queue row's acknowledgement rides along"
+        );
+        assert_eq!(a.groups[1].rows.len(), 1);
+        assert!(a.groups[1].rows[0].also_changed_by.is_empty());
+        assert_eq!(a.unattributed.len(), 1, "jpmorgan: no queue run showed it");
+        assert_eq!(
+            a.fixed.len(),
+            1,
+            "resolved rows are what a promotion removes"
+        );
+    }
+
+    #[test]
+    fn no_queue_runs_leaves_every_charged_row_unattributed() {
+        let a = attribute(vec![row("x", "$.a", Bucket::Introduced, None)], &[]);
+        assert!(a.groups.is_empty());
+        assert_eq!(a.unattributed.len(), 1);
+    }
+
+    #[test]
+    fn a_release_placed_on_a_merge_deja_never_saw_counts_from_its_own_time() {
+        // 2026.10.16.2 sits on 21e6bdad4c, older than anything déjà tracks;
+        // reconcile records the release's commit time as its merged_at.
+        let versions = vec![
+            version("e5", "merge", None, Some(15)),
+            version("d4", "merge", None, Some(14)),
+            version("c3", "merge", None, Some(9)),
+        ];
+        let live = version("2026.10.16.2", "release", Some("21e6bdad4c"), Some(10));
+        let got: Vec<&str> = carried_by(&versions, "e5", Some(&live))
+            .expect("the release's own time dates it")
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["e5", "d4"],
+            "c3 merged before the release was cut"
+        );
+    }
+
+    #[test]
+    fn at_most_is_every_merge_up_to_the_picked_one() {
+        let versions = vec![
+            version("e5", "merge", None, Some(15)),
+            version("d4", "merge", None, Some(14)),
+            version("r", "release", None, Some(13)),
+            version("c3", "merge", None, Some(9)),
+        ];
+        let got: Vec<&str> = carried_at_most(&versions, "d4", 10)
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(got, vec!["d4", "c3"]);
+        assert_eq!(carried_at_most(&versions, "d4", 1).len(), 1, "capped");
+    }
+
+    fn merge_pr(name: &str, hour: u32, pr: i64) -> deja_store::CdVersionRow {
+        let mut v = version(name, "merge", None, Some(hour));
+        v.prs = vec![deja_store::CdVersionPr {
+            repo: "example/repo".into(),
+            pr_number: pr,
+            title: Some(format!("change {pr}")),
+            author: None,
+            merged_at: v.merged_at,
+        }];
+        v
+    }
+
+    #[test]
+    fn a_release_carries_the_prs_of_its_merges_once_each() {
+        let a = merge_pr("a", 12, 7);
+        let b = merge_pr("b", 13, 8);
+        let again = merge_pr("c", 14, 7);
+        let got: Vec<i64> = prs_of(&[&again, &b, &a])
+            .iter()
+            .map(|p| p.pr_number)
+            .collect();
+        assert_eq!(got, vec![7, 8]);
+    }
+
+    #[test]
+    fn a_placed_release_carries_the_merges_since_the_release_before_it() {
+        let versions = vec![
+            merge_pr("e5", 15, 5),
+            merge_pr("d4", 13, 4),
+            merge_pr("c3", 11, 3),
+            version("r-old", "release", None, Some(12)),
+            merge_pr("b2", 9, 2),
+        ];
+        let release = version("r-new", "release", Some("d4"), Some(14));
+        let got: Vec<&str> = merges_since_previous_release(&versions, &release)
+            .expect("r-old dates the start")
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect();
+        assert_eq!(got, vec!["d4"], "c3 is in r-old, e5 came after r-new");
+        let alone = vec![merge_pr("d4", 13, 4)];
+        assert!(
+            merges_since_previous_release(&alone, &release).is_none(),
+            "nothing before it to count from"
+        );
     }
 }

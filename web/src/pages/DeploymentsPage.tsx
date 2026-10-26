@@ -16,6 +16,8 @@
 //   /deployments/environments/:env                 one environment's history
 //   /deployments/promotions                        every promotion request
 //   /deployments/promotions/:id                    one request, step by step
+//   /deployments/versions/:version/promote         what a promotion carries, and Promote
+//   /deployments/versions/:version/diff            the promotion delta, by merge
 //   /deployments/pull-requests/:owner/:repo/:n     where a pull request is
 
 import React from "react";
@@ -48,7 +50,6 @@ import {
   mergesSince,
   placesOf,
   promotionActivity,
-  promotionCandidates,
   promotionFocus,
   promotionPhrase,
   promotionProgress,
@@ -86,7 +87,7 @@ function useSystem(cfg: CdConfig | undefined): [string, (s: string) => void] {
 }
 
 /** A link under /deployments that keeps the system. */
-function href(path: string, system: string, cfg: CdConfig | undefined): string {
+export function href(path: string, system: string, cfg: CdConfig | undefined): string {
   const first = cfg?.enabled ? cfg.systems[0] : "";
   return system && system !== first ? `${path}?system=${encodeURIComponent(system)}` : path;
 }
@@ -211,7 +212,7 @@ function PauseSwitch({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }
 
 /** The page frame: title, system switcher, sub-navigation. Children render
  *  only once the config says tracking is on. */
-function Frame({ title, crumb, children }: { title: React.ReactNode; crumb?: React.ReactNode; children: (cfg: Extract<CdConfig, { enabled: true }>, system: string) => React.ReactNode }) {
+export function Frame({ title, crumb, children }: { title: React.ReactNode; crumb?: React.ReactNode; children: (cfg: Extract<CdConfig, { enabled: true }>, system: string) => React.ReactNode }) {
   const cfg = useCdConfig();
   const [system, setSystem] = useSystem(cfg.data);
   const here = useLocation().pathname;
@@ -345,7 +346,7 @@ function ReleaseTagRow({ rows }: { rows: (CdDeploymentRow | null | undefined)[] 
   );
 }
 
-function VersionLink({ version, system, cfg }: { version: string; system: string; cfg: CdConfig | undefined }) {
+export function VersionLink({ version, system, cfg }: { version: string; system: string; cfg: CdConfig | undefined }) {
   return (
     <Link className="mono" to={href(`/deployments/versions/${encodeURIComponent(version)}`, system, cfg)}>
       {version}
@@ -354,7 +355,7 @@ function VersionLink({ version, system, cfg }: { version: string; system: string
 }
 
 /** A promotion replay's one word, with the reason on hover. */
-function PromotionReplayChip({ replay }: { replay: CdPromotionReplayRow | null | undefined }) {
+export function PromotionReplayChip({ replay }: { replay: CdPromotionReplayRow | null | undefined }) {
   if (!replay) return <span className="hint">—</span>;
   const { word, tone } = promotionReplayWord(replay);
   const repointed = replay.run_delta_against && replay.baseline_run && replay.run_delta_against !== replay.baseline_run
@@ -388,7 +389,7 @@ function PromotionReplayRuns({ replay }: { replay: CdPromotionReplayRow }) {
   );
 }
 
-function PrCell({ v }: { v: CdVersionRow }) {
+export function PrCell({ v }: { v: CdVersionRow }) {
   if (v.kind === "release") return <span className="hint">{carries(v)}</span>;
   const pr = pullRequestOf(v);
   if (!pr) return <span className="hint">—</span>;
@@ -470,7 +471,7 @@ function Pipeline({ cfg, system }: { cfg: Extract<CdConfig, { enabled: true }>; 
               cfg={cfg}
               promotable={cfg.promotable.includes(env)}
               source={i > 0 ? cfg.environments[i - 1] : null}
-              versions={versions.data?.versions ?? []}
+              sourceLive={i > 0 ? byName.get(cfg.environments[i - 1])?.live_version ?? null : null}
             />
           </React.Fragment>
         ))}
@@ -527,7 +528,7 @@ function EnvCard({
   cfg,
   promotable,
   source,
-  versions,
+  sourceLive,
 }: {
   env: string;
   row: CdEnvironment | undefined;
@@ -535,7 +536,8 @@ function EnvCard({
   cfg: CdConfig;
   promotable: boolean;
   source: string | null;
-  versions: { version: CdVersionRow; where: CdVersionWhere[] }[];
+  /** The merge the source environment runs: what Promote opens on. */
+  sourceLive: CdVersionRow | null;
 }) {
   const live = row?.live ?? null;
   const latest = row?.latest ?? null;
@@ -614,7 +616,7 @@ function EnvCard({
           </div>
         )}
       </div>
-      {promotable && source && <Promotions env={env} source={source} system={system} cfg={cfg} targetLive={row?.live_version ?? null} versions={versions} />}
+      {promotable && source && <Promotions env={env} source={source} system={system} cfg={cfg} sourceLive={sourceLive} />}
       <div className="cd-envfoot">
         <Link className="btn" to={href(`/deployments/environments/${encodeURIComponent(env)}`, system, cfg)}>
           History
@@ -628,33 +630,31 @@ function EnvCard({
 
 /** Whether the signed-in person may promote to `env`: `<env>_upgrader`, or in
  *  beta a maintainer. The API decides; this only decides what is drawn. */
-function useMayPromote(env: string): boolean {
+export function useMayPromote(env: string): boolean {
   const me = useMe();
   const roles = me.data?.roles ?? [];
   return !!me.data?.authenticated && (roles.includes(`${env}_upgrader`) || roles.includes("maintainer"));
 }
 
 /** The promotable card's promotion section: the request in flight with its
- *  step, or the Promote control. */
+ *  step, or the Promote control, which opens the preview page on the merge
+ *  the source environment runs. */
 function Promotions({
   env,
   source,
   system,
   cfg,
-  targetLive,
-  versions,
+  sourceLive,
 }: {
   env: string;
   source: string;
   system: string;
   cfg: CdConfig;
-  targetLive: CdVersionRow | null;
-  versions: { version: CdVersionRow; where: CdVersionWhere[] }[];
+  sourceLive: CdVersionRow | null;
 }) {
   const may = useMayPromote(env);
   const me = useMe();
   const qc = useQueryClient();
-  const [open, setOpen] = React.useState(false);
   const q = useQuery({ queryKey: ["cd", "promotions", system, env], queryFn: () => cdApi.promotions(system, env), refetchInterval: 10_000 });
   const current = (q.data ?? []).find(inFlight) ?? null;
   const last = !current ? (q.data ?? [])[0] ?? null : null;
@@ -722,107 +722,14 @@ function Promotions({
               {last.state === "failed" && (last.step_detail.failed?.reason ? ` · ${last.step_detail.failed.reason}` : "")}
             </div>
           )}
-          {may && (
-            <button className="btn primary" onClick={() => setOpen(true)}>
-              Promote to {env}
-            </button>
+          {may && sourceLive?.kind === "merge" && (
+            <Link className="btn primary" to={href(`/deployments/versions/${encodeURIComponent(sourceLive.version)}/promote?to=${encodeURIComponent(env)}`, system, cfg)}>
+              Promote to {env}…
+            </Link>
           )}
+          {may && sourceLive?.kind !== "merge" && <span className="hint">{source} runs {sourceLive ? "a release" : "nothing recorded"}, so there is no merge to promote; pick one from the Versions tab.</span>}
         </>
       )}
-      {open && (
-        <PromoteDialog
-          env={env}
-          source={source}
-          system={system}
-          candidates={promotionCandidates(versions, source, targetLive)}
-          onClose={() => setOpen(false)}
-          onDone={() => {
-            setOpen(false);
-            refresh();
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-function PromoteDialog({
-  env,
-  source,
-  system,
-  candidates,
-  onClose,
-  onDone,
-}: {
-  env: string;
-  source: string;
-  system: string;
-  candidates: CdVersionRow[];
-  onClose: () => void;
-  onDone: () => void;
-}) {
-  const [pick, setPick] = React.useState(candidates[0]?.version ?? "");
-  const [note, setNote] = React.useState("");
-  const check = useQuery({
-    queryKey: ["cd", "promotion-check", system, env, pick],
-    queryFn: () => cdApi.promotionCheck(system, env, pick),
-    enabled: !!pick,
-  });
-  const go = useMutation({ mutationFn: () => cdApi.promote(system, env, pick, note.trim()), onSuccess: onDone });
-  const picked = candidates.find((c) => c.version === pick);
-  const riding = candidates.slice(candidates.findIndex((c) => c.version === pick));
-  return (
-    <div className="cd-dialog" role="dialog" aria-modal="true" aria-labelledby="cd-promote-title">
-      <div className="cd-dialogbox">
-        <h2 id="cd-promote-title">
-          Promote to {env} <span className="beta">beta</span>
-        </h2>
-        {candidates.length === 0 ? (
-          <p className="hint">No merge has reached {source} since what {env} runs.</p>
-        ) : (
-          <>
-            <label htmlFor="cd-promote-pick">
-              Version, from what ran on {source}. It and every merge before it go to {env}; merges after it stay on {source}.
-            </label>
-            <select id="cd-promote-pick" value={pick} onChange={(e) => setPick(e.target.value)}>
-              {candidates.map((c) => (
-                <option key={c.version} value={c.version}>
-                  {c.version} · {carries(c)}
-                </option>
-              ))}
-            </select>
-            {picked && (
-              <p className="hint">
-                {riding.length === 1 ? `Only this merge goes to ${env}.` : `${riding.length} merges go to ${env}, this one and the ${riding.length - 1} before it.`} A release (CalVer tag on {picked.version}) is cut if
-                none exists yet, then deployed and synced.
-              </p>
-            )}
-            <h3>Checks</h3>
-            {check.isLoading && <p className="hint">checking…</p>}
-            {check.error && <p className="err">{String(check.error)}</p>}
-            {check.data && (
-              <ul className="cd-checks">
-                {check.data.checks.map((c) => (
-                  <li key={c.id} className={c.ok ? "ok" : "no"}>
-                    <span className={`chip ${c.ok ? "ok" : "failed"}`}>{c.ok ? "pass" : "fail"}</span> {c.why}
-                  </li>
-                ))}
-              </ul>
-            )}
-            <label htmlFor="cd-promote-note">Note (optional, shown on the request)</label>
-            <input id="cd-promote-note" value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. QA signed off the avs check" />
-            {go.error && <p className="err">{String(go.error)}</p>}
-          </>
-        )}
-        <div className="cd-promoactions">
-          <button className="btn primary" disabled={!check.data?.ok || go.isPending} onClick={() => go.mutate()}>
-            {go.isPending ? "Promoting…" : `Promote ${pick || ""}`}
-          </button>
-          <button className="btn" onClick={onClose}>
-            Cancel
-          </button>
-        </div>
-      </div>
     </div>
   );
 }
@@ -1411,9 +1318,20 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
   const rows = q.data.deployments;
   const seen = new Set<string>();
   const now = rows.filter((r) => (seen.has(r.environment) ? false : (seen.add(r.environment), true)));
+  const target = cfg.promotable[0] ?? null;
+  const source = target ? cfg.environments[cfg.environments.indexOf(target) - 1] : null;
+  const ranOnSource = !!source && rows.some((r) => r.environment === source && isRunning(r.state));
 
   return (
     <>
+      {v.kind === "merge" && target && ranOnSource && (
+        <div className="cd-versionactions">
+          <Link className="btn primary" to={href(`/deployments/versions/${encodeURIComponent(v.version)}/promote?to=${encodeURIComponent(target)}`, system, cfg)}>
+            Promote to {target}…
+          </Link>
+          <span className="hint">what rides along, what {target} will see change, and the checks</span>
+        </div>
+      )}
       <dl className="cd-facts">
         <div>
           <dt>kind</dt>
@@ -1575,6 +1493,10 @@ function VersionDetail({ cfg, system, version }: { cfg: Extract<CdConfig, { enab
                   <td>
                     {h.state === "requested" && q.data.promotion_replays.findIndex((x) => x.against_version === h.against_version) < i ? (
                       <span className="chip muted">started</span>
+                    ) : target && h.candidate_run ? (
+                      <Link to={href(`/deployments/versions/${encodeURIComponent(v.version)}/diff?to=${encodeURIComponent(target)}`, system, cfg)} title="the delta, by pull request">
+                        <PromotionReplayChip replay={h} />
+                      </Link>
                     ) : (
                       <PromotionReplayChip replay={h} />
                     )}

@@ -35,6 +35,7 @@ import DeploymentsPage, {
   VersionPage,
   VersionsPage,
 } from "./pages/DeploymentsPage";
+import { PromotePreviewPage, PromotionDiffPage } from "./pages/PromotionPreviewPage";
 import LoginPage from "./pages/LoginPage";
 
 import BoundaryPolicyPage from "./pages/BoundaryPolicyPage";
@@ -200,6 +201,8 @@ const router = createBrowserRouter([
       { path: "/deployments", element: <DeploymentsPage /> },
       { path: "/deployments/versions", element: <VersionsPage /> },
       { path: "/deployments/versions/:version", element: <VersionPage /> },
+      { path: "/deployments/versions/:version/promote", element: <PromotePreviewPage /> },
+      { path: "/deployments/versions/:version/diff", element: <PromotionDiffPage /> },
       { path: "/deployments/environments", element: <EnvironmentsPage /> },
       { path: "/deployments/environments/:env", element: <EnvironmentPage /> },
       { path: "/deployments/promotions", element: <PromotionsPage /> },

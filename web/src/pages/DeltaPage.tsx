@@ -35,7 +35,7 @@ import {
  * delta verdict, never replaced by it.
  */
 
-function sideLabel(s: DeltaSide): { text: string; cls: string } {
+export function sideLabel(s: DeltaSide): { text: string; cls: string } {
   if (s === "tape") return { text: "= tape", cls: "tape" };
   if (s === "absent") return { text: "absent", cls: "absent" };
   return { text: s.hash, cls: "hash" };
@@ -47,7 +47,7 @@ function sideEq(a: DeltaSide, b: DeltaSide): boolean {
 }
 
 /** The address, read as a reader would: request, then the site under it. */
-function AddressCell({ a }: { a: DeltaAddress }) {
+export function AddressCell({ a }: { a: DeltaAddress }) {
   const corr = a.correlation.length > 18 ? `…${a.correlation.slice(-14)}` : a.correlation;
   if (a.kind === "status") {
     return (
