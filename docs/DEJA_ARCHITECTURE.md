@@ -353,8 +353,9 @@ The orchestrator adds cause-vs-consequence lanes: `ValueDivergedOrigin` marks th
 Argument identity is evaluated **before the scorer declares a request
 divergent**. The comparison-only chain recognizes a bounded standard-base64
 string containing UTF-8 JSON, parses its document, and compares JSON object
-members structurally; decoded arrays remain positional. Inline JSON already
-has structural comparison. Malformed encodings, non-document text, changed
+members structurally; decoded arrays remain positional and nested strings
+remain literal. Inline JSON retains its legacy comparison tolerances and is
+never equated with a base64 document. Malformed encodings, non-document text, changed
 JSON values, and changed surrounding arguments are not treated as equal.
 This scorer rule has no boundary, operation, or vendor condition.
 
@@ -380,7 +381,9 @@ One proposal **appends or revokes exactly one rule** against the expected
 active revision. The **Deja replay service's state Postgres**, not the
 system-under-test database, stores the resulting complete rule set as an
 immutable, audited snapshot; it is not an unrestricted policy replacement.
-A different signed-in maintainer confirms it. Proposal-base and active-pointer
+A different signed-in maintainer confirms it once; the active allowance then
+applies automatically to every future replay in its declared system and
+operation scope until revoked. No per-run approval is required. Proposal-base and active-pointer
 checks refuse stale confirmations, so an earlier proposal cannot undo a
 newer append. Revocation removes the rule from future runs without mutating
 previous revisions, pinned run snapshots, or raw ledger arguments. When no
@@ -419,7 +422,10 @@ the active revision's approved noise targets. The behavior tree uses that
 digest for a still-divergent call, so three-way delta inherits common semantic
 drift instead of comparing base64 renderings or declared volatile header
 values. Untrusted pairing falls back to the raw hash; no signature is
-cryptographically verified.
+cryptographically verified. Tree canon version 7 also retains the argument
+scoring revision recorded in each ledger. Rebuilding a historical cache does
+not upgrade that revision: delta refuses an old/current revision pair and
+requests a fresh baseline replay instead of reporting a false candidate change.
 
 The blocking-vs-drift policy is **built, declared, and judged** — not open. Boundaries declare canonicalization presets applied by the scorer before judging (never by runtime routing): `final_state`, `absent_after`, `project{include,exclude}`. Volatile columns are declared `project:!created_at,!last_synced,!modified_at` on the DB row seams with a matching `reply_canon` on `http_incoming`. Blocking vs non-blocking is explicit in the verdict: seed gaps, order-nondeterminism, and idempotent-delete lines are non-blocking; evidence-gated `inconclusive_race` rows (recognized only when the run's HTTP layer is clean) make the verdict `inconclusive` with an auto-rerun recommendation — a race-only run can never pass.
 

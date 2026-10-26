@@ -21290,7 +21290,7 @@ mod tests {
         );
         let mut signed_candidate = served_encoded_artifacts(
             signed_recorded,
-            signed_args(r#"{"avs":true,"amount":2}"#, "sig-candidate"),
+            signed_args(r#"{"amount":2,"avs":true}"#, "sig-candidate"),
             UPSTREAM_CALL,
         );
         let rule = BoundaryRule {

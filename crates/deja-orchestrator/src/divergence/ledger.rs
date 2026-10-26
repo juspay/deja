@@ -90,9 +90,15 @@ impl CallSide {
     }
 }
 
+pub const ARGUMENT_REVISION: u32 = 2;
+
 /// One reconciled call: its identity, classification, and both sides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallRecord {
+    /// Scorer semantics that produced this row. Missing on historical ledgers;
+    /// rebuilding a tree must preserve that provenance rather than upgrade it.
+    #[serde(default)]
+    pub argument_revision: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -496,6 +502,7 @@ pub(crate) fn build_with_inconclusive_into(
                 ("value_diverged".to_owned(), true)
             };
             sink(CallRecord {
+                argument_revision: ARGUMENT_REVISION,
                 correlation_id: obs.correlation_id.clone(),
                 source_event_global_sequence: obs.source_event_global_sequence,
                 served_event_global_sequence: None,
@@ -584,6 +591,7 @@ pub(crate) fn build_with_inconclusive_into(
                     _ => None,
                 });
             sink(CallRecord {
+                argument_revision: ARGUMENT_REVISION,
                 correlation_id: obs.correlation_id.clone(),
                 source_event_global_sequence: Some(twin_seq),
                 // The recorded event the candidate served, where it served one
@@ -733,6 +741,7 @@ pub(crate) fn build_with_inconclusive_into(
             .and_then(recorded_for)
             .and_then(CallSide::or_none);
         sink(CallRecord {
+            argument_revision: ARGUMENT_REVISION,
             correlation_id: obs.correlation_id.clone(),
             source_event_global_sequence: obs.source_event_global_sequence,
             served_event_global_sequence: if skewed {
@@ -781,6 +790,7 @@ pub(crate) fn build_with_inconclusive_into(
         // Cut off by the correlation's seed gap, mirroring the scorecard.
         let cascaded = blocking && cascade.covers(ev.correlation_id.as_deref(), ev.global_sequence);
         sink(CallRecord {
+            argument_revision: ARGUMENT_REVISION,
             correlation_id: ev.correlation_id.clone(),
             source_event_global_sequence: Some(ev.global_sequence),
             served_event_global_sequence: None,

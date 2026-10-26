@@ -1119,7 +1119,7 @@ async fn v1_create_run(
         Err(e) => return error_resp(500, &format!("create run: {e}")),
     };
     let reject_unregistered_queue = |error: &str| {
-        if let Err(cleanup) = std::fs::remove_file(st.root.run_path(&run.run_id)) {
+        if let Err(cleanup) = remove_unadmitted_run(&st.root, &run.run_id) {
             eprintln!(
                 "deja-orchestrator: remove unadmitted queued run {}: {cleanup}",
                 run.run_id
@@ -2382,7 +2382,11 @@ async fn v1_get_run(State(st): State<AppState>, id: RunId) -> Response {
         Some(store) => match store.get_run(&id).await {
             Ok(row) => row,
             Err(e) => {
-                eprintln!("deja-orchestrator: get run {id} from store failed: {e}; reading file");
+                eprintln!(
+                    "deja-orchestrator: get run {} from store failed: {}; reading file",
+                    id.as_str().escape_debug(),
+                    e.to_string().escape_debug()
+                );
                 None
             }
         },
@@ -4323,6 +4327,20 @@ fn confined(candidate: std::path::PathBuf, base: &std::path::Path) -> Option<std
     Some(candidate)
 }
 
+/// Remove only the admitted run record, never a path outside the run store.
+fn remove_unadmitted_run(root: &HarnessRoot, id: &str) -> std::io::Result<()> {
+    let id: RunId = id
+        .parse()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let path = confined(root.run_path(&id), &root.root.join("runs")).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unadmitted run record is missing or outside the run store",
+        )
+    })?;
+    std::fs::remove_file(path)
+}
+
 /// `GET /api/v1/runs/{id}/stages` — append-only stage history.
 async fn v1_run_stages(State(st): State<AppState>, id: RunId) -> Response {
     let store = match require_store(&st) {
@@ -4876,11 +4894,17 @@ async fn v1_boundary_policy_preview(
         Ok(id) => id,
         Err(e) => return error_resp(400, &format!("run_id: {e}")),
     };
-    let run = match runs::get(&st.root, &id) {
-        Ok(run) => run,
-        Err(_) => return error_resp(404, "run not found for preview"),
+    let params = match run_params_read(&st, &id).await {
+        Ok(Some(params)) => params,
+        Ok(None) => return error_resp(404, "run not found for preview"),
+        Err(why) => return error_resp(503, &format!("preview run could not be read: {why}")),
     };
-    if run.spec.system() != system {
+    let run_system = params
+        .system_under_test
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| deja_orchestrator::default_system());
+    if run_system != system {
         return error_resp(400, "preview run belongs to a different system");
     }
     let snapshot = deja_orchestrator::policy::BoundaryPolicySnapshot {
@@ -6890,6 +6914,28 @@ mod tests {
     }
 
     const LEDGER_ROW: &str = r#"{"correlation_id":"c1","boundary":"redis","trait_name":"Cache","method_name":"get","kind":"matched","blocking":false}"#;
+
+    #[test]
+    fn unadmitted_run_cleanup_is_confined_to_its_run_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = HarnessRoot::new(dir.path()).unwrap();
+        let path = root.run_path("queued-run");
+        std::fs::write(&path, "{}").unwrap();
+        remove_unadmitted_run(&root, "queued-run").unwrap();
+        assert!(!path.exists());
+
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, "keep").unwrap();
+        assert!(remove_unadmitted_run(&root, "../outside").is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.run_path("linked-run")).unwrap();
+            assert!(remove_unadmitted_run(&root, "linked-run").is_err());
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        }
+    }
 
     #[test]
     fn preview_reuses_semantic_identity_and_revocable_noise_rules() {
@@ -9039,6 +9085,58 @@ mod sign_in {
     }
 
     #[tokio::test]
+    async fn boundary_policy_preview_reads_durable_run_without_a_local_snapshot() {
+        let Ok(db_url) = std::env::var("DEJA_TEST_DB_URL") else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let (auth, signer) = enabled(&["alice@juspay.in"]);
+        let mut st = state(auth, None);
+        let store = Arc::new(Store::connect(&db_url).await.expect("test Postgres"));
+        st.store = Some(store.clone());
+        let run_id = deja_orchestrator::new_id("policy-preview");
+        let candidate = serde_json::json!({"kind":"prebuilt_image","image":"local/preview:unused"});
+        let params = serde_json::json!({
+            "mode":"replay", "candidate_spec":candidate,
+            "system_under_test":"hyperswitch", "recording_id":"rec-preview"
+        });
+        store
+            .insert_run(
+                &run_id,
+                "replay",
+                Some("rec-preview"),
+                &candidate,
+                &params,
+                None,
+                "alice@juspay.in",
+            )
+            .await
+            .unwrap();
+        // The ledger can be cached or hydrated from S3 independently of the
+        // worker's run JSON, which does not survive a fresh orchestrator host.
+        std::fs::write(st.root.call_ledger_path(&run_id), "").unwrap();
+        assert!(!st.root.run_path(&run_id).exists());
+        let app = app_router(st.clone());
+        let request = |system: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("/api/v1/systems/{system}/boundary-policy/preview"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::COOKIE, session_cookie(&signer, "alice@juspay.in"))
+                .body(Body::from(
+                    serde_json::json!({"run_id":run_id,"rules":[]}).to_string(),
+                ))
+                .unwrap()
+        };
+        let (status, body) = call(app, request("hyperswitch")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let preview: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(preview["run_id"], run_id);
+        assert_eq!(preview["total_rows"], 0);
+        assert!(!st.root.run_path(&run_id).exists());
+    }
+
+    #[tokio::test]
     async fn maintainer_can_activate_and_revoke_scoped_noise_through_api() {
         let Ok(db_url) = std::env::var("DEJA_TEST_DB_URL") else {
             eprintln!("skipped: DEJA_TEST_DB_URL is not set");
@@ -9088,6 +9186,7 @@ mod sign_in {
                 .method(Method::POST)
                 .uri(path)
                 .header(header::CONTENT_TYPE, "application/json")
+                .header("x-deja-actor", email)
                 .header(header::COOKIE, session_cookie(&signer, email))
                 .body(Body::from(body.to_string()))
                 .unwrap()
@@ -9158,6 +9257,31 @@ mod sign_in {
         assert_eq!(snapshot["digest"], activated_snapshot["snapshot"]["digest"]);
         assert!(snapshot["rules"].as_array().unwrap().contains(&rule));
 
+        // The same activation automatically applies to later admissions;
+        // neither the caller nor the maintainer approves each replay again.
+        let (status, body) = call(
+            app.clone(),
+            post(
+                "/api/v1/runs".into(),
+                "alice@juspay.in",
+                serde_json::json!({
+                    "mode":"replay", "system_under_test":"hyperswitch",
+                    "recording_id":"rec-not-on-disk-again",
+                    "candidate_spec":{"kind":"prebuilt_image","image":"local/policy-smoke:unavailable"}
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let second_created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let second_run_id = second_created["run_id"].as_str().unwrap();
+        let second_pinned: Run =
+            deja_orchestrator::read_json(&st.root.run_path(second_run_id)).unwrap();
+        assert_eq!(
+            second_pinned.spec.boundary_policy,
+            pinned.spec.boundary_policy
+        );
+
         let (status, body) = call(
             app.clone(),
             post(
@@ -9189,6 +9313,39 @@ mod sign_in {
             unchanged.spec.boundary_policy, pinned.spec.boundary_policy,
             "revocation must not rewrite a previously admitted replay"
         );
+        let second_unchanged: Run =
+            deja_orchestrator::read_json(&st.root.run_path(second_run_id)).unwrap();
+        assert_eq!(
+            second_unchanged.spec.boundary_policy,
+            second_pinned.spec.boundary_policy
+        );
+        let (status, body) = call(
+            app.clone(),
+            post(
+                "/api/v1/runs".into(),
+                "alice@juspay.in",
+                serde_json::json!({
+                    "mode":"replay", "system_under_test":"hyperswitch",
+                    "recording_id":"rec-after-revocation",
+                    "candidate_spec":{"kind":"prebuilt_image","image":"local/policy-smoke:unavailable"}
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let after_created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let after: Run = deja_orchestrator::read_json(
+            &st.root.run_path(after_created["run_id"].as_str().unwrap()),
+        )
+        .unwrap();
+        let after_rules = after
+            .spec
+            .boundary_policy
+            .as_ref()
+            .map(|snapshot| serde_json::to_value(&snapshot.rules).unwrap())
+            .unwrap_or_else(|| serde_json::json!([]));
+        assert_eq!(after_rules, serde_json::json!(original_rules));
+        assert!(!after_rules.as_array().unwrap().contains(&rule));
         let (status, body) = call(
             app,
             Request::builder()

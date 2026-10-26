@@ -121,26 +121,44 @@ fn semantic_same(
     path: &str,
     changes: &mut Vec<IdentityChange>,
 ) -> bool {
-    if recorded == observed {
-        return true;
-    }
     if same(recorded, observed) {
         differences(recorded, observed, path, changes);
         return true;
     }
     match (recorded, observed) {
         (Value::String(left), Value::String(right)) => {
-            let (Some(left), Some(right)) = (semantic_document(left), semantic_document(right))
+            // Inline documents already use the legacy identity above. Mixing
+            // them with encoded documents would make equality non-transitive:
+            // inline arrays are multisets, encoded arrays are positional.
+            if embedded_document(left).is_some() || embedded_document(right).is_some() {
+                return false;
+            }
+            let (Some(left), Some(right)) = (encoded_document(left), encoded_document(right))
             else {
                 return false;
             };
-            if left != right {
+            if !same_decoded_document(&left, &right) {
                 return false;
             }
             changes.push(IdentityChange::DocumentText(path.to_owned()));
             true
         }
+        (Value::Object(left), Value::Object(right)) if is_json_request_body(left) => {
+            is_json_request_body(right)
+                && semantic_same(
+                    &left["json"],
+                    &right["json"],
+                    &format!("{path}.json"),
+                    changes,
+                )
+        }
         (Value::Object(left), Value::Object(right)) if left.len() == right.len() => {
+            if is_json_request_body(right)
+                || is_form_request_body(left)
+                || is_form_request_body(right)
+            {
+                return false;
+            }
             left.iter().all(|(key, value)| {
                 let Some(other) = right.get(key) else {
                     return false;
@@ -148,7 +166,7 @@ fn semantic_same(
                 if is_byte_string(key, value) || is_byte_string(key, other) {
                     return member_same(key, value, other);
                 }
-                value == other || semantic_same(value, other, &format!("{path}.{key}"), changes)
+                semantic_same(value, other, &format!("{path}.{key}"), changes)
             })
         }
         (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
@@ -166,16 +184,34 @@ fn semantic_same(
                 .zip(partners)
                 .enumerate()
                 .all(|(index, (value, partner))| {
-                    value == &right[partner]
-                        || semantic_same(
-                            value,
-                            &right[partner],
-                            &format!("{path}[{index}]"),
-                            changes,
-                        )
+                    semantic_same(value, &right[partner], &format!("{path}[{index}]"), changes)
                 })
         }
         _ => false,
+    }
+}
+
+/// Decoded JSON is structural: arrays are positional and strings stay literal.
+/// Numbers retain the same textual identity as the rest of the comparator.
+fn same_decoded_document(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Number(left), Value::Number(right)) => left.to_string() == right.to_string(),
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| same_decoded_document(value, other))
+                })
+        }
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| same_decoded_document(left, right))
+        }
+        _ => left == right,
     }
 }
 
@@ -188,6 +224,10 @@ fn semantic_hash(value: &Value) -> u64 {
         Value::String(text) => semantic_document(text)
             .map(|document| tagged(0x7365_6d64_6f63, element_hash(&document)))
             .unwrap_or_else(|| element_hash(value)),
+        Value::Object(map) if is_json_request_body(map) => {
+            tagged(0x626f_6479, semantic_hash(&map["json"]))
+        }
+        Value::Object(map) if is_form_request_body(map) => element_hash(value),
         Value::Object(map) => {
             let sum = map.iter().fold(0u64, |sum, (key, member)| {
                 let member_hash = if is_byte_string(key, member) {
@@ -324,7 +364,7 @@ fn member_same(key: &str, value: &Value, other: &Value) -> bool {
 }
 
 /// A byte string's text, when it is UTF-8 holding a JSON object or array.
-fn byte_document(value: &Value) -> Option<Value> {
+pub fn byte_document(value: &Value) -> Option<Value> {
     let bytes: Vec<u8> = value
         .as_array()?
         .iter()
@@ -334,7 +374,7 @@ fn byte_document(value: &Value) -> Option<Value> {
 }
 
 /// A byte string in deja's capture: one of its byte members, holding bytes.
-fn is_byte_string(key: &str, value: &Value) -> bool {
+pub fn is_byte_string(key: &str, value: &Value) -> bool {
     BYTE_STRING_MEMBERS.contains(&key)
         && value.as_array().is_some_and(|items| {
             items
@@ -534,6 +574,30 @@ fn is_json_request_body(map: &serde_json::Map<String, Value>) -> bool {
         && map.get("json").is_some_and(|json| !json.is_null())
 }
 
+/// Capture-specific identity shared by the scorer and its argument digest.
+/// JSON bodies use their parsed payload; form bodies use the exact multiset
+/// of fields. Wire-rendering metadata is not part of either body's identity.
+pub enum CapturedBodyIdentity<'a> {
+    Json(&'a Value),
+    Form(Vec<String>),
+}
+
+pub fn captured_body_identity(value: &Value) -> Option<CapturedBodyIdentity<'_>> {
+    let map = value.as_object()?;
+    if is_json_request_body(map) {
+        Some(CapturedBodyIdentity::Json(&map["json"]))
+    } else if is_form_request_body(map) {
+        let mut fields: Vec<_> = crate::replay::request_body_text(map)?
+            .split('&')
+            .map(str::to_owned)
+            .collect();
+        fields.sort_unstable();
+        Some(CapturedBodyIdentity::Form(fields))
+    } else {
+        None
+    }
+}
+
 /// Where two values with one identity differ as written. Both sides have the
 /// same shape wherever this descends, because they are one identity. A
 /// reordered array is reported, and each of its members is still followed to
@@ -658,7 +722,30 @@ mod tests {
         let inline = json!({ "payload": r#"{"a":1}"# });
         let encoded = json!({ "payload": base64(r#"{"a":1}"#) });
         assert!(identity_differences(&inline, &encoded).is_none());
-        assert!(semantic_differences(&inline, &encoded).is_some());
+        assert!(semantic_differences(&inline, &encoded).is_none());
+    }
+
+    #[test]
+    fn encoded_documents_do_not_bridge_inline_multiset_identity() {
+        let inline = json!({"payload": "[1,2]"});
+        let reordered = json!({"payload": "[2,1]"});
+        let encoded = json!({"payload": base64("[1,2]")});
+        assert!(semantic_differences(&inline, &reordered).is_some());
+        assert!(semantic_differences(&inline, &encoded).is_none());
+        assert!(semantic_differences(&reordered, &encoded).is_none());
+    }
+
+    #[test]
+    fn encoded_documents_keep_nested_strings_and_signed_zero_distinct() {
+        let args = |document: &str| json!({"payload": base64(document)});
+        assert!(semantic_differences(
+            &args(r#"{"nested":"{\"a\":1}"}"#),
+            &args(r#"{"nested":"{ \"a\":1}"}"#),
+        )
+        .is_none());
+        assert!(semantic_differences(&args("[-0.0]"), &args("[0.0]")).is_none());
+        assert!(semantic_differences(&json!(-0.0), &json!(0.0)).is_none());
+        assert!(semantic_differences(&json!({"x":-0.0}), &json!({"x":0.0})).is_none());
     }
     /// Arrays are multisets everywhere, with no exceptions: a tuple, a pair, a
     /// row, numbers and nulls are one identity in any order. Multiplicity

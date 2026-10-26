@@ -10,6 +10,13 @@ use std::collections::BTreeMap;
 const MAX_DATA_BYTES: usize = 1024 * 1024;
 const MAX_HEADER_PAIRS: usize = 4096;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Context {
+    Arguments,
+    Inline,
+    Decoded,
+}
+
 /// The paired-serve and independent-order checks belong to the caller.
 /// Both scorecard equivalence and delta keys use the SAME canonical digest,
 /// so a maintainer rule cannot be interpreted differently by those readers.
@@ -111,7 +118,8 @@ pub(super) fn semantic_digest(
     method_name: &str,
     snapshot: Option<&BoundaryPolicySnapshot>,
 ) -> Option<String> {
-    semantic_hash(args, boundary, trait_name, method_name, snapshot).map(hex::encode)
+    semantic_hash(args, boundary, trait_name, method_name, snapshot)
+        .map(|digest| format!("v2:{}", hex::encode(digest)))
 }
 
 fn semantic_hash(
@@ -175,12 +183,12 @@ fn semantic_hash(
         }
     }
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"deja-semantic-argument-v1");
+    hasher.update(b"deja-semantic-argument-v2");
     hash_semantic_value(
         &mut hasher,
         args,
         "",
-        false,
+        Context::Arguments,
         source.zip(decoded.as_ref()),
         rules,
     )?;
@@ -197,7 +205,7 @@ fn hash_semantic_value(
     hasher: &mut sha2::Sha256,
     value: &Value,
     path: &str,
-    decoded_context: bool,
+    context: Context,
     source: Option<(&str, &Value)>,
     rules: &[Option<&BoundaryRule>],
 ) -> Option<()> {
@@ -205,7 +213,7 @@ fn hash_semantic_value(
     if let Some((source_path, document)) = source {
         if path == source_path {
             hasher.update(b"encoded-document");
-            return hash_semantic_value(hasher, document, "", true, None, rules);
+            return hash_semantic_value(hasher, document, "", Context::Decoded, None, rules);
         }
     }
     let mut scalar = false;
@@ -242,6 +250,30 @@ fn hash_semantic_value(
     if grouped || ignored_header.is_some() {
         return hash_headers(hasher, value.as_array()?, grouped, ignored_header);
     }
+    if context != Context::Decoded {
+        match deja::identity::captured_body_identity(value) {
+            Some(deja::identity::CapturedBodyIdentity::Json(json)) => {
+                hasher.update(b"json-request-body");
+                return hash_semantic_value(
+                    hasher,
+                    json,
+                    &format!("{path}/json"),
+                    context,
+                    source,
+                    rules,
+                );
+            }
+            Some(deja::identity::CapturedBodyIdentity::Form(fields)) => {
+                hasher.update(b"form-request-body");
+                hasher.update((fields.len() as u64).to_be_bytes());
+                for field in fields {
+                    hash_bytes(hasher, field.as_bytes());
+                }
+                return Some(());
+            }
+            None => {}
+        }
+    }
     match value {
         Value::Null => hasher.update(b"null"),
         Value::Bool(flag) => hasher.update(if *flag { b"true".as_slice() } else { b"false" }),
@@ -250,9 +282,18 @@ fn hash_semantic_value(
             hash_bytes(hasher, number.to_string().as_bytes());
         }
         Value::String(text) => {
-            if let Some(document) = deja::identity::semantic_document(text) {
-                hasher.update(b"document");
-                hash_semantic_value(hasher, &document, "", true, None, &[])?;
+            if context == Context::Decoded {
+                hasher.update(b"string");
+                hash_bytes(hasher, text.as_bytes());
+            } else if let Some(document) = deja::identity::embedded_document(text) {
+                hasher.update(b"inline-document");
+                hash_semantic_value(hasher, &document, "", Context::Inline, None, &[])?;
+            } else if let Some(document) = (context == Context::Arguments)
+                .then(|| deja::identity::semantic_document(text))
+                .flatten()
+            {
+                hasher.update(b"encoded-document");
+                hash_semantic_value(hasher, &document, "", Context::Decoded, None, &[])?;
             } else {
                 hasher.update(b"string");
                 hash_bytes(hasher, text.as_bytes());
@@ -274,22 +315,45 @@ fn hash_semantic_value(
                 // Deja capture's own byte-string members have positional
                 // bytes; do not mistake their JSON array representation for
                 // an unordered collection.
-                let child_decoded =
-                    decoded_context || matches!(key.as_str(), "raw_bytes" | "BulkString" | "Bytes");
-                hash_semantic_value(hasher, child, &child_path, child_decoded, source, rules)?;
+                if context != Context::Decoded && deja::identity::is_byte_string(key, child) {
+                    let targeted_bytes = rules.iter().flatten().any(|rule| {
+                        rule_path(rule)
+                            .strip_prefix(child_path.as_str())
+                            .is_some_and(|tail| tail.starts_with('/'))
+                    });
+                    if let Some(document) = (!targeted_bytes)
+                        .then(|| deja::identity::byte_document(child))
+                        .flatten()
+                    {
+                        hasher.update(b"byte-document");
+                        hash_semantic_value(hasher, &document, "", Context::Inline, None, &[])?;
+                    } else {
+                        hasher.update(b"byte-string");
+                        hash_semantic_value(
+                            hasher,
+                            child,
+                            &child_path,
+                            Context::Decoded,
+                            source,
+                            rules,
+                        )?;
+                    }
+                } else {
+                    hash_semantic_value(hasher, child, &child_path, context, source, rules)?;
+                }
             }
         }
         Value::Array(items) => {
             hasher.update(b"array");
             hasher.update((items.len() as u64).to_be_bytes());
-            if decoded_context {
+            if context == Context::Decoded {
                 for (index, child) in items.iter().enumerate() {
                     let child_path = if rules.is_empty() && source.is_none() {
                         String::new()
                     } else {
                         format!("{path}/{index}")
                     };
-                    hash_semantic_value(hasher, child, &child_path, true, source, rules)?;
+                    hash_semantic_value(hasher, child, &child_path, context, source, rules)?;
                 }
             } else {
                 let mut hashes = Vec::with_capacity(items.len());
@@ -300,7 +364,7 @@ fn hash_semantic_value(
                     } else {
                         format!("{path}/{index}")
                     };
-                    hash_semantic_value(&mut inner, child, &child_path, false, source, rules)?;
+                    hash_semantic_value(&mut inner, child, &child_path, context, source, rules)?;
                     hashes.push(inner.finalize());
                 }
                 hashes.sort_unstable();
@@ -549,5 +613,121 @@ mod tests {
             semantic_digest(&outer_and_inner, "api", "service", "send", Some(&policy)),
             "the outer signature was never approved"
         );
+    }
+
+    #[test]
+    fn decoded_strings_remain_literal_under_an_unrelated_allowance() {
+        let policy = snapshot(
+            vec![NoiseTarget::Scalar {
+                json_pointer: "/nonce".into(),
+            }],
+            Some("/data"),
+        );
+        let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+        let args = |payload: &str| {
+            serde_json::json!({
+                "data": encode(&serde_json::json!({"nonce":"same", "payload":payload}).to_string())
+            })
+        };
+        let recorded = args(r#"{"amount":1}"#);
+        for changed in [r#"{ "amount":1}"#.to_owned(), encode(r#"{"amount":1}"#)] {
+            let observed = args(&changed);
+            assert!(deja::identity::semantic_differences(&recorded, &observed).is_none());
+            assert!(!matches(recorded.clone(), observed.clone(), &policy));
+            assert_ne!(
+                semantic_digest(&recorded, "api", "service", "send", None),
+                semantic_digest(&observed, "api", "service", "send", None),
+            );
+        }
+    }
+
+    #[test]
+    fn digests_preserve_inline_tolerances_and_encoded_structure() {
+        let digest = |args: &Value| semantic_digest(args, "api", "service", "send", None);
+        let inline = serde_json::json!({"payload": r#"{"ids":[1,2]}"#});
+        let reordered = serde_json::json!({"payload": r#"{"ids":[2,1]}"#});
+        assert!(deja::identity::semantic_differences(&inline, &reordered).is_some());
+        assert_eq!(digest(&inline), digest(&reordered));
+        let encoded = |text: &str| {
+            serde_json::json!({
+                "payload": base64::engine::general_purpose::STANDARD.encode(text)
+            })
+        };
+        let encoded_inline = encoded(r#"{"ids":[1,2]}"#);
+        assert_ne!(digest(&inline), digest(&encoded_inline));
+        assert_ne!(
+            digest(&encoded_inline),
+            digest(&encoded(r#"{"ids":[2,1]}"#))
+        );
+        assert_ne!(digest(&encoded("[-0.0]")), digest(&encoded("[0.0]")));
+    }
+
+    #[test]
+    fn inline_documents_do_not_enable_nested_base64_normalization() {
+        let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+        let args = |text: &str| {
+            serde_json::json!({
+                "nonce":"same", "document":serde_json::json!({"payload":encode(text)}).to_string()
+            })
+        };
+        let recorded = args(r#"{"a":1,"b":2}"#);
+        let observed = args(r#"{"b":2,"a":1}"#);
+        let policy = snapshot(
+            vec![NoiseTarget::Scalar {
+                json_pointer: "/nonce".into(),
+            }],
+            None,
+        );
+        assert!(deja::identity::semantic_differences(&recorded, &observed).is_none());
+        assert!(!matches(recorded.clone(), observed.clone(), &policy));
+        assert_ne!(
+            semantic_digest(&recorded, "api", "service", "send", None),
+            semantic_digest(&observed, "api", "service", "send", None),
+        );
+    }
+
+    #[test]
+    fn digests_share_legacy_capture_body_and_byte_document_identity() {
+        let pairs = [
+            (
+                serde_json::json!({"Bytes": r#"{"a":1,"b":[1,2]}"#.as_bytes()}),
+                serde_json::json!({"Bytes": r#"{"b":[2,1],"a":1}"#.as_bytes()}),
+            ),
+            (
+                serde_json::json!({"kind":"JsonRequestBody", "json":{"ids":[1,2]}, "raw_bytes":[1]}),
+                serde_json::json!({"kind":"JsonRequestBody", "json":{"ids":[2,1]}, "raw_bytes":[2]}),
+            ),
+            (
+                serde_json::json!({"kind":"FormUrlEncodedRequestBody", "raw_bytes":b"a=1&b=2"}),
+                serde_json::json!({"kind":"FormUrlEncodedRequestBody", "raw_bytes":b"b=2&a=1"}),
+            ),
+        ];
+        for (recorded, observed) in pairs {
+            assert!(deja::identity::semantic_differences(&recorded, &observed).is_some());
+            assert_eq!(
+                semantic_digest(&recorded, "api", "service", "send", None),
+                semantic_digest(&observed, "api", "service", "send", None),
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_allowance_can_target_a_byte_inside_a_captured_document() {
+        let policy = snapshot(
+            vec![NoiseTarget::Scalar {
+                json_pointer: "/Bytes/5".into(),
+            }],
+            None,
+        );
+        assert!(matches(
+            serde_json::json!({"Bytes":br#"{"a":1}"#}),
+            serde_json::json!({"Bytes":br#"{"a":2}"#}),
+            &policy,
+        ));
+        assert!(!matches(
+            serde_json::json!({"Bytes":br#"{"a":1}"#}),
+            serde_json::json!({"Bytes":br#"{"b":2}"#}),
+            &policy,
+        ));
     }
 }

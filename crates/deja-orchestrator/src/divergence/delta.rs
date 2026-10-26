@@ -271,6 +271,12 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             m.policy_digest, y.policy_digest
         ));
     }
+    if m.argument_revision != y.argument_revision {
+        return Err(
+            "the runs use incompatible argument scoring revisions; replay a fresh baseline before comparing"
+                .to_owned(),
+        );
+    }
     // The trees hash what each candidate captured, in the encoding of the
     // deja it links. Across two encodings every affected address would read
     // as changed behaviour, so the tape verdict is the one to read there.
@@ -570,6 +576,7 @@ mod tests {
         BehaviourTree {
             run_id: run.into(),
             canon_version: CANON_VERSION,
+            argument_revision: super::super::ledger::ARGUMENT_REVISION,
             entries: entries
                 .into_iter()
                 .map(|(address, value)| Entry {
@@ -611,6 +618,23 @@ mod tests {
         assert!(three_way(&m, &y)
             .unwrap_err()
             .contains("different boundary policies"));
+    }
+
+    #[test]
+    fn historical_argument_hashes_require_a_fresh_baseline() {
+        let current = tree("y", vec![(call("c", 0), div("semantic:v2:abc"))]);
+        for old_hash in ["abc", "semantic:abc"] {
+            let mut historical = tree("m", vec![(call("c", 0), div(old_hash))]);
+            historical.argument_revision = 0;
+            assert!(three_way(&historical, &current)
+                .unwrap_err()
+                .contains("fresh baseline"));
+            assert!(three_way(&current, &historical)
+                .unwrap_err()
+                .contains("fresh baseline"));
+            assert!(three_way(&historical, &historical).unwrap().verdict.pass);
+        }
+        assert!(three_way(&current, &current).unwrap().verdict.pass);
     }
 
     #[test]

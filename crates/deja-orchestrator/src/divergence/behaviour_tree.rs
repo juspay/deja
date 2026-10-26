@@ -46,7 +46,10 @@ use super::ledger::CallRecord;
 ///    rules; divergent tree values hash normalized semantic arguments rather
 ///    than representation bytes. The run's immutable policy digest is part of
 ///    its comparison identity.
-pub const CANON_VERSION: u32 = 6;
+/// 7: encoded documents keep nested strings literal; inline documents retain
+///    legacy array tolerances. Semantic digests carry their own revision so
+///    rebuilding a historical ledger cannot relabel its old hashes as new.
+pub const CANON_VERSION: u32 = 7;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -126,6 +129,10 @@ pub struct Entry {
 pub struct BehaviourTree {
     pub run_id: String,
     pub canon_version: u32,
+    /// The scorer revision retained by the ledger, independent of the cache
+    /// version used to rebuild this projection.
+    #[serde(default)]
+    pub argument_revision: u32,
     pub entries: Vec<Entry>,
     /// The lane each correlation ran in, from its connector call.
     pub lanes: HashMap<String, Lane>,
@@ -433,6 +440,11 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
     BehaviourTree {
         run_id: run_id.to_owned(),
         canon_version: CANON_VERSION,
+        argument_revision: rows
+            .iter()
+            .map(|row| row.argument_revision)
+            .min()
+            .unwrap_or(super::ledger::ARGUMENT_REVISION),
         entries,
         lanes,
         correlations,
@@ -479,6 +491,7 @@ impl BehaviourTree {
             &serde_json::json!({
                 "run_id": self.run_id,
                 "canon_version": self.canon_version,
+                "argument_revision": self.argument_revision,
                 "entries": self.entries.len(),
                 "lanes": self.lanes,
                 "correlations": self.correlations,
@@ -515,6 +528,7 @@ impl BehaviourTree {
         Some(Self {
             run_id: head.get("run_id")?.as_str()?.to_owned(),
             canon_version: head.get("canon_version")?.as_u64()? as u32,
+            argument_revision: head.get("argument_revision")?.as_u64()?.try_into().ok()?,
             entries,
             lanes: serde_json::from_value(head.get("lanes")?.clone()).ok()?,
             correlations: serde_json::from_value(head.get("correlations")?.clone()).ok()?,
@@ -563,6 +577,7 @@ mod tests {
         args: serde_json::Value,
     ) -> CallRecord {
         CallRecord {
+            argument_revision: super::super::ledger::ARGUMENT_REVISION,
             correlation_id: Some(corr.to_owned()),
             source_event_global_sequence: source_seq,
             served_event_global_sequence: None,
@@ -602,6 +617,34 @@ mod tests {
         let c =
             serde_json::json!({"url": "https://api.x.com/v1", "headers": [["a", "1"], ["b", "3"]]});
         assert_ne!(hash_of(&a), hash_of(&c), "a header VALUE is behaviour");
+    }
+
+    #[test]
+    fn rebuilding_a_historical_ledger_keeps_its_scoring_revision() {
+        let mut current = row(
+            "value_diverged",
+            "c",
+            "span",
+            Some(1),
+            serde_json::json!({"amount":2}),
+        );
+        current.semantic_digest = Some("v2:observed".into());
+        let mut old_json = serde_json::to_value(&current).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("argument_revision");
+        old_json.as_object_mut().unwrap().remove("semantic_digest");
+        let historical: CallRecord = serde_json::from_value(old_json).unwrap();
+        let baseline = build("m", &[historical], &[]);
+        let candidate = build("y", &[current], &[]);
+        assert_eq!(baseline.canon_version, candidate.canon_version);
+        assert_eq!(baseline.argument_revision, 0);
+        let rebuilt = BehaviourTree::from_jsonl(&baseline.to_jsonl()).unwrap();
+        assert_eq!(rebuilt.argument_revision, 0);
+        assert!(super::super::delta::three_way(&rebuilt, &candidate)
+            .unwrap_err()
+            .contains("fresh baseline"));
     }
 
     /// A call served from its own recorded error reproduced the recording, so
