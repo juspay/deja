@@ -90,7 +90,7 @@ impl CallSide {
     }
 }
 
-pub const ARGUMENT_REVISION: u32 = 2;
+pub const ARGUMENT_REVISION: u32 = 3;
 
 /// One reconciled call: its identity, classification, and both sides.
 #[derive(Debug, Clone, Serialize, Deserialize)]

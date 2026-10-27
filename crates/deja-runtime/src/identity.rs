@@ -100,9 +100,9 @@ pub fn identity_differences(recorded: &Value, observed: &Value) -> Option<Vec<Id
 /// does not change `same`, `identity_args_hash`, or lookup policy: a fixed
 /// candidate still probes the addresses its compiled runtime understands.
 ///
-/// Within decoded JSON, object keys are structural and arrays are positional.
-/// The legacy comparison runs first, so existing unencoded identity semantics
-/// remain unchanged.
+/// The legacy comparison runs first. Decoding is one additional parser stage:
+/// a parsed document goes straight back through the existing JSON comparator,
+/// including its array and nested-document rules.
 pub fn semantic_differences(recorded: &Value, observed: &Value) -> Option<Vec<IdentityChange>> {
     if let Some(changes) = identity_differences(recorded, observed) {
         return Some(changes);
@@ -127,17 +127,11 @@ fn semantic_same(
     }
     match (recorded, observed) {
         (Value::String(left), Value::String(right)) => {
-            // Inline documents already use the legacy identity above. Mixing
-            // them with encoded documents would make equality non-transitive:
-            // inline arrays are multisets, encoded arrays are positional.
-            if embedded_document(left).is_some() || embedded_document(right).is_some() {
-                return false;
-            }
-            let (Some(left), Some(right)) = (encoded_document(left), encoded_document(right))
+            let (Some(left), Some(right)) = (semantic_document(left), semantic_document(right))
             else {
                 return false;
             };
-            if !same_decoded_document(&left, &right) {
+            if !same(&left, &right) {
                 return false;
             }
             changes.push(IdentityChange::DocumentText(path.to_owned()));
@@ -188,30 +182,6 @@ fn semantic_same(
                 })
         }
         _ => false,
-    }
-}
-
-/// Decoded JSON is structural: arrays are positional and strings stay literal.
-/// Numbers retain the same textual identity as the rest of the comparator.
-fn same_decoded_document(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::Number(left), Value::Number(right)) => left.to_string() == right.to_string(),
-        (Value::Object(left), Value::Object(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, value)| {
-                    right
-                        .get(key)
-                        .is_some_and(|other| same_decoded_document(value, other))
-                })
-        }
-        (Value::Array(left), Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| same_decoded_document(left, right))
-        }
-        _ => left == right,
     }
 }
 
@@ -711,41 +681,69 @@ mod tests {
     }
 
     #[test]
-    fn semantic_comparison_preserves_decoded_array_order() {
+    fn decoded_arrays_continue_through_existing_multiset_comparison() {
         let recorded = json!({ "payload": base64(r#"{"items":[1,2]}"#) });
         let reordered = json!({ "payload": base64(r#"{"items":[2,1]}"#) });
-        assert!(semantic_differences(&recorded, &reordered).is_none());
+        assert!(semantic_differences(&recorded, &reordered).is_some());
     }
 
     #[test]
-    fn semantic_comparison_keeps_inline_and_encoded_json_distinct() {
+    fn inline_and_encoded_documents_use_the_same_json_comparison() {
         let inline = json!({ "payload": r#"{"a":1}"# });
         let encoded = json!({ "payload": base64(r#"{"a":1}"#) });
         assert!(identity_differences(&inline, &encoded).is_none());
-        assert!(semantic_differences(&inline, &encoded).is_none());
+        assert!(semantic_differences(&inline, &encoded).is_some());
     }
 
     #[test]
-    fn encoded_documents_do_not_bridge_inline_multiset_identity() {
+    fn encoded_documents_preserve_transitive_existing_json_identity() {
         let inline = json!({"payload": "[1,2]"});
         let reordered = json!({"payload": "[2,1]"});
         let encoded = json!({"payload": base64("[1,2]")});
         assert!(semantic_differences(&inline, &reordered).is_some());
-        assert!(semantic_differences(&inline, &encoded).is_none());
-        assert!(semantic_differences(&reordered, &encoded).is_none());
+        assert!(semantic_differences(&inline, &encoded).is_some());
+        assert!(semantic_differences(&reordered, &encoded).is_some());
     }
 
     #[test]
-    fn encoded_documents_keep_nested_strings_and_signed_zero_distinct() {
+    fn encoded_documents_reuse_nested_json_and_numeric_identity() {
         let args = |document: &str| json!({"payload": base64(document)});
         assert!(semantic_differences(
             &args(r#"{"nested":"{\"a\":1}"}"#),
             &args(r#"{"nested":"{ \"a\":1}"}"#),
         )
-        .is_none());
+        .is_some());
         assert!(semantic_differences(&args("[-0.0]"), &args("[0.0]")).is_none());
         assert!(semantic_differences(&json!(-0.0), &json!(0.0)).is_none());
         assert!(semantic_differences(&json!({"x":-0.0}), &json!({"x":0.0})).is_none());
+    }
+
+    #[test]
+    fn preexisting_matches_keep_their_exact_comparison_result() {
+        let pairs = [
+            (json!({"items":[1,2,1]}), json!({"items":[1,1,2]})),
+            (
+                json!({"doc":r#"{"ids":[1,2]}"#}),
+                json!({"doc":r#"{"ids":[2,1]}"#}),
+            ),
+            (
+                json!({"Bytes":br#"{"a":1,"b":2}"#}),
+                json!({"Bytes":br#"{"b":2,"a":1}"#}),
+            ),
+            (
+                json!({"kind":"JsonRequestBody","json":{"ids":[1,2]},"raw_bytes":[1]}),
+                json!({"kind":"JsonRequestBody","json":{"ids":[2,1]},"raw_bytes":[2]}),
+            ),
+            (
+                json!({"kind":"FormUrlEncodedRequestBody","raw_bytes":b"a=1&b=2"}),
+                json!({"kind":"FormUrlEncodedRequestBody","raw_bytes":b"b=2&a=1"}),
+            ),
+        ];
+        for (recorded, observed) in pairs {
+            let previous = identity_differences(&recorded, &observed);
+            assert!(previous.is_some());
+            assert_eq!(semantic_differences(&recorded, &observed), previous);
+        }
     }
     /// Arrays are multisets everywhere, with no exceptions: a tuple, a pair, a
     /// row, numbers and nulls are one identity in any order. Multiplicity
@@ -1362,8 +1360,8 @@ mod tests {
         );
         assert_eq!(
             semantic_differences(&recorded, &args(encoded(r#"{"a":1,"b":[2,1]}"#), "m1")),
-            None,
-            "decoded JSON arrays remain positional"
+            Some(vec![IdentityChange::DocumentText("$.request.data".into())]),
+            "decoded JSON uses the existing array comparison"
         );
         assert_eq!(
             semantic_differences(&recorded, &args(encoded(r#"{"a":1,"b":[1,2]}"#), "m2")),

@@ -13,8 +13,8 @@ const MAX_HEADER_PAIRS: usize = 4096;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Context {
     Arguments,
-    Inline,
-    Decoded,
+    Json,
+    Bytes,
 }
 
 /// The paired-serve and independent-order checks belong to the caller.
@@ -119,7 +119,7 @@ pub(super) fn semantic_digest(
     snapshot: Option<&BoundaryPolicySnapshot>,
 ) -> Option<String> {
     semantic_hash(args, boundary, trait_name, method_name, snapshot)
-        .map(|digest| format!("v2:{}", hex::encode(digest)))
+        .map(|digest| format!("v3:{}", hex::encode(digest)))
 }
 
 fn semantic_hash(
@@ -183,7 +183,7 @@ fn semantic_hash(
         }
     }
     let mut hasher = sha2::Sha256::new();
-    hasher.update(b"deja-semantic-argument-v2");
+    hasher.update(b"deja-semantic-argument-v3");
     hash_semantic_value(
         &mut hasher,
         args,
@@ -212,8 +212,8 @@ fn hash_semantic_value(
     use sha2::Digest as _;
     if let Some((source_path, document)) = source {
         if path == source_path {
-            hasher.update(b"encoded-document");
-            return hash_semantic_value(hasher, document, "", Context::Decoded, None, rules);
+            hasher.update(b"document");
+            return hash_semantic_value(hasher, document, "", Context::Json, None, rules);
         }
     }
     let mut scalar = false;
@@ -250,7 +250,7 @@ fn hash_semantic_value(
     if grouped || ignored_header.is_some() {
         return hash_headers(hasher, value.as_array()?, grouped, ignored_header);
     }
-    if context != Context::Decoded {
+    if context != Context::Bytes {
         match deja::identity::captured_body_identity(value) {
             Some(deja::identity::CapturedBodyIdentity::Json(json)) => {
                 hasher.update(b"json-request-body");
@@ -282,18 +282,18 @@ fn hash_semantic_value(
             hash_bytes(hasher, number.to_string().as_bytes());
         }
         Value::String(text) => {
-            if context == Context::Decoded {
+            if context == Context::Bytes {
                 hasher.update(b"string");
                 hash_bytes(hasher, text.as_bytes());
             } else if let Some(document) = deja::identity::embedded_document(text) {
-                hasher.update(b"inline-document");
-                hash_semantic_value(hasher, &document, "", Context::Inline, None, &[])?;
+                hasher.update(b"document");
+                hash_semantic_value(hasher, &document, "", Context::Json, None, &[])?;
             } else if let Some(document) = (context == Context::Arguments)
                 .then(|| deja::identity::semantic_document(text))
                 .flatten()
             {
-                hasher.update(b"encoded-document");
-                hash_semantic_value(hasher, &document, "", Context::Decoded, None, &[])?;
+                hasher.update(b"document");
+                hash_semantic_value(hasher, &document, "", Context::Json, None, &[])?;
             } else {
                 hasher.update(b"string");
                 hash_bytes(hasher, text.as_bytes());
@@ -315,7 +315,7 @@ fn hash_semantic_value(
                 // Deja capture's own byte-string members have positional
                 // bytes; do not mistake their JSON array representation for
                 // an unordered collection.
-                if context != Context::Decoded && deja::identity::is_byte_string(key, child) {
+                if context != Context::Bytes && deja::identity::is_byte_string(key, child) {
                     let targeted_bytes = rules.iter().flatten().any(|rule| {
                         rule_path(rule)
                             .strip_prefix(child_path.as_str())
@@ -326,14 +326,14 @@ fn hash_semantic_value(
                         .flatten()
                     {
                         hasher.update(b"byte-document");
-                        hash_semantic_value(hasher, &document, "", Context::Inline, None, &[])?;
+                        hash_semantic_value(hasher, &document, "", Context::Json, None, &[])?;
                     } else {
                         hasher.update(b"byte-string");
                         hash_semantic_value(
                             hasher,
                             child,
                             &child_path,
-                            Context::Decoded,
+                            Context::Bytes,
                             source,
                             rules,
                         )?;
@@ -346,7 +346,7 @@ fn hash_semantic_value(
         Value::Array(items) => {
             hasher.update(b"array");
             hasher.update((items.len() as u64).to_be_bytes());
-            if context == Context::Decoded {
+            if context == Context::Bytes {
                 for (index, child) in items.iter().enumerate() {
                     let child_path = if rules.is_empty() && source.is_none() {
                         String::new()
@@ -616,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn decoded_strings_remain_literal_under_an_unrelated_allowance() {
+    fn decoded_value_changes_remain_blocking_under_an_unrelated_allowance() {
         let policy = snapshot(
             vec![NoiseTarget::Scalar {
                 json_pointer: "/nonce".into(),
@@ -630,7 +630,7 @@ mod tests {
             })
         };
         let recorded = args(r#"{"amount":1}"#);
-        for changed in [r#"{ "amount":1}"#.to_owned(), encode(r#"{"amount":1}"#)] {
+        for changed in [r#"{"amount":2}"#.to_owned(), encode(r#"{"amount":1}"#)] {
             let observed = args(&changed);
             assert!(deja::identity::semantic_differences(&recorded, &observed).is_none());
             assert!(!matches(recorded.clone(), observed.clone(), &policy));
@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn digests_preserve_inline_tolerances_and_encoded_structure() {
+    fn decoded_document_digests_reuse_existing_json_tolerances() {
         let digest = |args: &Value| semantic_digest(args, "api", "service", "send", None);
         let inline = serde_json::json!({"payload": r#"{"ids":[1,2]}"#});
         let reordered = serde_json::json!({"payload": r#"{"ids":[2,1]}"#});
@@ -654,8 +654,8 @@ mod tests {
             })
         };
         let encoded_inline = encoded(r#"{"ids":[1,2]}"#);
-        assert_ne!(digest(&inline), digest(&encoded_inline));
-        assert_ne!(
+        assert_eq!(digest(&inline), digest(&encoded_inline));
+        assert_eq!(
             digest(&encoded_inline),
             digest(&encoded(r#"{"ids":[2,1]}"#))
         );

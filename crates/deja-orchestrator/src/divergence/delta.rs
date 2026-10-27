@@ -271,12 +271,6 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             m.policy_digest, y.policy_digest
         ));
     }
-    if m.argument_revision != y.argument_revision {
-        return Err(
-            "the runs use incompatible argument scoring revisions; replay a fresh baseline before comparing"
-                .to_owned(),
-        );
-    }
     // The trees hash what each candidate captured, in the encoding of the
     // deja it links. Across two encodings every affected address would read
     // as changed behaviour, so the tape verdict is the one to read there.
@@ -337,8 +331,26 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             .iter()
             .flatten()
             .any(|e| !matches!(e.value, Value::Novel { .. }));
-        let m_side = side_of(me.map(|entry| &entry.value), tape_has);
-        let y_side = side_of(ye.map(|entry| &entry.value), tape_has);
+        let compatible_side = |entry: Option<&super::behaviour_tree::Entry>| {
+            if m.argument_revision != y.argument_revision {
+                if let Some(entry) = entry {
+                    if let Value::Diverged { hash } | Value::Novel { hash } = &entry.value {
+                        if let Some(legacy) = &entry.legacy_hash {
+                            return Ok(Side::Hash(legacy.clone()));
+                        }
+                        if hash.starts_with("semantic:") {
+                            return Err(
+                                "the cached tree lacks legacy argument hashes; rebuild it from the call ledger"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(side_of(entry.map(|entry| &entry.value), tape_has))
+        };
+        let m_side = compatible_side(me)?;
+        let y_side = compatible_side(ye)?;
         let bucket = classify(tape_has, &m_side, &y_side);
         let blocking =
             me.map(|e| e.blocking).unwrap_or(false) || ye.map(|e| e.blocking).unwrap_or(false);
@@ -582,6 +594,7 @@ mod tests {
                 .map(|(address, value)| Entry {
                     address,
                     value,
+                    legacy_hash: None,
                     blocking: true,
                 })
                 .collect(),
@@ -621,18 +634,21 @@ mod tests {
     }
 
     #[test]
-    fn historical_argument_hashes_require_a_fresh_baseline() {
-        let current = tree("y", vec![(call("c", 0), div("semantic:v2:abc"))]);
+    fn historical_argument_hashes_compare_using_compatible_legacy_identity() {
+        let mut current = tree("y", vec![(call("c", 0), div("semantic:v3:abc"))]);
+        current.entries[0].legacy_hash = Some("abc".into());
         for old_hash in ["abc", "semantic:abc"] {
             let mut historical = tree("m", vec![(call("c", 0), div(old_hash))]);
             historical.argument_revision = 0;
-            assert!(three_way(&historical, &current)
-                .unwrap_err()
-                .contains("fresh baseline"));
-            assert!(three_way(&current, &historical)
-                .unwrap_err()
-                .contains("fresh baseline"));
+            if old_hash.starts_with("semantic:") {
+                historical.entries[0].legacy_hash = Some("abc".into());
+            }
+            assert!(three_way(&historical, &current).unwrap().verdict.pass);
+            assert!(three_way(&current, &historical).unwrap().verdict.pass);
             assert!(three_way(&historical, &historical).unwrap().verdict.pass);
+            let mut changed = current.clone();
+            changed.entries[0].legacy_hash = Some("different".into());
+            assert!(!three_way(&historical, &changed).unwrap().verdict.pass);
         }
         assert!(three_way(&current, &current).unwrap().verdict.pass);
     }

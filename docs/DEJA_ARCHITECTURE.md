@@ -352,10 +352,10 @@ The orchestrator adds cause-vs-consequence lanes: `ValueDivergedOrigin` marks th
 
 Argument identity is evaluated **before the scorer declares a request
 divergent**. The comparison-only chain recognizes a bounded standard-base64
-string containing UTF-8 JSON, parses its document, and compares JSON object
-members structurally; decoded arrays remain positional and nested strings
-remain literal. Inline JSON retains its legacy comparison tolerances and is
-never equated with a base64 document. Malformed encodings, non-document text, changed
+string containing UTF-8 JSON, parses its document, and compares the resulting
+value using the existing JSON comparator, including its array-multiset and
+nested-document rules. Inline and encoded documents share that comparison.
+Every existing match keeps its previous result. Malformed encodings, non-document text, changed
 JSON values, and changed surrounding arguments are not treated as equal.
 This scorer rule has no boundary, operation, or vendor condition.
 
@@ -422,10 +422,10 @@ the active revision's approved noise targets. The behavior tree uses that
 digest for a still-divergent call, so three-way delta inherits common semantic
 drift instead of comparing base64 renderings or declared volatile header
 values. Untrusted pairing falls back to the raw hash; no signature is
-cryptographically verified. Tree canon version 7 also retains the argument
-scoring revision recorded in each ledger. Rebuilding a historical cache does
-not upgrade that revision: delta refuses an old/current revision pair and
-requests a fresh baseline replay instead of reporting a false candidate change.
+cryptographically verified. Behavior trees retain the legacy argument hash
+alongside a new semantic hash. Comparisons across scoring revisions use that
+compatible legacy representation, so a parser rollout does not require a fresh
+baseline or turn unchanged historical drift into a candidate regression.
 
 The blocking-vs-drift policy is **built, declared, and judged** — not open. Boundaries declare canonicalization presets applied by the scorer before judging (never by runtime routing): `final_state`, `absent_after`, `project{include,exclude}`. Volatile columns are declared `project:!created_at,!last_synced,!modified_at` on the DB row seams with a matching `reply_canon` on `http_incoming`. Blocking vs non-blocking is explicit in the verdict: seed gaps, order-nondeterminism, and idempotent-delete lines are non-blocking; evidence-gated `inconclusive_race` rows (recognized only when the run's HTTP layer is clean) make the verdict `inconclusive` with an auto-rerun recommendation — a race-only run can never pass.
 

@@ -21132,6 +21132,41 @@ mod tests {
     }
 
     #[test]
+    fn decoded_documents_continue_existing_json_rules_across_scoring_outputs() {
+        for (recorded, observed) in [
+            (
+                r#"{"items":[1,2],"nested":"{\"ids\":[1,2]}"}"#,
+                r#"{"nested":"{\"ids\":[2,1]}","items":[2,1]}"#,
+            ),
+            (
+                r#"{"headers":[["a","1"],["b","2"]]}"#,
+                r#"{"headers":[["b","2"],["a","1"]]}"#,
+            ),
+        ] {
+            for (tier, art) in in_both_tiers(|| {
+                served_encoded_artifacts(
+                    encoded_args(recorded),
+                    encoded_args(observed),
+                    UPSTREAM_CALL,
+                )
+            }) {
+                assert_eq!(detect(&art).summary.value_divergences, 0, "{tier}");
+                let rows = build_ledger(&art).expect("ledger builds");
+                let row = rows
+                    .iter()
+                    .find(|row| row.boundary == "api")
+                    .expect("api call");
+                assert_eq!(row.kind, "matched", "{tier}");
+                let tree = behaviour_tree::build("candidate", &rows, &art.http_diffs);
+                assert!(tree.entries.iter().any(|entry| {
+                    matches!(&entry.address, behaviour_tree::Address::Call { boundary, .. } if boundary == "api")
+                        && matches!(entry.value, behaviour_tree::Value::Reproduced)
+                }), "{tier}");
+            }
+        }
+    }
+
+    #[test]
     fn approved_header_noise_is_nondivergent_until_a_new_revision_revokes_it() {
         use crate::policy::{
             BoundaryPolicyDocument, BoundaryPolicySnapshot, BoundaryRule, BoundarySelector,
@@ -21149,6 +21184,7 @@ mod tests {
         };
         let recorded = encoded(
             serde_json::json!([
+                ["x-signature", "recorded"],
                 ["date", "today"],
                 ["set-cookie", "a=1"],
                 ["set-cookie", "b=2"],
@@ -21158,10 +21194,11 @@ mod tests {
         );
         let reordered = encoded(
             serde_json::json!([
-                ["content-type", "application/json"],
+                ["x-signature", "replay"],
+                ["date", "today"],
                 ["set-cookie", "a=1"],
                 ["set-cookie", "b=2"],
-                ["date", "today"]
+                ["content-type", "application/json"]
             ]),
             200,
         );
@@ -21175,8 +21212,9 @@ mod tests {
                 method_name: "send".into(),
             },
             source_path: Some("/request/data".into()),
-            target: NoiseTarget::HeaderGroup {
+            target: NoiseTarget::HeaderValue {
                 json_pointer: "/headers".into(),
+                name: "x-signature".into(),
             },
         };
         let document = BoundaryPolicyDocument { rules: vec![rule] };
@@ -21206,6 +21244,7 @@ mod tests {
             recorded.clone(),
             encoded(
                 serde_json::json!([
+                    ["x-signature", "replay"],
                     ["date", "today"],
                     ["set-cookie", "a=1"],
                     ["set-cookie", "b=2"],
@@ -21290,7 +21329,7 @@ mod tests {
         );
         let mut signed_candidate = served_encoded_artifacts(
             signed_recorded,
-            signed_args(r#"{"amount":2,"avs":true}"#, "sig-candidate"),
+            signed_args(r#"{"avs":true,"amount":2}"#, "sig-candidate"),
             UPSTREAM_CALL,
         );
         let rule = BoundaryRule {

@@ -49,7 +49,9 @@ use super::ledger::CallRecord;
 /// 7: encoded documents keep nested strings literal; inline documents retain
 ///    legacy array tolerances. Semantic digests carry their own revision so
 ///    rebuilding a historical ledger cannot relabel its old hashes as new.
-pub const CANON_VERSION: u32 = 7;
+/// 8: retain the legacy hash beside semantic call hashes so existing baselines
+///    compare across scorer revisions without requiring another replay.
+pub const CANON_VERSION: u32 = 8;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -120,6 +122,10 @@ pub struct Lane {
 pub struct Entry {
     pub address: Address,
     pub value: Value,
+    /// Pre-parser argument identity for comparisons with historical runs.
+    /// Older entries already carry this representation in `value.hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_hash: Option<String>,
     /// Whether this address blocks a verdict when it diverges — mirrors the
     /// ledger row's `blocking` for calls; responses always block.
     pub blocking: bool,
@@ -404,6 +410,12 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                 recorded_event,
                 occurrence,
             },
+            legacy_hash: row.semantic_digest.as_ref().and_then(|_| {
+                row.observed
+                    .as_ref()
+                    .and_then(|side| side.args.as_ref())
+                    .map(hash_of)
+            }),
             value,
             blocking: row.blocking,
         });
@@ -415,6 +427,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                 correlation: d.correlation_id.clone(),
                 request_sequence: d.request_sequence,
             },
+            legacy_hash: None,
             value: if d.status_match {
                 Value::Reproduced
             } else {
@@ -430,6 +443,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                     correlation: d.correlation_id.clone(),
                     json_path: p.json_path.clone(),
                 },
+                legacy_hash: None,
                 value: Value::Diverged {
                     hash: hash_of(body_diff_value(d, p)),
                 },
@@ -620,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuilding_a_historical_ledger_keeps_its_scoring_revision() {
+    fn historical_ledger_compares_with_new_replay_without_a_fresh_baseline() {
         let mut current = row(
             "value_diverged",
             "c",
@@ -628,7 +642,7 @@ mod tests {
             Some(1),
             serde_json::json!({"amount":2}),
         );
-        current.semantic_digest = Some("v2:observed".into());
+        current.semantic_digest = Some("v3:observed".into());
         let mut old_json = serde_json::to_value(&current).unwrap();
         old_json
             .as_object_mut()
@@ -637,14 +651,27 @@ mod tests {
         old_json.as_object_mut().unwrap().remove("semantic_digest");
         let historical: CallRecord = serde_json::from_value(old_json).unwrap();
         let baseline = build("m", &[historical], &[]);
-        let candidate = build("y", &[current], &[]);
+        let candidate = build("y", &[current.clone()], &[]);
         assert_eq!(baseline.canon_version, candidate.canon_version);
         assert_eq!(baseline.argument_revision, 0);
         let rebuilt = BehaviourTree::from_jsonl(&baseline.to_jsonl()).unwrap();
         assert_eq!(rebuilt.argument_revision, 0);
-        assert!(super::super::delta::three_way(&rebuilt, &candidate)
-            .unwrap_err()
-            .contains("fresh baseline"));
+        assert!(
+            super::super::delta::three_way(&rebuilt, &candidate)
+                .expect("historical baseline remains compatible")
+                .verdict
+                .pass
+        );
+        let mut changed = current;
+        changed.observed.as_mut().unwrap().args = Some(serde_json::json!({"amount":3}));
+        changed.semantic_digest = Some("v3:changed".into());
+        let changed_tree = build("y-changed", &[changed], &[]);
+        assert!(
+            !super::super::delta::three_way(&rebuilt, &changed_tree)
+                .expect("real changes remain comparable")
+                .verdict
+                .pass
+        );
     }
 
     /// A call served from its own recorded error reproduced the recording, so
