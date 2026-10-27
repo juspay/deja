@@ -498,6 +498,7 @@ mod tests {
             label: None,
             github: None,
             delta_against: None,
+            boundary_policy: None,
             purpose: None,
             mode: RunMode::Replay,
             candidate_spec: CandidateSpec::PrebuiltImage {

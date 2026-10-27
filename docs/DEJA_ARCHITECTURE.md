@@ -350,6 +350,83 @@ After the replay run, the observed and shadow boundary calls are compared agains
 
 The orchestrator adds cause-vs-consequence lanes: `ValueDivergedOrigin` marks the originating read so downstream consequences are attributed to it, alongside omitted/novel/environmental/`inconclusive_race` lanes.
 
+Argument identity is evaluated **before the scorer declares a request
+divergent**. The comparison-only chain recognizes a bounded standard-base64
+string containing UTF-8 JSON, parses its document, and compares the resulting
+value using the existing JSON comparator, including its array-multiset and
+nested-document rules. Inline and encoded documents share that comparison.
+Every existing match keeps its previous result. Malformed encodings, non-document text, changed
+JSON values, and changed surrounding arguments are not treated as equal.
+This scorer rule has no boundary, operation, or vendor condition.
+
+A fixed candidate image still executes its own compiled lookup policy. If it
+used the args-free fallback, it will have stamped `arg_divergent` before the
+orchestrator observes the call. The scorer checks that the call paired with
+the *recorded event it actually served*, then evaluates the generic semantic
+chain **before its own divergence verdict**. It does not change lookup keys,
+the candidate's flag, the recording, or the candidate image. An unpaired
+serve or independent order mismatch remains blocking.
+
+The encoded-JSON semantic comparison is a **hardened rule in Deja code**.
+For residual differences it cannot prove equivalent, an authenticated
+maintainer can append a temporary **per-system noise rule** selecting an
+exact boundary/trait/method and one typed target: a scalar JSON Pointer,
+header-name group presentation, or one named header value. The source can be
+raw arguments or a declared JSON Pointer to base64-encoded UTF-8 JSON.
+Everything outside approved targets is still compared; repeated values of
+one header name retain their order. Approving a signature value declares
+noise; Deja has no signing key and does **not** verify its HMAC.
+
+One proposal **appends or revokes exactly one rule** against the expected
+active revision. The **Deja replay service's state Postgres**, not the
+system-under-test database, stores the resulting complete rule set as an
+immutable, audited snapshot; it is not an unrestricted policy replacement.
+A different signed-in maintainer confirms it once; the active allowance then
+applies automatically to every future replay in its declared system and
+operation scope until revoked. No per-run approval is required. Proposal-base and active-pointer
+checks refuse stale confirmations, so an earlier proposal cannot undo a
+newer append. Revocation removes the rule from future runs without mutating
+previous revisions, pinned run snapshots, or raw ledger arguments. When no
+rules are active, new runs carry no noise-policy digest.
+
+An explicit `DEJA_DB_URL` enables maintainer rules in **Deja's** state
+Postgres, independently of any system-under-test database. If it is
+unreachable, Compose replay proceeds file-backed with **no newly loaded
+allowances**: known noise may reappear, but no difference is silently
+approved. A validated snapshot already read remains pinned even if its
+later catalog write fails. An invalid fetched document or digest is an
+integrity error and still refuses admission. Direct Kubernetes execution
+without scheduling retains its existing behavior.
+
+Queued Kubernetes runs (`scheduler_capacity > 0`) cannot use that fallback:
+the capacity scheduler discovers runs only through Deja's store. Without a
+connected store or a successfully inserted run row, admission returns 503
+before creating a Job and removes any just-created run file. Retry after
+database recovery; restart the orchestrator if it booted without a store,
+so its scheduler starts. This is a scheduler dependency, not a noise-rule
+requirement.
+
+Maintainer changes and policy preview require the connected Deja store.
+Without an explicitly configured rule store, Compose replay retains its
+prior file-only behavior and cannot activate maintainer rules. Dashboard
+preview streams bounded historical ledger classifications without payloads
+and refuses to promise absorption without trusted pairing. Only a new replay
+proves the full effect. Three-way delta refuses comparisons across different
+pinned rule digests rather than presenting differently judged runs as one
+candidate change.
+
+When both replays make the same genuine JSON change from the tape but encode
+it differently, a trustworthy paired ledger row carries a semantic digest of
+the observed arguments. The digest canonicalizes decoded documents and only
+the active revision's approved noise targets. The behavior tree uses that
+digest for a still-divergent call, so three-way delta inherits common semantic
+drift instead of comparing base64 renderings or declared volatile header
+values. Untrusted pairing falls back to the raw hash; no signature is
+cryptographically verified. Behavior trees retain the legacy argument hash
+alongside a new semantic hash. Comparisons across scoring revisions use that
+compatible legacy representation, so a parser rollout does not require a fresh
+baseline or turn unchanged historical drift into a candidate regression.
+
 The blocking-vs-drift policy is **built, declared, and judged** — not open. Boundaries declare canonicalization presets applied by the scorer before judging (never by runtime routing): `final_state`, `absent_after`, `project{include,exclude}`. Volatile columns are declared `project:!created_at,!last_synced,!modified_at` on the DB row seams with a matching `reply_canon` on `http_incoming`. Blocking vs non-blocking is explicit in the verdict: seed gaps, order-nondeterminism, and idempotent-delete lines are non-blocking; evidence-gated `inconclusive_race` rows (recognized only when the run's HTTP layer is clean) make the verdict `inconclusive` with an auto-rerun recommendation — a race-only run can never pass.
 
 The comparator produces a `ReplayReport` and a scorecard containing a Summary (matched/total correlations, side-effect and value divergences, inconclusive races/seed gaps), per-boundary and per-correlation breakdowns, warnings, and a three-state `Verdict {pass, inconclusive, reason}`. Latency/resource scoring does not exist today; if added it would be future work.

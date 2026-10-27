@@ -26,6 +26,8 @@
 
 use serde_json::Value;
 
+/// Maximum size of decoded JSON accepted by the scorer-only base64 path.
+const MAX_ENCODED_DOCUMENT_BYTES: usize = 1024 * 1024;
 /// A captured request body is hashed by its content (see
 /// `replay::hash_request_body`); its identity is that content's, so two calls
 /// the exact hash finds the same are always the same identity.
@@ -93,6 +95,191 @@ pub fn identity_differences(recorded: &Value, observed: &Value) -> Option<Vec<Id
     Some(changes)
 }
 
+/// Scorer-only identity chain: decode eligible base64 UTF-8 JSON documents
+/// before deciding whether a paired call's arguments differ. This deliberately
+/// does not change `same`, `identity_args_hash`, or lookup policy: a fixed
+/// candidate still probes the addresses its compiled runtime understands.
+///
+/// The legacy comparison runs first. Decoding is one additional parser stage:
+/// a parsed document goes straight back through the existing JSON comparator,
+/// including its array and nested-document rules.
+pub fn semantic_differences(recorded: &Value, observed: &Value) -> Option<Vec<IdentityChange>> {
+    if let Some(changes) = identity_differences(recorded, observed) {
+        return Some(changes);
+    }
+    let mut changes = Vec::new();
+    if !semantic_same(recorded, observed, "$", &mut changes) {
+        return None;
+    }
+    changes.sort();
+    Some(changes)
+}
+
+fn semantic_same(
+    recorded: &Value,
+    observed: &Value,
+    path: &str,
+    changes: &mut Vec<IdentityChange>,
+) -> bool {
+    if same(recorded, observed) {
+        differences(recorded, observed, path, changes);
+        return true;
+    }
+    match (recorded, observed) {
+        (Value::String(left), Value::String(right)) => {
+            let (Some(left), Some(right)) = (semantic_document(left), semantic_document(right))
+            else {
+                return false;
+            };
+            if !same(&left, &right) {
+                return false;
+            }
+            changes.push(IdentityChange::DocumentText(path.to_owned()));
+            true
+        }
+        (Value::Object(left), Value::Object(right)) if is_json_request_body(left) => {
+            is_json_request_body(right)
+                && semantic_same(
+                    &left["json"],
+                    &right["json"],
+                    &format!("{path}.json"),
+                    changes,
+                )
+        }
+        (Value::Object(left), Value::Object(right)) if left.len() == right.len() => {
+            if is_json_request_body(right)
+                || is_form_request_body(left)
+                || is_form_request_body(right)
+            {
+                return false;
+            }
+            left.iter().all(|(key, value)| {
+                let Some(other) = right.get(key) else {
+                    return false;
+                };
+                if is_byte_string(key, value) || is_byte_string(key, other) {
+                    return member_same(key, value, other);
+                }
+                semantic_same(value, other, &format!("{path}.{key}"), changes)
+            })
+        }
+        (Value::Array(left), Value::Array(right)) if left.len() == right.len() => {
+            let Some(partners) = semantic_matching(left, right) else {
+                return false;
+            };
+            if partners
+                .iter()
+                .enumerate()
+                .any(|(index, partner)| index != *partner)
+            {
+                changes.push(IdentityChange::ArrayOrder(path.to_owned()));
+            }
+            left.iter()
+                .zip(partners)
+                .enumerate()
+                .all(|(index, (value, partner))| {
+                    semantic_same(value, &right[partner], &format!("{path}[{index}]"), changes)
+                })
+        }
+        _ => false,
+    }
+}
+
+/// The lookup hash is deliberately unchanged. This hash is only a bucket key
+/// for the scorer's fallback matching; every candidate is confirmed by
+/// `semantic_same`, so collisions cannot turn different calls into matches.
+fn semantic_hash(value: &Value) -> u64 {
+    let tagged = |tag: u64, inner: u64| finalise(tag ^ inner.rotate_left(17));
+    match value {
+        Value::String(text) => semantic_document(text)
+            .map(|document| tagged(0x7365_6d64_6f63, element_hash(&document)))
+            .unwrap_or_else(|| element_hash(value)),
+        Value::Object(map) if is_json_request_body(map) => {
+            tagged(0x626f_6479, semantic_hash(&map["json"]))
+        }
+        Value::Object(map) if is_form_request_body(map) => element_hash(value),
+        Value::Object(map) => {
+            let sum = map.iter().fold(0u64, |sum, (key, member)| {
+                let member_hash = if is_byte_string(key, member) {
+                    match byte_document(member) {
+                        Some(document) => tagged(0x0062_7974_6564_6f63, element_hash(&document)),
+                        None => tagged(0x6279_7465, element_hash(member)),
+                    }
+                } else {
+                    semantic_hash(member)
+                };
+                let key_hash = crate::fnv1a_str(crate::FNV_OFFSET_BASIS, key);
+                sum.wrapping_add(finalise(key_hash ^ member_hash.rotate_left(29)))
+            });
+            tagged(0x7365_6d6f_626a, sum)
+        }
+        Value::Array(items) => {
+            let sum = items
+                .iter()
+                .fold(0u64, |sum, item| sum.wrapping_add(semantic_hash(item)));
+            tagged(0x7365_6d61_7272, sum)
+        }
+        _ => element_hash(value),
+    }
+}
+
+fn semantic_matching(left: &[Value], right: &[Value]) -> Option<Vec<usize>> {
+    use std::collections::{HashMap, VecDeque};
+    if left.len() != right.len() {
+        return None;
+    }
+    let mut buckets: HashMap<u64, VecDeque<usize>> = HashMap::new();
+    let left_hashes: Vec<_> = left.iter().map(semantic_hash).collect();
+    let right_hashes: Vec<_> = right.iter().map(semantic_hash).collect();
+    for (index, hash) in right_hashes.iter().enumerate() {
+        buckets.entry(*hash).or_default().push_back(index);
+    }
+    let mut used = vec![false; right.len()];
+    let mut partners = vec![None; left.len()];
+    for (index, value) in left.iter().enumerate() {
+        if left_hashes[index] == right_hashes[index]
+            && semantic_same(value, &right[index], "", &mut Vec::new())
+        {
+            used[index] = true;
+            partners[index] = Some(index);
+        }
+    }
+    for (index, value) in left.iter().enumerate() {
+        if partners[index].is_some() {
+            continue;
+        }
+        let hash = left_hashes[index];
+        let bucket = buckets.get_mut(&hash)?;
+        let position = bucket.iter().position(|&other| {
+            !used[other] && semantic_same(value, &right[other], "", &mut Vec::new())
+        })?;
+        let other = bucket.remove(position)?;
+        used[other] = true;
+        partners[index] = Some(other);
+    }
+    partners.into_iter().collect()
+}
+
+/// A bounded inline or standard-base64 UTF-8 JSON object/array. The scorer
+/// uses the same chain for pairwise comparison and its semantic delta digest.
+pub fn semantic_document(text: &str) -> Option<Value> {
+    embedded_document(text).or_else(|| encoded_document(text))
+}
+
+fn encoded_document(text: &str) -> Option<Value> {
+    use base64::Engine as _;
+    if text.len() < 4 || text.len() > MAX_ENCODED_DOCUMENT_BYTES * 2 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .ok()?;
+    if bytes.len() > MAX_ENCODED_DOCUMENT_BYTES {
+        return None;
+    }
+    embedded_document(std::str::from_utf8(&bytes).ok()?)
+}
+
 /// Whether two values are one identity: arrays compared as multisets, objects
 /// by key, a document in a string as that document, a byte string and a
 /// number as written.
@@ -147,7 +334,7 @@ fn member_same(key: &str, value: &Value, other: &Value) -> bool {
 }
 
 /// A byte string's text, when it is UTF-8 holding a JSON object or array.
-fn byte_document(value: &Value) -> Option<Value> {
+pub fn byte_document(value: &Value) -> Option<Value> {
     let bytes: Vec<u8> = value
         .as_array()?
         .iter()
@@ -157,7 +344,7 @@ fn byte_document(value: &Value) -> Option<Value> {
 }
 
 /// A byte string in deja's capture: one of its byte members, holding bytes.
-fn is_byte_string(key: &str, value: &Value) -> bool {
+pub fn is_byte_string(key: &str, value: &Value) -> bool {
     BYTE_STRING_MEMBERS.contains(&key)
         && value.as_array().is_some_and(|items| {
             items
@@ -357,6 +544,30 @@ fn is_json_request_body(map: &serde_json::Map<String, Value>) -> bool {
         && map.get("json").is_some_and(|json| !json.is_null())
 }
 
+/// Capture-specific identity shared by the scorer and its argument digest.
+/// JSON bodies use their parsed payload; form bodies use the exact multiset
+/// of fields. Wire-rendering metadata is not part of either body's identity.
+pub enum CapturedBodyIdentity<'a> {
+    Json(&'a Value),
+    Form(Vec<String>),
+}
+
+pub fn captured_body_identity(value: &Value) -> Option<CapturedBodyIdentity<'_>> {
+    let map = value.as_object()?;
+    if is_json_request_body(map) {
+        Some(CapturedBodyIdentity::Json(&map["json"]))
+    } else if is_form_request_body(map) {
+        let mut fields: Vec<_> = crate::replay::request_body_text(map)?
+            .split('&')
+            .map(str::to_owned)
+            .collect();
+        fields.sort_unstable();
+        Some(CapturedBodyIdentity::Form(fields))
+    } else {
+        None
+    }
+}
+
 /// Where two values with one identity differ as written. Both sides have the
 /// same shape wherever this descends, because they are one identity. A
 /// reordered array is reported, and each of its members is still followed to
@@ -412,6 +623,128 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn base64(text: &str) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let bytes = text.as_bytes();
+        let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let a = chunk[0];
+            let b = *chunk.get(1).unwrap_or(&0);
+            let c = *chunk.get(2).unwrap_or(&0);
+            encoded.push(TABLE[(a >> 2) as usize] as char);
+            encoded.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize] as char);
+            encoded.push(if chunk.len() > 1 {
+                TABLE[(((b & 15) << 2) | (c >> 6)) as usize] as char
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                TABLE[(c & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        encoded
+    }
+
+    #[test]
+    fn semantic_comparison_accepts_generic_encoded_boundary_documents() {
+        let recorded = json!({
+            "boundary": "ledger",
+            "args": { "payload": base64(r#"{"nested":{"b":2,"a":1}}"#) }
+        });
+        let reordered = json!({
+            "boundary": "ledger",
+            "args": { "payload": base64(r#"{"nested":{"a":1,"b":2}}"#) }
+        });
+        assert!(identity_differences(&recorded, &reordered).is_none());
+        assert!(semantic_differences(&recorded, &reordered).is_some());
+    }
+
+    #[test]
+    fn semantic_comparison_detects_encoded_value_changes() {
+        let recorded = json!({ "payload": base64(r#"{"nested":{"value":1}}"#) });
+        let changed = json!({ "payload": base64(r#"{"nested":{"value":2}}"#) });
+        assert!(semantic_differences(&recorded, &changed).is_none());
+    }
+
+    #[test]
+    fn semantic_comparison_keeps_malformed_or_ciphertext_exact() {
+        let malformed = json!({ "payload": "not base64" });
+        let other = json!({ "payload": "also not base64" });
+        assert!(semantic_differences(&malformed, &other).is_none());
+
+        let ciphertext = json!({ "payload": base64("opaque ciphertext") });
+        let different_ciphertext = json!({ "payload": base64("other ciphertext") });
+        assert!(semantic_differences(&ciphertext, &different_ciphertext).is_none());
+    }
+
+    #[test]
+    fn decoded_arrays_continue_through_existing_multiset_comparison() {
+        let recorded = json!({ "payload": base64(r#"{"items":[1,2]}"#) });
+        let reordered = json!({ "payload": base64(r#"{"items":[2,1]}"#) });
+        assert!(semantic_differences(&recorded, &reordered).is_some());
+    }
+
+    #[test]
+    fn inline_and_encoded_documents_use_the_same_json_comparison() {
+        let inline = json!({ "payload": r#"{"a":1}"# });
+        let encoded = json!({ "payload": base64(r#"{"a":1}"#) });
+        assert!(identity_differences(&inline, &encoded).is_none());
+        assert!(semantic_differences(&inline, &encoded).is_some());
+    }
+
+    #[test]
+    fn encoded_documents_preserve_transitive_existing_json_identity() {
+        let inline = json!({"payload": "[1,2]"});
+        let reordered = json!({"payload": "[2,1]"});
+        let encoded = json!({"payload": base64("[1,2]")});
+        assert!(semantic_differences(&inline, &reordered).is_some());
+        assert!(semantic_differences(&inline, &encoded).is_some());
+        assert!(semantic_differences(&reordered, &encoded).is_some());
+    }
+
+    #[test]
+    fn encoded_documents_reuse_nested_json_and_numeric_identity() {
+        let args = |document: &str| json!({"payload": base64(document)});
+        assert!(semantic_differences(
+            &args(r#"{"nested":"{\"a\":1}"}"#),
+            &args(r#"{"nested":"{ \"a\":1}"}"#),
+        )
+        .is_some());
+        assert!(semantic_differences(&args("[-0.0]"), &args("[0.0]")).is_none());
+        assert!(semantic_differences(&json!(-0.0), &json!(0.0)).is_none());
+        assert!(semantic_differences(&json!({"x":-0.0}), &json!({"x":0.0})).is_none());
+    }
+
+    #[test]
+    fn preexisting_matches_keep_their_exact_comparison_result() {
+        let pairs = [
+            (json!({"items":[1,2,1]}), json!({"items":[1,1,2]})),
+            (
+                json!({"doc":r#"{"ids":[1,2]}"#}),
+                json!({"doc":r#"{"ids":[2,1]}"#}),
+            ),
+            (
+                json!({"Bytes":br#"{"a":1,"b":2}"#}),
+                json!({"Bytes":br#"{"b":2,"a":1}"#}),
+            ),
+            (
+                json!({"kind":"JsonRequestBody","json":{"ids":[1,2]},"raw_bytes":[1]}),
+                json!({"kind":"JsonRequestBody","json":{"ids":[2,1]},"raw_bytes":[2]}),
+            ),
+            (
+                json!({"kind":"FormUrlEncodedRequestBody","raw_bytes":b"a=1&b=2"}),
+                json!({"kind":"FormUrlEncodedRequestBody","raw_bytes":b"b=2&a=1"}),
+            ),
+        ];
+        for (recorded, observed) in pairs {
+            let previous = identity_differences(&recorded, &observed);
+            assert!(previous.is_some());
+            assert_eq!(semantic_differences(&recorded, &observed), previous);
+        }
+    }
     /// Arrays are multisets everywhere, with no exceptions: a tuple, a pair, a
     /// row, numbers and nulls are one identity in any order. Multiplicity
     /// counts: a repeated member is not the same as one.
@@ -1005,6 +1338,87 @@ mod tests {
             Some(vec![IdentityChange::ArrayOrder(
                 "$.body.json.ids".to_owned()
             )])
+        );
+    }
+
+    #[test]
+    fn encoded_json_is_compared_semantically_only_by_the_scorer() {
+        use base64::Engine as _;
+        let encoded = |document: &str| base64::engine::general_purpose::STANDARD.encode(document);
+        let args = |data: String, merchant: &str| json!({"method":"POST","request":{"data":data,"merchant":merchant}});
+        let recorded = args(encoded(r#"{"a":1,"b":[1,2]}"#), "m1");
+        let reordered = args(encoded(r#"{"b":[1,2],"a":1}"#), "m1");
+        assert_eq!(identity_differences(&recorded, &reordered), None);
+        assert_eq!(
+            semantic_differences(&recorded, &reordered),
+            Some(vec![IdentityChange::DocumentText("$.request.data".into())])
+        );
+        assert_eq!(
+            semantic_differences(&recorded, &args(encoded(r#"{"a":2,"b":[1,2]}"#), "m1")),
+            None,
+            "changed JSON values are not representation noise"
+        );
+        assert_eq!(
+            semantic_differences(&recorded, &args(encoded(r#"{"a":1,"b":[2,1]}"#), "m1")),
+            Some(vec![IdentityChange::DocumentText("$.request.data".into())]),
+            "decoded JSON uses the existing array comparison"
+        );
+        assert_eq!(
+            semantic_differences(&recorded, &args(encoded(r#"{"a":1,"b":[1,2]}"#), "m2")),
+            None,
+            "other argument fields remain exact"
+        );
+        assert_eq!(
+            semantic_differences(
+                &args(encoded("not json"), "m1"),
+                &args(encoded("different"), "m1")
+            ),
+            None,
+            "non-document text is not silently normalized"
+        );
+    }
+
+    #[test]
+    fn outer_multiset_order_and_encoded_json_rendering_can_change_together() {
+        use base64::Engine as _;
+        let encoded = |document: &str| base64::engine::general_purpose::STANDARD.encode(document);
+        let recorded = json!([
+            {"operation":"a","data":encoded(r#"{"x":1,"y":2}"#)},
+            {"operation":"b","data":"unchanged"}
+        ]);
+        let observed = json!([
+            {"operation":"b","data":"unchanged"},
+            {"operation":"a","data":encoded(r#"{"y":2,"x":1}"#)}
+        ]);
+        assert_eq!(identity_differences(&recorded, &observed), None);
+        assert_eq!(
+            semantic_differences(&recorded, &observed),
+            Some(vec![
+                IdentityChange::ArrayOrder("$".into()),
+                IdentityChange::DocumentText("$[0].data".into()),
+            ])
+        );
+    }
+
+    #[test]
+    fn encoded_document_chain_keeps_existing_json_tolerances_elsewhere() {
+        use base64::Engine as _;
+        let encoded = |document: &str| base64::engine::general_purpose::STANDARD.encode(document);
+        let recorded = json!({
+            "encoded": encoded(r#"{"x":1,"y":2}"#),
+            "plain": r#"{"ids":[1,2]}"#
+        });
+        let observed = json!({
+            "encoded": encoded(r#"{"y":2,"x":1}"#),
+            "plain": r#"{"ids":[2,1]}"#
+        });
+        assert_eq!(identity_differences(&recorded, &observed), None);
+        assert_eq!(
+            semantic_differences(&recorded, &observed),
+            Some(vec![
+                IdentityChange::DocumentText("$.encoded".into()),
+                IdentityChange::DocumentText("$.plain".into()),
+            ])
         );
     }
 }
