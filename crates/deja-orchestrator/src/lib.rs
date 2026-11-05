@@ -10,7 +10,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-
 pub mod api;
 pub mod artifact_kinds;
 pub mod auth;
@@ -22,6 +21,7 @@ pub mod divergence;
 pub mod executor;
 pub mod lifecycle;
 pub mod lookup;
+pub mod policy;
 pub mod s3;
 pub mod scope;
 /// The declared configuration, defined in `deja-compactor` and re-exported here
@@ -521,6 +521,9 @@ pub struct RunSpec {
     /// the tape-relative verdict reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta_against: Option<String>,
+    /// Immutable maintainer policy pinned when the run is admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_policy: Option<policy::BoundaryPolicySnapshot>,
     /// Why the run exists, when it is not a candidate under test: `baseline`
     /// for a replay of main that other runs are measured against. Displayed;
     /// never acted on.
@@ -647,6 +650,9 @@ pub struct RunParams {
     pub expectation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta_against: Option<String>,
+    /// Immutable boundary argument policy selected when the run was admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary_policy: Option<policy::BoundaryPolicySnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,6 +688,7 @@ impl RunParams {
             scored_span_namespaces: spec.effective_scored_span_namespaces(),
             expectation: expectation.map(str::to_owned),
             delta_against: spec.delta_against.clone(),
+            boundary_policy: spec.boundary_policy.clone(),
             purpose: spec.purpose.clone(),
             label: spec.label.clone(),
             github: spec.github.clone(),
@@ -1558,6 +1565,7 @@ mod run_params_tests {
             label: None,
             github: None,
             delta_against: None,
+            boundary_policy: None,
             purpose: None,
             scored_span_namespaces: Vec::new(),
             mode: RunMode::Replay,

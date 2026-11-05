@@ -42,7 +42,16 @@ use super::ledger::CallRecord;
 /// 5: a whole-body difference the kernel could only report as raw bytes is
 ///    hashed by the candidate's decoded body, so the map order serialised
 ///    into those bytes is not behaviour either.
-pub const CANON_VERSION: u32 = 5;
+/// 6: paired argument verdicts use semantic JSON and pinned maintainer noise
+///    rules; divergent tree values hash normalized semantic arguments rather
+///    than representation bytes. The run's immutable policy digest is part of
+///    its comparison identity.
+/// 7: encoded documents keep nested strings literal; inline documents retain
+///    legacy array tolerances. Semantic digests carry their own revision so
+///    rebuilding a historical ledger cannot relabel its old hashes as new.
+/// 8: retain the legacy hash beside semantic call hashes so existing baselines
+///    compare across scorer revisions without requiring another replay.
+pub const CANON_VERSION: u32 = 8;
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -113,6 +122,10 @@ pub struct Lane {
 pub struct Entry {
     pub address: Address,
     pub value: Value,
+    /// Pre-parser argument identity for comparisons with historical runs.
+    /// Older entries already carry this representation in `value.hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_hash: Option<String>,
     /// Whether this address blocks a verdict when it diverges — mirrors the
     /// ledger row's `blocking` for calls; responses always block.
     pub blocking: bool,
@@ -122,6 +135,10 @@ pub struct Entry {
 pub struct BehaviourTree {
     pub run_id: String,
     pub canon_version: u32,
+    /// The scorer revision retained by the ledger, independent of the cache
+    /// version used to rebuild this projection.
+    #[serde(default)]
+    pub argument_revision: u32,
     pub entries: Vec<Entry>,
     /// The lane each correlation ran in, from its connector call.
     pub lanes: HashMap<String, Lane>,
@@ -138,6 +155,9 @@ pub struct BehaviourTree {
     /// when these agree; otherwise an encoding change reads as behaviour.
     #[serde(default)]
     pub event_schema_versions: BTreeSet<u32>,
+    /// Immutable boundary policy used for this run; absent on legacy runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_digest: Option<String>,
 }
 
 /// The event schema versions named in an observed stream. Every event carries
@@ -315,15 +335,21 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             lanes.entry(correlation.clone()).or_insert(lane);
         }
         let observed_hash = || {
-            row.observed
-                .as_ref()
-                .and_then(|s| s.args.as_ref())
-                .map(hash_of)
-                .unwrap_or_else(|| "∅".to_owned())
+            row.semantic_digest.as_ref().map_or_else(
+                || {
+                    row.observed
+                        .as_ref()
+                        .and_then(|side| side.args.as_ref())
+                        .map(hash_of)
+                        .unwrap_or_else(|| "∅".to_owned())
+                },
+                |digest| format!("semantic:{digest}"),
+            )
         };
         let value = match row.kind.as_str() {
             // A served call returned exactly the value the recording holds.
             "matched"
+            | "approved_noise"
             | "recovered"
             | "identity_skew"
             | "deterministic"
@@ -384,6 +410,12 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                 recorded_event,
                 occurrence,
             },
+            legacy_hash: row.semantic_digest.as_ref().and_then(|_| {
+                row.observed
+                    .as_ref()
+                    .and_then(|side| side.args.as_ref())
+                    .map(hash_of)
+            }),
             value,
             blocking: row.blocking,
         });
@@ -395,6 +427,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                 correlation: d.correlation_id.clone(),
                 request_sequence: d.request_sequence,
             },
+            legacy_hash: None,
             value: if d.status_match {
                 Value::Reproduced
             } else {
@@ -410,6 +443,7 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                     correlation: d.correlation_id.clone(),
                     json_path: p.json_path.clone(),
                 },
+                legacy_hash: None,
                 value: Value::Diverged {
                     hash: hash_of(body_diff_value(d, p)),
                 },
@@ -420,10 +454,16 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
     BehaviourTree {
         run_id: run_id.to_owned(),
         canon_version: CANON_VERSION,
+        argument_revision: rows
+            .iter()
+            .map(|row| row.argument_revision)
+            .min()
+            .unwrap_or(super::ledger::ARGUMENT_REVISION),
         entries,
         lanes,
         correlations,
         event_schema_versions: BTreeSet::new(),
+        policy_digest: None,
     }
 }
 
@@ -465,10 +505,12 @@ impl BehaviourTree {
             &serde_json::json!({
                 "run_id": self.run_id,
                 "canon_version": self.canon_version,
+                "argument_revision": self.argument_revision,
                 "entries": self.entries.len(),
                 "lanes": self.lanes,
                 "correlations": self.correlations,
                 "event_schema_versions": self.event_schema_versions,
+                "policy_digest": self.policy_digest,
             })
             .to_string(),
         );
@@ -500,6 +542,7 @@ impl BehaviourTree {
         Some(Self {
             run_id: head.get("run_id")?.as_str()?.to_owned(),
             canon_version: head.get("canon_version")?.as_u64()? as u32,
+            argument_revision: head.get("argument_revision")?.as_u64()?.try_into().ok()?,
             entries,
             lanes: serde_json::from_value(head.get("lanes")?.clone()).ok()?,
             correlations: serde_json::from_value(head.get("correlations")?.clone()).ok()?,
@@ -507,6 +550,7 @@ impl BehaviourTree {
                 head.get("event_schema_versions")?.clone(),
             )
             .ok()?,
+            policy_digest: head.get("policy_digest")?.as_str().map(str::to_owned),
         })
     }
 
@@ -520,6 +564,22 @@ impl BehaviourTree {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn policy_digest_roundtrips_and_rejects_old_draft_cache_header() {
+        let mut tree = build("run", &[], &[]);
+        tree.policy_digest = Some("policy-sha256".into());
+        let encoded = tree.to_jsonl();
+        assert_eq!(
+            BehaviourTree::from_jsonl(&encoded).unwrap().policy_digest,
+            tree.policy_digest
+        );
+
+        // The superseded draft's version-6 header lacked the policy key.
+        // Refuse that cache even though its numeric version happens to match:
+        // its call entries were built under different semantics.
+        let prior_draft = encoded.replace(",\"policy_digest\":\"policy-sha256\"", "");
+        assert!(BehaviourTree::from_jsonl(&prior_draft).is_none());
+    }
     use super::*;
     use crate::divergence::ledger::CallSide;
 
@@ -531,9 +591,12 @@ mod tests {
         args: serde_json::Value,
     ) -> CallRecord {
         CallRecord {
+            argument_revision: super::super::ledger::ARGUMENT_REVISION,
             correlation_id: Some(corr.to_owned()),
             source_event_global_sequence: source_seq,
             served_event_global_sequence: None,
+            semantic_pair: false,
+            semantic_digest: None,
             boundary: "http_outgoing".to_owned(),
             trait_name: "svc".to_owned(),
             method_name: "call_connector_api".to_owned(),
@@ -568,6 +631,47 @@ mod tests {
         let c =
             serde_json::json!({"url": "https://api.x.com/v1", "headers": [["a", "1"], ["b", "3"]]});
         assert_ne!(hash_of(&a), hash_of(&c), "a header VALUE is behaviour");
+    }
+
+    #[test]
+    fn historical_ledger_compares_with_new_replay_without_a_fresh_baseline() {
+        let mut current = row(
+            "value_diverged",
+            "c",
+            "span",
+            Some(1),
+            serde_json::json!({"amount":2}),
+        );
+        current.semantic_digest = Some("v3:observed".into());
+        let mut old_json = serde_json::to_value(&current).unwrap();
+        old_json
+            .as_object_mut()
+            .unwrap()
+            .remove("argument_revision");
+        old_json.as_object_mut().unwrap().remove("semantic_digest");
+        let historical: CallRecord = serde_json::from_value(old_json).unwrap();
+        let baseline = build("m", &[historical], &[]);
+        let candidate = build("y", &[current.clone()], &[]);
+        assert_eq!(baseline.canon_version, candidate.canon_version);
+        assert_eq!(baseline.argument_revision, 0);
+        let rebuilt = BehaviourTree::from_jsonl(&baseline.to_jsonl()).unwrap();
+        assert_eq!(rebuilt.argument_revision, 0);
+        assert!(
+            super::super::delta::three_way(&rebuilt, &candidate)
+                .expect("historical baseline remains compatible")
+                .verdict
+                .pass
+        );
+        let mut changed = current;
+        changed.observed.as_mut().unwrap().args = Some(serde_json::json!({"amount":3}));
+        changed.semantic_digest = Some("v3:changed".into());
+        let changed_tree = build("y-changed", &[changed], &[]);
+        assert!(
+            !super::super::delta::three_way(&rebuilt, &changed_tree)
+                .expect("real changes remain comparable")
+                .verdict
+                .pass
+        );
     }
 
     /// A call served from its own recorded error reproduced the recording, so

@@ -86,6 +86,17 @@ function RunHeader({ run }: { run: RunRow }) {
                 : "not recorded"}
           </dd>
         </div>
+        {params?.boundary_policy && (
+          <div>
+            <dt>boundary policy</dt>
+            <dd className="mono" title={params.boundary_policy.digest}>
+              {params.boundary_policy.revision_id === null
+                ? "strict · no active revision"
+                : `revision ${params.boundary_policy.revision_id}`}
+              {" · "}{params.boundary_policy.digest.slice(0, 21)}…
+            </dd>
+          </div>
+        )}
         <div>
           <dt>run by</dt>
           <dd>{run.created_by}</dd>
