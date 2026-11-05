@@ -4332,12 +4332,23 @@ fn remove_unadmitted_run(root: &HarnessRoot, id: &str) -> std::io::Result<()> {
     let id: RunId = id
         .parse()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-    let path = confined(root.run_path(&id), &root.root.join("runs")).ok_or_else(|| {
-        std::io::Error::new(
+    let base = root.root.join("runs").canonicalize()?;
+    let expected = base.join(format!("{id}.json"));
+    let path = expected.canonicalize()?;
+    // Keep the guard beside the deletion: the resolved path must be both
+    // confined and the exact run leaf, never a symlink's sibling target.
+    if !path.starts_with(&base) {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "unadmitted run record is missing or outside the run store",
-        )
-    })?;
+            "unadmitted run record is outside the run store",
+        ));
+    }
+    if path != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "unadmitted run record resolves to another file",
+        ));
+    }
     std::fs::remove_file(path)
 }
 
@@ -6923,6 +6934,12 @@ mod tests {
         std::fs::write(&path, "{}").unwrap();
         remove_unadmitted_run(&root, "queued-run").unwrap();
         assert!(!path.exists());
+        assert_eq!(
+            remove_unadmitted_run(&root, "missing-run")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
 
         let outside = dir.path().join("outside.json");
         std::fs::write(&outside, "keep").unwrap();
@@ -6934,6 +6951,15 @@ mod tests {
             std::os::unix::fs::symlink(&outside, root.run_path("linked-run")).unwrap();
             assert!(remove_unadmitted_run(&root, "linked-run").is_err());
             assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+
+            let sibling = root.run_path("admitted-run");
+            std::fs::write(&sibling, "already admitted").unwrap();
+            std::os::unix::fs::symlink(&sibling, root.run_path("redirected-run")).unwrap();
+            assert!(remove_unadmitted_run(&root, "redirected-run").is_err());
+            assert_eq!(
+                std::fs::read_to_string(&sibling).unwrap(),
+                "already admitted"
+            );
         }
     }
 
