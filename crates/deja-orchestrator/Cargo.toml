@@ -42,7 +42,7 @@ flate2 = "1"
 # apiserver); the CA trust root is loaded from the pod's mounted SA cert, which
 # needs rustls directly (versions pinned to ureq 2.12's own rustls 0.23).
 ureq = { version = "2", features = ["json"] }
-rustls = "0.23"
+rustls = "0.23.46"
 rustls-pemfile = "2"
 mime_guess = "2"
 serde = { version = "1", features = ["derive"] }
