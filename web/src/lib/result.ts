@@ -200,7 +200,7 @@ export function resultOf(run: ScoredRun): RunResult {
       state: "REPRODUCED",
       label: "reproduced",
       tone: "good",
-      headline: `${matched} of ${total} recorded request${total === 1 ? "" : "s"} reproduced exactly`,
+      headline: `${matched} of ${total} recorded request${total === 1 ? "" : "s"} accepted by the replay comparison`,
       detail: reason,
       guard: null,
     };

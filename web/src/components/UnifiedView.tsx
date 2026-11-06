@@ -1,7 +1,7 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
-import { api, CallRecord, GraphNode, HttpDiff, Scorecard, SpanShapeOutcome } from "../lib/api";
+import { api, CallRecord, GraphNode, Scorecard, SpanShapeOutcome } from "../lib/api";
 import {
   ancestorKeys,
   buildSpine,
@@ -12,12 +12,12 @@ import {
   MARK_ORDER,
   Side,
   SpineNode,
-  transportFailure,
 } from "../lib/spine";
-import { diffArgs, LeafDiff, summarizeLeaves } from "../lib/argdiff";
+import { diffArgs, LeafDiff } from "../lib/argdiff";
 import { useSystems } from "../lib/systems";
 import { JsonView, ValuePair } from "./JsonView";
-import { JsonDiff } from "./JsonDiff";
+import { CallComparison, ResponseEvidence } from "./Comparison";
+import { callComparisonText } from "../lib/comparison";
 import { ConfidenceBadge, levelForRank } from "./Confidence";
 import { evidenceOf } from "../lib/evidence";
 
@@ -72,26 +72,20 @@ function siteOf(c: CallRecord): string {
 
 /* ------------------------------------------------------------- leaf diffing */
 
-/**
- * A ciphertext byte array. `argdiff`'s `isObj` already excludes arrays, so one
- * of these is a single leaf rather than 47 — but rendered raw it is still 47
- * integers of noise. It is CLASSIFIED here, not deleted: the leaf still appears,
- * labelled with why it cannot match.
- */
-function ciphertextBytes(v: unknown): number | null {
+/** Compact raw numeric-array rendering; no cryptographic meaning is inferred. */
+function numericArrayLength(v: unknown): number | null {
   return Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === "number") ? v.length : null;
 }
 
 function LeafRow({ d }: { d: LeafDiff }) {
-  const a = ciphertextBytes(d.recorded);
-  const b = ciphertextBytes(d.candidate);
+  const a = numericArrayLength(d.recorded);
+  const b = numericArrayLength(d.candidate);
   return (
     <div className="leafdiff">
       <div className="jpath">{d.path || "(value)"}</div>
       {a != null && b != null ? (
         <div className="suppressed">
-          ciphertext — {a} bytes recorded, {b} replayed. Encrypted with a fresh per-value nonce, so
-          the bytes differ by construction; this is not evidence about the candidate.
+          captured numeric arrays — {a} elements recorded, {b} replayed. Read the scorer's comparison above for their behavioral classification.
         </div>
       ) : d.highlight ? (
         <div className="strhl">
@@ -109,16 +103,12 @@ function LeafRow({ d }: { d: LeafDiff }) {
 
 function FieldDiff({ recorded, candidate }: { recorded: unknown; candidate: unknown }) {
   const leaves = React.useMemo(() => diffArgs(recorded, candidate), [recorded, candidate]);
-  const cipher = leaves.filter(
-    (d) => ciphertextBytes(d.recorded) != null && ciphertextBytes(d.candidate) != null,
-  ).length;
   if (leaves.length === 0)
-    return <p className="hint">the two values are structurally identical at every leaf.</p>;
+    return <p className="hint">This raw inspection found no displayed leaf differences. The scorer's judgment is shown above.</p>;
   return (
     <>
       <p className="hint">
-        {leaves.length} changed leaf{leaves.length === 1 ? "" : "s"}
-        {cipher > 0 ? ` — ${cipher} of them ciphertext that cannot match` : ""}.
+        {leaves.length} displayed raw difference{leaves.length === 1 ? "" : "s"}. These highlights do not decide the verdict.
       </p>
       <div className="argdiff">
         {leaves.map((d, i) => (
@@ -134,6 +124,7 @@ function FieldDiff({ recorded, candidate }: { recorded: unknown; candidate: unkn
 function CallHead({ c }: { c: CallRecord }) {
   const rank = c.resolved_rank;
   return (
+    <>
     <div className="evhead">
       <span className="bm">
         <b>{c.boundary}</b>·{c.method_name}
@@ -144,6 +135,8 @@ function CallHead({ c }: { c: CallRecord }) {
       {c.blocking && <span className="chip fail">blocking</span>}
       <span className="where">{siteOf(c)}</span>
     </div>
+    <CallComparison call={c} />
+    </>
   );
 }
 
@@ -219,9 +212,11 @@ function ValueDiverged({ e }: { e: CallEntry }) {
       )}
       {stopped ? (
         <>
-          <h4>arguments</h4>
-          <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
-          <FullArguments c={c} />
+          <details className="evraw">
+            <summary>Raw captured arguments</summary>
+            <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
+            <FullArguments c={c} />
+          </details>
           <h4>result</h4>
           <p className="hint">
             No replayed result: the call was refused before it ran, so there is nothing to set
@@ -234,10 +229,13 @@ function ValueDiverged({ e }: { e: CallEntry }) {
         </>
       ) : (
         <>
-          <h4>result</h4>
-          <FieldDiff recorded={c.recorded?.result} candidate={c.observed?.result} />
           <details className="evraw">
-            <summary>arguments</summary>
+            <summary>Raw captured result</summary>
+            <FieldDiff recorded={c.recorded?.result} candidate={c.observed?.result} />
+            <ValuePair baseline={c.recorded?.result} candidate={c.observed?.result} />
+          </details>
+          <details className="evraw">
+            <summary>Raw captured arguments</summary>
             <FieldDiff recorded={c.recorded?.args} candidate={c.observed?.args} />
             <FullArguments c={c} />
           </details>
@@ -535,75 +533,18 @@ function Matched({ e }: { e: CallEntry }) {
     <div className="evidence ev-matched">
       <CallHead c={c} />
       <SplitSpans e={e} />
-      <p className="evwhat">Reconciled: this call was found on both sides and its values agree.</p>
-      <HttpCallFacts e={e} />
+      <p className="evwhat">Reconciled by the scorer's call classification.</p>
+      <details className="evraw"><summary>Raw captured connector-call facts</summary><HttpCallFacts e={e} /></details>
       {c.recorded?.args !== undefined && (
         <details className="evraw">
-          <summary>recorded arguments</summary>
-          <JsonView value={c.recorded.args} />
+          <summary>Raw captured arguments, recorded and replayed</summary>
+          <ValuePair baseline={c.recorded.args} candidate={c.observed?.args} />
         </details>
       )}
       <details className="evraw">
-        <summary>recorded value</summary>
-        <JsonView value={c.recorded?.result} />
+        <summary>Raw captured result, recorded and replayed</summary>
+        <ValuePair baseline={c.recorded?.result} candidate={c.observed?.result} />
       </details>
-    </div>
-  );
-}
-
-/**
- * RESPONSE — what the caller saw.
- *
- * ONE FAILURE, NOT 156. Each of the three live diffs carries 54 body leaves of
- * which 53 are `candidate: null` and one is the parse error itself; the scorer
- * counts 156 `BodyMismatch` + 3 `StatusMismatch` across the run. They all say
- * the same single thing — there was no response to compare — so that is what
- * this renders, with the flattened fields available but subordinate.
- */
-function Response({ d }: { d: HttpDiff }) {
-  const failed = transportFailure(d);
-  const missing = d.body_diff.filter((f) => f.candidate === null).length;
-  return (
-    <div className="evidence ev-http">
-      <div className="evhead">
-        <span className="bm">
-          <b>{d.request_path}</b> · seq {d.request_sequence}
-        </span>
-        <span className="statuspill">
-          <span className="ok">{d.status_baseline}</span> <span className="sep">→</span>{" "}
-          <span className="bad">{failed ? "no response" : d.status_candidate}</span>
-        </span>
-      </div>
-      {failed ? (
-        <>
-          <p className="evwhat">
-            <b>The candidate returned no HTTP response that could be parsed</b> — &ldquo;{failed}
-            &rdquo;. This is one failure.
-          </p>
-          <p className="evlimit">
-            The {missing} recorded response field{missing === 1 ? "" : "s"} below are reported as
-            differing only because there was nothing on the other side to compare them to. They are
-            a consequence of the missing response, not {missing} separate findings — and because the
-            response never parsed, this run cannot say whether the candidate&rsquo;s behaviour
-            changed.
-          </p>
-          <details className="evraw">
-            <summary>
-              the {missing} recorded field{missing === 1 ? "" : "s"} and the recorded body
-            </summary>
-            <JsonView value={d.baseline_body} clamp={false} />
-          </details>
-        </>
-      ) : (
-        <>
-          <p className="evwhat">
-            {d.status_match
-              ? `The status matched; ${d.body_diff.length} response field${d.body_diff.length === 1 ? "" : "s"} differ.`
-              : `The recorded response was ${d.status_baseline}; the candidate answered ${d.status_candidate}.`}
-          </p>
-          <JsonDiff before={d.baseline_body} after={d.candidate_body} />
-        </>
-      )}
     </div>
   );
 }
@@ -784,12 +725,14 @@ function SpanDetail({
   onPick,
   boundaryNotes,
   graphIndex,
+  scorecard,
 }: {
   node: SpineNode;
   selected: { nodeId: number | null; side: Side };
   onPick: (nodeId: number, side: Side) => void;
   boundaryNotes: Record<string, string | null>;
   graphIndex: GraphIndex;
+  scorecard?: Scorecard | null;
 }) {
   // A row is a SITE. When it holds several instances the panel enumerates them
   // and each one is separately addressable, because `(correlation, span_path)`
@@ -844,7 +787,7 @@ function SpanDetail({
         <SpanFields node={node} graphIndex={graphIndex} selected={selected} />
         {empty && <NoEvidence n={node} />}
         {node.http.map((d, i) => (
-          <Response key={`h${i}`} d={d} />
+          <ResponseEvidence key={`h${i}`} diff={d} scorecard={scorecard} />
         ))}
         {node.calls.map((e, i) => {
           const k = e.call.kind;
@@ -864,7 +807,7 @@ function SpanDetail({
           // verdict sentence on the row's own flag). A kind added to the
           // scorer tomorrow must degrade to "no panel yet, here are the values",
           // never to a claim of agreement.
-          if (k === "matched" || k === "recovered" || k === "deterministic")
+          if (k === "matched" || k === "recovered" || k === "deterministic" || k === "approved_noise")
             return <Matched key={i} e={e} />;
           return <UnrecognisedKind key={i} e={e} />;
         })}
@@ -929,50 +872,12 @@ function Row({
   );
 }
 
-/**
- * What changed on this row's value-divergence, in one line beside its chip —
- * the first changed leaf of recorded-vs-attempted arguments — so the tree
- * already answers "what" and the panel is for "why".
- */
+/** The published explanation beside the call's existing structural mark. */
 function RowChange({ n }: { n: SpineNode }) {
-  const summary = React.useMemo(() => {
-    const e = n.calls.find(
-      (c) =>
-        c.call.kind === "value_diverged" &&
-        c.call.recorded?.args !== undefined &&
-        c.call.observed?.args !== undefined,
-    );
-    if (!e) return null;
-    const s = summarizeLeaves(diffArgs(e.call.recorded!.args, e.call.observed!.args), 1);
-    // A flagged row whose leaves all compare EQUAL differs only in ORDER — the
-    // two sides serialise differently, `diffArgs` descends, and every key
-    // matches. Returning null here rendered nothing at all, so the commonest
-    // divergence we have (26 of 27 blocking body mismatches on the run this
-    // viewer exists for are `payment_methods_enabled` ordering) showed a
-    // divergence chip beside an empty explanation. Saying "order only" is not a
-    // guess: it is what an empty leaf-diff on a flagged row MEANS.
-    return { leaves: s, orderOnly: s.shown.length === 0 };
-  }, [n.calls]);
-  if (!summary) return null;
-  if (summary.orderOnly) {
-    return (
-      <span
-        className="uvwhat mono"
-        title="the two sides hold the same values in a different order — no leaf differs"
-      >
-        <span className="jpath">order only</span>
-      </span>
-    );
-  }
-  const l = summary.leaves.shown[0];
-  return (
-    <span className="uvwhat mono" title={`${l.path}: ${l.recorded} → ${l.candidate}`}>
-      <span className="jpath">{l.path}</span>
-      <del>{l.recorded}</del>
-      <ins>{l.candidate}</ins>
-      {summary.leaves.more > 0 && <span className="fmore">+{summary.leaves.more}</span>}
-    </span>
-  );
+  const entry = n.calls.find((e) => e.call.kind === "value_diverged" || e.call.comparison?.verdict.kind === "absorbed");
+  if (!entry) return null;
+  const text = callComparisonText(entry.call);
+  return <span className="uvwhat" title={text}>{text}</span>;
 }
 
 /* ------------------------------------------------------------------- view  */
@@ -1036,8 +941,9 @@ export default function UnifiedView({
     () =>
       buildSpine(evidence.calls, graph.data, evidence.https, spanShapes, {
         promoteInternal: showLattice,
+        scorecard,
       }),
-    [evidence, graph.data, spanShapes, showLattice],
+    [evidence, graph.data, spanShapes, showLattice, scorecard],
   );
 
   const boundaryNotes = React.useMemo(() => {
@@ -1294,6 +1200,7 @@ export default function UnifiedView({
             onPick={(nodeId, side) => select(selectedNode, { nodeId, side })}
             boundaryNotes={boundaryNotes}
             graphIndex={graphIndex}
+            scorecard={scorecard}
           />
         )}
       </div>

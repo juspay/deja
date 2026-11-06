@@ -279,6 +279,10 @@ pub struct Scorecard {
     /// revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_digest: Option<String>,
+    /// The HTTP decisions used by this scorecard, published for downstream
+    /// projections so accepted kernel differences are not charged again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_comparison: Option<HttpComparison>,
     pub summary: Summary,
     pub per_boundary: BTreeMap<String, BoundaryStats>,
     pub per_correlation: Vec<CorrelationOutcome>,
@@ -636,6 +640,7 @@ impl Scorecard {
             run_id,
             recording_id: None,
             policy_digest: None,
+            http_comparison: None,
             summary: Summary {
                 uncorrelated_events_tolerated: true,
                 ..Summary::default()
@@ -2560,8 +2565,9 @@ fn call_site_label(obs: &ObservedCall) -> String {
 /// handled here" from their presence. The labels ARE shared with
 /// `ClauseSource` — `recorder`, `default` — so a consumer aggregating
 /// absorptions across both engines reads one vocabulary; a test pins that.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueCanonSource {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueCanonSource {
     /// A `bag` clause on the recorded event — stamped by the codec from the
     /// boundary's own contract, or declared statically at the site.
     Recorder,
@@ -2579,8 +2585,9 @@ impl ValueCanonSource {
 }
 
 /// Why two matched values that are not equal were not counted as a divergence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueAbsorption {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "source", rename_all = "snake_case")]
+pub enum ValueAbsorption {
     /// An order-only difference, forgiven by a clause or by the default. THIS
     /// is the number the strict flip waits on: when the default goes, every
     /// `Default` here becomes a divergence and every `Recorder` stays green.
@@ -2608,11 +2615,141 @@ enum ValueAbsorption {
 
 /// The comparison of a matched call's recorded and observed values, with its
 /// reason, so a caller can SAY why a difference stopped counting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ValueVerdict {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "reason", rename_all = "snake_case")]
+pub enum ValueVerdict {
     Equal,
     Absorbed(ValueAbsorption),
     Diverged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonSubject {
+    Arguments,
+    Result,
+}
+
+/// The scorer's actual operand and decision. This contains an identity only,
+/// while the original operands remain on the ledger's recorded/observed sides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallComparison {
+    pub version: u32,
+    pub subject: ComparisonSubject,
+    pub verdict: ValueVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_identity: Option<String>,
+    /// Independent existing equivalence rules. Their namespaces include the
+    /// rule parameters, and each rule starts from the original candidate value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_alternatives: Vec<String>,
+}
+
+/// Compact decisions shared by the scorecard and streamed ledger. No captured
+/// argument/result payload is copied into this preparation.
+pub(crate) struct PreparedCallComparisons {
+    pairing: CallPairing,
+    arguments: Vec<Option<ValueVerdict>>,
+    results: Vec<Option<ValueVerdict>>,
+}
+
+impl PreparedCallComparisons {
+    fn new(
+        art: &RunArtifacts,
+        events: &HashMap<u64, &deja::BoundaryEvent>,
+        pairing: CallPairing,
+    ) -> Self {
+        let arguments = art
+            .observed
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                pairing.twin(index).map(|twin| {
+                    pair_request_verdict(
+                        call,
+                        events.get(&twin.sequence).copied(),
+                        art.boundary_policy.as_ref(),
+                    )
+                })
+            })
+            .collect();
+        let results = art
+            .observed
+            .iter()
+            .map(|call| {
+                observed_value_verdict(
+                    call,
+                    call.source_event_global_sequence
+                        .and_then(|seq| events.get(&seq).copied()),
+                )
+            })
+            .collect();
+        Self {
+            pairing,
+            arguments,
+            results,
+        }
+    }
+}
+
+#[cfg(test)]
+fn result_comparison(
+    obs: &ObservedCall,
+    event: Option<&deja::BoundaryEvent>,
+) -> Option<CallComparison> {
+    result_comparison_from_verdict(obs, event, observed_value_verdict(obs, event)?)
+}
+
+fn result_comparison_from_verdict(
+    obs: &ObservedCall,
+    event: Option<&deja::BoundaryEvent>,
+    verdict: ValueVerdict,
+) -> Option<CallComparison> {
+    // A substituted value was not independently executed and has no candidate
+    // result to judge. Keep that distinction even when it is called an origin.
+    if obs.provenance != deja::Provenance::Shadow {
+        return None;
+    }
+    let observed = obs.observed_result.as_ref()?;
+    let mut alternatives = Vec::new();
+    if is_db_boundary(&obs.boundary) {
+        alternatives.push(format!(
+            "result:db-infrastructure:v1:{:016x}",
+            written_hash(&db_normalize_infra(observed), true)
+        ));
+    }
+    for clause in event.map(event_value_clauses).unwrap_or_default() {
+        match clause {
+            CanonPreset::FinalState => {
+                alternatives.push(format!(
+                    "result:final-state:v1:{:016x}",
+                    written_hash(&final_state_canon(observed), true)
+                ));
+            }
+            CanonPreset::Project { include, exclude } => {
+                let projection = project_canon(observed, &include, &exclude);
+                if projection.matched {
+                    let parameters = serde_json::json!({"include":include,"exclude":exclude});
+                    alternatives.push(format!(
+                        "result:project:v1:{:016x}:{:016x}",
+                        written_hash(&parameters, true),
+                        written_hash(&projection.value, true)
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(CallComparison {
+        version: 1,
+        subject: ComparisonSubject::Result,
+        verdict,
+        candidate_identity: Some(format!(
+            "result:v1:{:016x}",
+            deja::identity::identity_args_hash(observed)
+        )),
+        candidate_alternatives: alternatives,
+    })
 }
 
 /// What a pair SENT, judged. A pair is one call whose address missed only by its
@@ -4347,8 +4484,9 @@ fn document_clauses_for(
 }
 
 /// Which source supplied the clause that governed a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClauseSource {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClauseSource {
     /// No declaration: order carries no meaning unless a path says otherwise.
     Default,
     Recorder,
@@ -4747,11 +4885,30 @@ fn hidden_form_bodies_equivalent(diff: &HttpDiff) -> bool {
 /// is the generic declaration for exactly that and is honoured below — schema
 /// knowledge belongs in a declaration made by whoever owns the semantics, never
 /// in this file.
-fn order_canonical_diff(
+/// Whether the kernel's existing form parser applies anywhere in a document.
+/// This is context discovery, independent of whether that form changed: two
+/// candidates with the same meaningful drift must use the same residual sites.
+fn contains_kernel_form(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.values().any(contains_kernel_form),
+        serde_json::Value::Array(items) => items.iter().any(contains_kernel_form),
+        serde_json::Value::String(text) => {
+            if let Some(document) = deja::identity::embedded_document(text) {
+                contains_kernel_form(&document)
+            } else {
+                deja_kernel::diff_form_strings(text, text, "$", &[]).is_some()
+            }
+        }
+        _ => false,
+    }
+}
+
+fn order_canonical_diff_into(
     baseline: &serde_json::Value,
     candidate: &serde_json::Value,
     path: &str,
     out: &mut Vec<JsonFieldDiff>,
+    strict_form_paths: &mut Vec<String>,
 ) {
     if baseline == candidate {
         return;
@@ -4763,11 +4920,12 @@ fn order_canonical_diff(
             keys.dedup();
             for key in keys {
                 let next = format!("{path}.{key}");
-                order_canonical_diff(
+                order_canonical_diff_into(
                     b.get(key).unwrap_or(&serde_json::Value::Null),
                     c.get(key).unwrap_or(&serde_json::Value::Null),
                     &next,
                     out,
+                    strict_form_paths,
                 );
             }
         }
@@ -4801,7 +4959,7 @@ fn order_canonical_diff(
                 // once order carries no information, a position cannot be
                 // reported as though it did.
                 let next = format!("{path}[{index}]");
-                order_canonical_diff(
+                order_canonical_diff_into(
                     only_baseline
                         .get(index)
                         .copied()
@@ -4812,7 +4970,48 @@ fn order_canonical_diff(
                         .unwrap_or(&serde_json::Value::Null),
                     &next,
                     out,
+                    strict_form_paths,
                 );
+            }
+        }
+        (serde_json::Value::String(b), serde_json::Value::String(c)) => {
+            // Match the kernel's JSON-before-form precedence. Otherwise an
+            // inline JSON document containing '&' and '=' can be mistaken for
+            // one outer form and lose the strictness of its nested form keys.
+            if let (Some(b), Some(c)) = (
+                deja::identity::embedded_document(b),
+                deja::identity::embedded_document(c),
+            ) {
+                let form_context = contains_kernel_form(&b) || contains_kernel_form(&c);
+                let mut document_rows = Vec::new();
+                let mut document_forms = Vec::new();
+                order_canonical_diff_into(&b, &c, path, &mut document_rows, &mut document_forms);
+                if !form_context || document_rows.is_empty() {
+                    // Ordinary inline documents keep their existing string
+                    // site: reconciliation records where the kernel judged
+                    // their rendering equivalent, and the classifier retains
+                    // its document-text reason instead of relabeling it order.
+                    out.push(JsonFieldDiff {
+                        json_path: path.to_owned(),
+                        baseline: baseline.clone(),
+                        candidate: candidate.clone(),
+                    });
+                } else {
+                    out.extend(document_rows);
+                    strict_form_paths.extend(document_forms);
+                }
+            } else if let Some(rows) = deja_kernel::diff_form_strings(b, c, path, &[]) {
+                // Keep the form site even when every key matched, so an outer
+                // inline document still follows the kernel's parsed reading.
+                strict_form_paths.push(path.to_owned());
+                strict_form_paths.extend(rows.iter().map(|row| row.json_path.clone()));
+                out.extend(rows);
+            } else {
+                out.push(JsonFieldDiff {
+                    json_path: path.to_owned(),
+                    baseline: baseline.clone(),
+                    candidate: candidate.clone(),
+                });
             }
         }
         (b, c) => out.push(JsonFieldDiff {
@@ -4821,6 +5020,16 @@ fn order_canonical_diff(
             candidate: c.clone(),
         }),
     }
+}
+
+#[cfg(test)]
+fn order_canonical_diff(
+    baseline: &serde_json::Value,
+    candidate: &serde_json::Value,
+    path: &str,
+    out: &mut Vec<JsonFieldDiff>,
+) {
+    order_canonical_diff_into(baseline, candidate, path, out, &mut Vec::new());
 }
 
 /// Is this row an ordering difference — two arrays with identical members in a
@@ -4843,7 +5052,7 @@ pub(crate) fn json_order_only_difference(
 
 /// A hash of a member as written, every rendering included, and key order
 /// too unless `keys_sorted`.
-fn written_hash(member: &serde_json::Value, keys_sorted: bool) -> u64 {
+pub(crate) fn written_hash(member: &serde_json::Value, keys_sorted: bool) -> u64 {
     use sha2::{Digest, Sha256};
     fn feed(hasher: &mut Sha256, value: &serde_json::Value, keys_sorted: bool) {
         match value {
@@ -5330,6 +5539,7 @@ fn embedded_document_pairs(
 fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
     let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
     let mut rows = Vec::new();
+    let mut strict_form_paths = Vec::new();
     // A non-JSON body carrying JSON documents is compared as those documents,
     // when the text around them is identical. Only at the root: a JSON body is
     // never re-scanned.
@@ -5342,17 +5552,24 @@ fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
     let embedded_document_paths = match &embedded {
         Some(pairs) => {
             for (index, (b, c)) in pairs.iter().enumerate() {
-                order_canonical_diff(b, c, &format!("$.~embedded[{index}]"), &mut rows);
+                order_canonical_diff_into(
+                    b,
+                    c,
+                    &format!("$.~embedded[{index}]"),
+                    &mut rows,
+                    &mut strict_form_paths,
+                );
             }
             vec!["$".to_owned()]
         }
         None => {
-            order_canonical_diff(baseline, candidate, "$", &mut rows);
+            order_canonical_diff_into(baseline, candidate, "$", &mut rows, &mut strict_form_paths);
             Vec::new()
         }
     };
     let mut reconciled = reconciled_with_kernel(rows, &diff.body_diff);
     reconciled.embedded_document_paths = embedded_document_paths;
+    reconciled.strict_form_paths = strict_form_paths;
     // The invariant holds in BOTH directions: the recompute may re-shape the
     // kernel's findings and may not invent one — and may not erase one either.
     // A kernel row that no surviving recompute row speaks about was not
@@ -5397,6 +5614,8 @@ struct Reconciliation {
     kernel_equivalent_paths: Vec<String>,
     /// Texts that were compared as the JSON documents embedded in them.
     embedded_document_paths: Vec<String>,
+    /// Kernel form-key residuals whose repeated values retain their order.
+    strict_form_paths: Vec<String>,
 }
 
 /// Is a difference reported at `inner` the same difference as, or part of, one
@@ -5471,36 +5690,63 @@ fn reconciled_with_kernel(
         rows,
         kernel_equivalent_paths,
         embedded_document_paths: Vec::new(),
+        strict_form_paths: Vec::new(),
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct HttpBodyClassification {
-    blocking_leaf_count: usize,
-    schema_derived_paths: Vec<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpBodyResidual {
+    #[serde(flatten)]
+    pub diff: JsonFieldDiff,
+    pub candidate_identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpResponseComparison {
+    pub correlation_id: String,
+    pub request_sequence: u64,
+    pub body: HttpBodyClassification,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpComparison {
+    pub version: u32,
+    pub responses: Vec<HttpResponseComparison>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpBodyClassification {
+    pub blocking_leaf_count: usize,
+    pub blocking: Vec<HttpBodyResidual>,
+    pub schema_derived_paths: Vec<String>,
     /// Paths whose difference is a permutation and nothing else. Still counted
     /// as blocking — they are named here so the report can SAY that a
     /// difference was ordering, not so it can stop reporting it.
-    order_only_paths: Vec<String>,
+    pub order_only_paths: Vec<String>,
     /// Differences a reply-canon clause governed, with the source that supplied
     /// it. Named and NOT counted as blocking.
-    canon_absorbed: Vec<(String, ClauseSource)>,
+    pub canon_absorbed: Vec<(String, ClauseSource)>,
     /// Paths the two sources described differently. Named AND still blocking —
     /// a disagreement about what a path means must never decide that a
     /// difference does not exist.
-    canon_conflicts: Vec<String>,
+    pub canon_conflicts: Vec<String>,
     /// Paths the order-canonical recompute reported at and the kernel judged the
     /// same — an encoded value whose serialisation order differed, or a path the
     /// run's body allowlist covers. Named and NOT counted as blocking.
-    kernel_equivalent_paths: Vec<String>,
+    pub kernel_equivalent_paths: Vec<String>,
     /// Texts compared as the JSON documents embedded in them. Named and NOT
     /// counted as blocking; what differs inside the documents is classified
     /// like any other row.
-    embedded_document_paths: Vec<String>,
+    pub embedded_document_paths: Vec<String>,
     /// Strings holding a JSON document written differently, at each string's
     /// own site. Named and NOT counted as blocking: the document is the same,
     /// its text is not.
-    document_text_paths: Vec<String>,
+    pub document_text_paths: Vec<String>,
+    /// Body leaves the same race evidence proved attributable to an
+    /// inconclusive result; they are not blocking HTTP differences.
+    pub race_absorbed_paths: Vec<String>,
+    /// Hidden-form field permutations accepted by the existing form parser.
+    pub hidden_form_paths: Vec<String>,
 }
 
 /// A JSON path reduced to the form a declaration is written in: every array
@@ -5563,7 +5809,14 @@ fn classify_http_body_diff(
 ) -> HttpBodyClassification {
     let (race, provenance) = (ctx.race, ctx.provenance);
     if hidden_form_bodies_equivalent(diff) {
-        return HttpBodyClassification::default();
+        return HttpBodyClassification {
+            hidden_form_paths: diff
+                .body_diff
+                .iter()
+                .map(|body| body.json_path.clone())
+                .collect(),
+            ..HttpBodyClassification::default()
+        };
     }
     let mut classification = HttpBodyClassification::default();
     // Ordering is resolved BEFORE anything is classified, so every absorber
@@ -5581,6 +5834,10 @@ fn classify_http_body_diff(
         .map(|r| r.embedded_document_paths.clone())
         .unwrap_or_default();
     for body in rows {
+        let strict_form = reconciled
+            .as_ref()
+            .is_some_and(|r| r.strict_form_paths.contains(&body.json_path));
+        let mut row_conflicted = false;
         // Existing explicit absorptions retain precedence over schema
         // provenance; one leaf is classified exactly once.
         match canon_verdict_for(diff, recorded_http, body, ctx.document_clauses) {
@@ -5592,10 +5849,14 @@ fn classify_http_body_diff(
             CanonVerdict::Conflict => {
                 classification.canon_conflicts.push(body.json_path.clone());
                 conflicted = true;
+                row_conflicted = true;
             }
             CanonVerdict::NotGoverned => {}
         }
         if race.http_body_diff_attributable(&diff.correlation_id, body) {
+            classification
+                .race_absorbed_paths
+                .push(body.json_path.clone());
             continue;
         }
         if json_diff_leaf_field(&body.json_path).is_some_and(|column| {
@@ -5605,7 +5866,7 @@ fn classify_http_body_diff(
                 .schema_derived_paths
                 .push(body.json_path.clone());
         } else {
-            if is_order_only_difference(body) {
+            if !strict_form && is_order_only_difference(body) {
                 // Order carries no meaning unless this path says it does. The
                 // members are identical as a multiset, so nothing was added,
                 // removed or changed; what moved was the order a collection was
@@ -5620,10 +5881,68 @@ fn classify_http_body_diff(
                 }
                 classification.order_only_paths.push(body.json_path.clone());
             }
-            classification.blocking_leaf_count += 1;
+            // A conflict retains the written order; an ordinary residual uses
+            // the same JSON identity that accepted the surrounding permutations.
+            let candidate_identity = if row_conflicted || strict_form {
+                format!("written:v1:{:016x}", written_hash(&body.candidate, true))
+            } else {
+                format!(
+                    "identity:v1:{:016x}",
+                    deja::identity::identity_args_hash(&body.candidate)
+                )
+            };
+            classification.blocking.push(HttpBodyResidual {
+                diff: body.clone(),
+                candidate_identity,
+            });
         }
     }
+    classification.blocking_leaf_count = classification.blocking.len();
     classification
+}
+
+fn prepare_http_comparison(
+    art: &RunArtifacts,
+    incoming: &HashMap<String, &deja::BoundaryEvent>,
+    race: &InconclusiveRaceEvidence,
+    provenance: &CorrelationColumnProvenance,
+) -> HttpComparison {
+    let clauses = document_clauses_for(&art.reply_canons, "http_incoming");
+    HttpComparison {
+        version: 1,
+        responses: art
+            .http_diffs
+            .iter()
+            .map(|diff| HttpResponseComparison {
+                correlation_id: diff.correlation_id.clone(),
+                request_sequence: diff.request_sequence,
+                body: classify_http_body_diff(
+                    diff,
+                    incoming.get(&diff.correlation_id).copied(),
+                    BodyClassificationContext {
+                        race,
+                        provenance,
+                        document_clauses: &clauses,
+                    },
+                ),
+            })
+            .collect(),
+    }
+}
+
+fn http_clean_from_comparison(
+    diffs: &[HttpDiff],
+    comparison: &HttpComparison,
+) -> HashMap<String, bool> {
+    let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
+    for (diff, decision) in diffs.iter().zip(&comparison.responses) {
+        let clean = diff.status_match && decision.body.blocking.is_empty();
+        clean_by_correlation
+            .entry(diff.correlation_id.clone())
+            .and_modify(|existing| *existing &= clean)
+            .or_insert(clean);
+    }
+    clean_by_correlation
 }
 
 fn json_contains_value(haystack: &serde_json::Value, needle: &serde_json::Value) -> bool {
@@ -5945,46 +6264,19 @@ fn tail_gap_evidence(
     TailGapEvidence { tail_begins_at }
 }
 
-/// Per-correlation HTTP cleanliness: status matched AND no blocking body leaf.
-/// A correlation carrying several responses is clean only if every one of them
-/// is, mirroring the `corr_http` fold the per-correlation outcomes use.
-fn http_clean_by_correlation(
-    http_diffs: &[HttpDiff],
-    http_incoming_by_correlation: &HashMap<String, &deja::BoundaryEvent>,
-    inconclusive_race: &InconclusiveRaceEvidence,
-    column_provenance: &CorrelationColumnProvenance,
-    document_clauses: &[CanonPreset],
-) -> HashMap<String, bool> {
-    let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
-    for diff in http_diffs {
-        let clean = diff.status_match
-            && classify_http_body_diff(
-                diff,
-                http_incoming_by_correlation
-                    .get(&diff.correlation_id)
-                    .copied(),
-                BodyClassificationContext {
-                    race: inconclusive_race,
-                    provenance: column_provenance,
-                    document_clauses,
-                },
-            )
-            .blocking_leaf_count
-                == 0;
-        clean_by_correlation
-            .entry(diff.correlation_id.clone())
-            .and_modify(|existing| *existing &= clean)
-            .or_insert(clean);
-    }
-    clean_by_correlation
-}
-
 pub fn detect(art: &RunArtifacts) -> Scorecard {
     let graph_plan = GraphScoringPlan::build(art);
     detect_with_plan(art, &graph_plan)
 }
 
 pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan) -> Scorecard {
+    detect_prepared(art, graph_plan).0
+}
+
+fn detect_prepared(
+    art: &RunArtifacts,
+    graph_plan: &GraphScoringPlan,
+) -> (Scorecard, PreparedCallComparisons) {
     // V1: uncorrelated (background-task) events are tolerated; the deja-tokio
     // correlation-propagation fix is a separate plan.
     let uncorrelated_tolerated = true;
@@ -6068,6 +6360,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         &column_provenance,
         art.boundary_policy.as_ref(),
     );
+    let prepared_calls = PreparedCallComparisons::new(art, &events_by_seq, pairing);
+    let pairing = &prepared_calls.pairing;
     let http_incoming_by_correlation = http_incoming_events_by_correlation(&art.events);
 
     let mut value_divergences = 0u64;
@@ -6107,24 +6401,16 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         http_status_clean,
         &recorded_span_paths,
     );
-    let blocking_http_body_mismatches = art
-        .http_diffs
+    let http_comparison = prepare_http_comparison(
+        art,
+        &http_incoming_by_correlation,
+        &inconclusive_race,
+        &column_provenance,
+    );
+    let blocking_http_body_mismatches = http_comparison
+        .responses
         .iter()
-        .filter(|diff| {
-            classify_http_body_diff(
-                diff,
-                http_incoming_by_correlation
-                    .get(&diff.correlation_id)
-                    .copied(),
-                BodyClassificationContext {
-                    race: &inconclusive_race,
-                    provenance: &column_provenance,
-                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
-                },
-            )
-            .blocking_leaf_count
-                > 0
-        })
+        .filter(|response| !response.body.blocking.is_empty())
         .count();
     let http_clean = http_status_clean && blocking_http_body_mismatches == 0;
     // Rule B: idempotent redis DELETE (recorded KeyDeleted vs observed KeyNotDeleted).
@@ -6139,13 +6425,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let tail_gap = tail_gap_evidence(
         &art.events,
         &art.observed,
-        &http_clean_by_correlation(
-            &art.http_diffs,
-            &http_incoming_by_correlation,
-            &inconclusive_race,
-            &column_provenance,
-            &document_clauses_for(&art.reply_canons, "http_incoming"),
-        ),
+        &http_clean_from_comparison(&art.http_diffs, &http_comparison),
     );
     let mut tail_gap_correlations: BTreeSet<String> = BTreeSet::new();
     let mut inconclusive_seed_gaps = 0u64;
@@ -6236,11 +6516,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             // ValueDiverged (the args-aligned flavor — a READ, or a WRITE whose
             // operand did not change). The re-keyed WRITE whose operand DID change
             // misses args and is paired args-free in the Novel branch below.
-            let verdict = observed_value_verdict(
-                obs,
-                obs.source_event_global_sequence
-                    .and_then(|seq| events_by_seq.get(&seq).copied()),
-            );
+            let verdict = prepared_calls.results[observed_index];
             if let Some(ValueVerdict::Absorbed(ValueAbsorption::Canon(source))) = verdict {
                 stats.note_kind("ValueCanonAbsorbed");
                 *value_canon_absorbed_seen
@@ -6411,7 +6687,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             let twin_event = events_by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded, obs, twin_event);
-            let verdict = pair_request_verdict(obs, twin_event, art.boundary_policy.as_ref());
+            let verdict = prepared_calls.arguments[observed_index]
+                .expect("a prepared pair has an argument verdict");
             if obs.arg_divergent
                 && obs
                     .served_event_global_sequence
@@ -6842,7 +7119,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
     let mut document_text_paths_seen: BTreeMap<String, u64> = BTreeMap::new();
     {
         let stats = boundary_entry(&mut per_boundary, "http_incoming");
-        for diff in &art.http_diffs {
+        for (diff, response) in art.http_diffs.iter().zip(&http_comparison.responses) {
             let recorded_http = http_incoming_by_correlation
                 .get(&diff.correlation_id)
                 .copied();
@@ -6856,15 +7133,7 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     .or_insert(0) += 1;
                 *inapplicable_reply_canons.entry(canon).or_insert(0) += 1;
             }
-            let body_classification = classify_http_body_diff(
-                diff,
-                recorded_http,
-                BodyClassificationContext {
-                    race: &inconclusive_race,
-                    provenance: &column_provenance,
-                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
-                },
-            );
+            let body_classification = &response.body;
             let blocking_body_diffs = body_classification.blocking_leaf_count;
             if diff.status_match && blocking_body_diffs == 0 {
                 stats.matched += 1;
@@ -6879,33 +7148,33 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
                     stats.bump_kind("BodyMismatch");
                 }
             }
-            for path in body_classification.schema_derived_paths {
+            for path in body_classification.schema_derived_paths.iter().cloned() {
                 stats.bump_kind("SchemaDefaultDivergence");
                 schema_default_divergences += 1;
                 *schema_default_response_paths_seen.entry(path).or_insert(0) += 1;
             }
-            for path in body_classification.order_only_paths {
+            for path in body_classification.order_only_paths.iter().cloned() {
                 *order_only_response_paths_seen.entry(path).or_insert(0) += 1;
             }
-            for (path, source) in body_classification.canon_absorbed {
+            for (path, source) in body_classification.canon_absorbed.iter().cloned() {
                 stats.note_kind("ReplyCanonAbsorbed");
                 *canon_absorbed_seen
                     .entry((path, source.label()))
                     .or_insert(0) += 1;
             }
-            for path in body_classification.canon_conflicts {
+            for path in body_classification.canon_conflicts.iter().cloned() {
                 *canon_conflict_paths_seen.entry(path).or_insert(0) += 1;
             }
-            for path in body_classification.kernel_equivalent_paths {
+            for path in body_classification.kernel_equivalent_paths.iter().cloned() {
                 stats.note_kind("OrderNondeterministicWarning");
                 order_nondeterminism_warnings += 1;
                 *kernel_equivalent_paths_seen.entry(path).or_insert(0) += 1;
             }
-            for path in body_classification.embedded_document_paths {
+            for path in body_classification.embedded_document_paths.iter().cloned() {
                 stats.note_kind("EmbeddedJsonCompared");
                 *embedded_document_paths_seen.entry(path).or_insert(0) += 1;
             }
-            for path in body_classification.document_text_paths {
+            for path in body_classification.document_text_paths.iter().cloned() {
                 stats.note_kind("ReplyDocumentAbsorbed");
                 *document_text_paths_seen.entry(path).or_insert(0) += 1;
             }
@@ -7525,12 +7794,13 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
         ));
     }
 
-    Scorecard {
+    let card = Scorecard {
         schema_version: 1,
         r#type: "replay-scorecard".to_owned(),
         run_id: art.run_id.clone(),
         recording_id: art.recording_id.clone(),
         policy_digest: art.boundary_policy.as_ref().map(|p| p.digest.clone()),
+        http_comparison: Some(http_comparison),
         summary: Summary {
             total_correlations,
             matched_correlations,
@@ -7581,7 +7851,8 @@ pub(crate) fn detect_with_plan(art: &RunArtifacts, graph_plan: &GraphScoringPlan
             .map(|scope| scope.iter().cloned().collect()),
         warnings,
         lookup_tally,
-    }
+    };
+    (card, prepared_calls)
 }
 
 // ---------------------------------------------------------------------------
@@ -7871,7 +8142,7 @@ pub fn load_artifacts(root: &HarnessRoot, run_id: &str) -> io::Result<RunArtifac
 pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecard> {
     let art = load_artifacts(root, run_id)?;
     let graph_plan = GraphScoringPlan::build(&art);
-    let card = detect_with_plan(&art, &graph_plan);
+    let (card, prepared_calls) = detect_prepared(&art, &graph_plan);
     let path = root
         .root
         .join("runs")
@@ -7882,7 +8153,13 @@ pub fn detect_and_score(root: &HarnessRoot, run_id: &str) -> io::Result<Scorecar
     // Streamed straight to the file. Collecting first held every resolved row —
     // each carrying the recorded side's full `args` and `result` — alongside the
     // parsed table and graph, which is what OOMKilled the runner on a dense tape.
-    if let Err(e) = stream_ledger(&root.call_ledger_path(run_id), &art, &graph_plan) {
+    if let Err(e) = stream_ledger(
+        &root.call_ledger_path(run_id),
+        &art,
+        &graph_plan,
+        card.http_comparison.as_ref(),
+        Some(&prepared_calls),
+    ) {
         eprintln!("divergence: ledger stream failed for {run_id}: {e}");
     }
     Ok(card)
@@ -7912,6 +8189,16 @@ pub(crate) fn build_ledger_into(
     graph_plan: &GraphScoringPlan,
     sink: &mut dyn FnMut(CallRecord) -> io::Result<()>,
 ) -> io::Result<()> {
+    build_ledger_with_http_into(art, graph_plan, None, None, sink)
+}
+
+fn build_ledger_with_http_into(
+    art: &RunArtifacts,
+    graph_plan: &GraphScoringPlan,
+    prepared_http: Option<&HttpComparison>,
+    prepared_calls: Option<&PreparedCallComparisons>,
+    sink: &mut dyn FnMut(CallRecord) -> io::Result<()>,
+) -> io::Result<()> {
     let events = &art.events;
     let span_paths = ledger::recorded_span_paths(&art.table);
     // Mirror scorecard classification: discover race evidence under status-clean
@@ -7922,24 +8209,22 @@ pub(crate) fn build_ledger_into(
     let inconclusive_race =
         inconclusive_race_evidence(events, &art.observed, http_status_clean, &span_paths);
     let column_provenance = correlation_column_provenance(events, &art.observed);
-    let blocking_http_body_mismatches = art
-        .http_diffs
+    let computed_http;
+    let http_comparison = if let Some(prepared) = prepared_http {
+        prepared
+    } else {
+        computed_http = prepare_http_comparison(
+            art,
+            &http_incoming_by_correlation,
+            &inconclusive_race,
+            &column_provenance,
+        );
+        &computed_http
+    };
+    let blocking_http_body_mismatches = http_comparison
+        .responses
         .iter()
-        .filter(|diff| {
-            classify_http_body_diff(
-                diff,
-                http_incoming_by_correlation
-                    .get(&diff.correlation_id)
-                    .copied(),
-                BodyClassificationContext {
-                    race: &inconclusive_race,
-                    provenance: &column_provenance,
-                    document_clauses: &document_clauses_for(&art.reply_canons, "http_incoming"),
-                },
-            )
-            .blocking_leaf_count
-                > 0
-        })
+        .filter(|response| !response.body.blocking.is_empty())
         .count();
     let http_clean = http_status_clean && blocking_http_body_mismatches == 0;
     let idempotent_delete = idempotent_delete_demotions(events, &art.observed, http_clean);
@@ -7948,13 +8233,7 @@ pub(crate) fn build_ledger_into(
     let tail_gap = tail_gap_evidence(
         events,
         &art.observed,
-        &http_clean_by_correlation(
-            &art.http_diffs,
-            &http_incoming_by_correlation,
-            &inconclusive_race,
-            &column_provenance,
-            &document_clauses_for(&art.reply_canons, "http_incoming"),
-        ),
+        &http_clean_from_comparison(&art.http_diffs, http_comparison),
     );
     ledger::build_with_plan_into(
         events,
@@ -7967,6 +8246,7 @@ pub(crate) fn build_ledger_into(
         &SeedGapCascade::build(art),
         art.boundary_policy.as_ref(),
         graph_plan,
+        prepared_calls,
         sink,
     )
 }
@@ -7976,13 +8256,15 @@ fn stream_ledger(
     path: &std::path::Path,
     art: &RunArtifacts,
     graph_plan: &GraphScoringPlan,
+    prepared_http: Option<&HttpComparison>,
+    prepared_calls: Option<&PreparedCallComparisons>,
 ) -> io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    build_ledger_into(art, graph_plan, &mut |row| {
+    build_ledger_with_http_into(art, graph_plan, prepared_http, prepared_calls, &mut |row| {
         let line = serde_json::to_vec(&row).map_err(io::Error::other)?;
         out.write_all(&line)?;
         out.write_all(b"\n")
@@ -8230,6 +8512,394 @@ mod tests {
                 "schema {schema:?}: {warnings:?}"
             );
         }
+    }
+
+    #[test]
+    fn published_comparison_identifies_executed_results_instead_of_args() {
+        let make = |result: serde_json::Value| {
+            let mut call = obs("db", Some("c"), true, Some(2), Some(1));
+            call.args = serde_json::json!({"sql":"select amount"});
+            call.provenance = deja::Provenance::Shadow;
+            call.recorded_result = Some(serde_json::json!({"amount":0}));
+            call.observed_result = Some(result);
+            call
+        };
+        let first = result_comparison(&make(serde_json::json!({"amount":1})), None).unwrap();
+        let second = result_comparison(&make(serde_json::json!({"amount":2})), None).unwrap();
+        assert_eq!(first.subject, ComparisonSubject::Result);
+        assert_eq!(first.verdict, ValueVerdict::Diverged);
+        assert_ne!(first.candidate_identity, second.candidate_identity);
+
+        let a =
+            make(serde_json::json!({"amount":1,"items":[1,2],"echo":"{\"x\":1,\"y\":2}","id":7}));
+        let b =
+            make(serde_json::json!({"amount":1,"items":[2,1],"echo":"{\"y\":2,\"x\":1}","id":7}));
+        assert_eq!(
+            result_comparison(&a, None).unwrap().candidate_identity,
+            result_comparison(&b, None).unwrap().candidate_identity,
+            "the default result rule accepts permitted rendering independently"
+        );
+        let mut serial = a.clone();
+        serial.observed_result.as_mut().unwrap()["id"] = serde_json::json!(8);
+        let original = result_comparison(&a, None).unwrap();
+        let serial = result_comparison(&serial, None).unwrap();
+        assert_ne!(original.candidate_identity, serial.candidate_identity);
+        assert_eq!(
+            original.candidate_alternatives, serial.candidate_alternatives,
+            "database infrastructure is a separate strict alternative"
+        );
+        let mut substituted = a;
+        substituted.provenance = deja::Provenance::ServedRecordedError;
+        assert!(result_comparison(&substituted, None).is_none());
+    }
+
+    #[test]
+    fn published_result_alternatives_do_not_compose_independent_rules() {
+        let tape = serde_json::json!({"id":0,"a":0,"b":0});
+        let event = db_read_ev_with_state_canon("c", "t", 1, tape.clone(), "project:id,a");
+        let make = |result: serde_json::Value| {
+            let mut call = obs("db", Some("c"), true, Some(2), Some(1));
+            call.provenance = deja::Provenance::Shadow;
+            call.recorded_result = Some(tape.clone());
+            call.observed_result = Some(result);
+            call
+        };
+        let m = make(serde_json::json!({"id":1,"a":1,"b":0}));
+        let y = make(serde_json::json!({"id":2,"a":1,"b":1}));
+        assert_eq!(
+            observed_value_verdict(&m, Some(&event)),
+            Some(ValueVerdict::Diverged)
+        );
+        assert_eq!(
+            observed_value_verdict(&y, Some(&event)),
+            Some(ValueVerdict::Diverged)
+        );
+        assert_eq!(
+            value_verdict(
+                "db",
+                m.observed_result.as_ref().unwrap(),
+                y.observed_result.as_ref().unwrap(),
+                Some(&event),
+                None
+            ),
+            ValueVerdict::Diverged
+        );
+        let m = result_comparison(&m, Some(&event)).unwrap();
+        let y = result_comparison(&y, Some(&event)).unwrap();
+        let identities = |comparison: &CallComparison| {
+            comparison
+                .candidate_identity
+                .iter()
+                .chain(&comparison.candidate_alternatives)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        assert!(
+            identities(&m).is_disjoint(&identities(&y)),
+            "no composed database/project/default rule may manufacture inheritance"
+        );
+    }
+
+    #[test]
+    fn published_result_alternatives_keep_every_applicable_project_rule() {
+        let tape = serde_json::json!({"a":0,"b":0,"c":0});
+        let event = db_read_ev_with_state_canon("c", "t", 1, tape.clone(), "project:a;project:b");
+        let make = |result: serde_json::Value| {
+            let mut call = obs("redis", Some("c"), true, Some(2), Some(1));
+            call.provenance = deja::Provenance::Shadow;
+            call.recorded_result = Some(tape.clone());
+            call.observed_result = Some(result);
+            call
+        };
+        let m = make(serde_json::json!({"a":1,"b":1,"c":0}));
+        let y = make(serde_json::json!({"a":2,"b":1,"c":1}));
+        assert_eq!(
+            observed_value_verdict(&m, Some(&event)),
+            Some(ValueVerdict::Diverged)
+        );
+        assert_eq!(
+            observed_value_verdict(&y, Some(&event)),
+            Some(ValueVerdict::Diverged)
+        );
+        assert!(matches!(
+            value_verdict(
+                "redis",
+                m.observed_result.as_ref().unwrap(),
+                y.observed_result.as_ref().unwrap(),
+                Some(&event),
+                None
+            ),
+            ValueVerdict::Absorbed(_)
+        ));
+        let m = result_comparison(&m, Some(&event)).unwrap();
+        let y = result_comparison(&y, Some(&event)).unwrap();
+        assert_eq!(m.candidate_alternatives.len(), 2);
+        assert_eq!(y.candidate_alternatives.len(), 2);
+        assert_ne!(m.candidate_identity, y.candidate_identity);
+        assert_eq!(
+            m.candidate_alternatives
+                .iter()
+                .filter(|identity| y.candidate_alternatives.contains(identity))
+                .count(),
+            1,
+            "the second declared OR alternative independently explains shared drift"
+        );
+    }
+
+    #[test]
+    fn published_project_alternative_applies_to_candidates_without_tape_field() {
+        let tape = serde_json::json!({"c":0});
+        let event = db_read_ev_with_state_canon("c", "t", 1, tape.clone(), "project:a");
+        let make = |result: serde_json::Value| {
+            let mut call = obs("redis", Some("c"), true, Some(2), Some(1));
+            call.provenance = deja::Provenance::Shadow;
+            call.recorded_result = Some(tape.clone());
+            call.observed_result = Some(result);
+            call
+        };
+        let m = make(serde_json::json!({"a":1,"b":1}));
+        let y = make(serde_json::json!({"a":1,"b":2}));
+        assert_eq!(
+            observed_value_verdict(&m, Some(&event)),
+            Some(ValueVerdict::Diverged)
+        );
+        assert_eq!(
+            observed_value_verdict(&y, Some(&event)),
+            Some(ValueVerdict::Diverged)
+        );
+        let m = result_comparison(&m, Some(&event)).unwrap();
+        let y = result_comparison(&y, Some(&event)).unwrap();
+        assert_ne!(m.candidate_identity, y.candidate_identity);
+        assert_eq!(m.candidate_alternatives.len(), 1);
+        assert_eq!(
+            m.candidate_alternatives, y.candidate_alternatives,
+            "M/Y projection applicability is independent of the tape's shape"
+        );
+    }
+
+    #[test]
+    fn published_form_residuals_reuse_kernel_keys_and_ordered_repeated_values() {
+        let classify = |candidate: &str| {
+            classify_body(&body_pair(
+                serde_json::json!("a=0&b=0"),
+                serde_json::json!(candidate),
+            ))
+        };
+        let m = classify("a=1&b=0");
+        let y = classify("b=0&a=1");
+        assert_eq!(m.blocking.len(), 1);
+        assert_eq!(m.blocking[0].diff.json_path, "$.a");
+        assert_eq!(
+            m.blocking[0].candidate_identity,
+            y.blocking[0].candidate_identity
+        );
+        let repeated = |candidate: &str| {
+            classify_body(&body_pair(
+                serde_json::json!("a=0&a=0&b=0"),
+                serde_json::json!(candidate),
+            ))
+        };
+        let m = repeated("a=1&a=2&b=0");
+        let y = repeated("a=2&a=1&b=0");
+        assert_ne!(
+            m.blocking[0].candidate_identity, y.blocking[0].candidate_identity,
+            "the kernel treats repeated values in a form field as ordered"
+        );
+        let reversed = classify_body(&body_pair(
+            serde_json::json!("a=1&a=2&b=0"),
+            serde_json::json!("a=2&a=1&b=0"),
+        ));
+        assert_eq!(
+            reversed.blocking.len(),
+            1,
+            "a repeated-key order change still blocks"
+        );
+    }
+
+    #[test]
+    fn published_nested_form_residuals_keep_kernel_json_first_precedence() {
+        let diff = body_pair(
+            serde_json::json!(r#"{"payload":"x=1&x=2"}"#),
+            serde_json::json!(r#"{"payload":"x=2&x=1"}"#),
+        );
+        assert_eq!(diff.body_diff.len(), 1);
+        assert_eq!(diff.body_diff[0].json_path, "$.payload.x");
+        let classification = classify_body(&diff);
+        assert_eq!(
+            classification.blocking.len(),
+            1,
+            "nested repeated-key values retain the kernel's ordered comparison"
+        );
+        assert_eq!(classification.blocking[0].diff, diff.body_diff[0]);
+        assert!(classification.blocking[0]
+            .candidate_identity
+            .starts_with("written:v1:"));
+    }
+
+    #[test]
+    fn published_nested_form_context_is_stable_when_only_a_sibling_changed() {
+        let baseline = serde_json::json!(r#"{"payload":"a=0&b=0","n":0}"#);
+        let compare = |run: &str, payload: &str| {
+            let candidate =
+                serde_json::Value::String(serde_json::json!({"payload":payload,"n":1}).to_string());
+            let diff = body_pair(baseline.clone(), candidate);
+            let mut artifacts = art(Vec::new(), Vec::new(), vec![diff]);
+            artifacts.run_id = run.to_owned();
+            let card = detect(&artifacts);
+            assert_eq!(
+                card.http_comparison.as_ref().unwrap().responses[0]
+                    .body
+                    .blocking[0]
+                    .diff
+                    .json_path,
+                "$.n",
+                "form context applies even when its value did not change"
+            );
+            behaviour_tree::build_with_scorecard(run, &[], &artifacts.http_diffs, Some(&card))
+                .unwrap()
+        };
+        let m = compare("m", "a=0&b=0");
+        let y = compare("y", "b=0&a=0");
+        let delta = delta::three_way(&m, &y).unwrap();
+        assert!(delta.verdict.pass);
+        assert_eq!(
+            (
+                delta.verdict.introduced,
+                delta.verdict.changed,
+                delta.verdict.inherited
+            ),
+            (0, 0, 1)
+        );
+    }
+
+    #[test]
+    fn published_http_identity_uses_only_its_own_path_conflict() {
+        let baseline = serde_json::json!({"a":[1,2],"b":0});
+        let event =
+            http_incoming_ev_with_reply_canon("order", 1, Some("project:!a"), baseline.clone());
+        let m = classify_with_sources(
+            &body_pair(baseline.clone(), serde_json::json!({"a":[2,1],"b":1})),
+            Some(&event),
+            &clauses("bag:$.a[]"),
+        );
+        let y = classify_with_sources(
+            &body_pair(baseline, serde_json::json!({"a":[1,2],"b":1})),
+            Some(&event),
+            &clauses("bag:$.a[]"),
+        );
+        assert!(!m.canon_conflicts.is_empty());
+        let b_identity = |classification: &HttpBodyClassification| {
+            classification
+                .blocking
+                .iter()
+                .find(|row| row.diff.json_path == "$.b")
+                .unwrap()
+                .candidate_identity
+                .clone()
+        };
+        assert_eq!(
+            b_identity(&m),
+            b_identity(&y),
+            "a sibling conflict cannot change b's identity"
+        );
+    }
+
+    #[test]
+    fn published_comparison_streamed_ledger_keeps_the_executed_operand() {
+        let compare = |result: &str| {
+            let artifacts = art(
+                vec![seq_entry_res(
+                    Some("c"),
+                    "storage",
+                    7,
+                    serde_json::json!("old"),
+                )],
+                vec![exec_obs(
+                    "storage",
+                    Some("c"),
+                    true,
+                    Some(7),
+                    Some(serde_json::json!("old")),
+                    serde_json::json!(result),
+                )],
+                vec![http("c", true, vec![])],
+            );
+            let plan = GraphScoringPlan::build(&artifacts);
+            let (card, prepared) = detect_prepared(&artifacts, &plan);
+            let published = card.http_comparison.as_ref().unwrap();
+            assert_eq!(published.responses.len(), artifacts.http_diffs.len());
+            assert_eq!(published.responses[0].correlation_id, "c");
+            assert_eq!(
+                published.responses[0].request_sequence,
+                artifacts.http_diffs[0].request_sequence
+            );
+            let mut rows = Vec::new();
+            build_ledger_with_http_into(
+                &artifacts,
+                &plan,
+                Some(published),
+                Some(&prepared),
+                &mut |row| {
+                    rows.push(row);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(card.summary.value_divergences, 1);
+            assert_eq!(rows.len(), 1);
+            let comparison = rows.pop().unwrap().comparison.unwrap();
+            assert_eq!(comparison.subject, ComparisonSubject::Result);
+            assert_eq!(comparison.verdict, ValueVerdict::Diverged);
+            comparison.candidate_identity
+        };
+        assert_ne!(
+            compare("first"),
+            compare("second"),
+            "same call arguments cannot hide different independently executed results"
+        );
+    }
+
+    #[test]
+    fn published_http_residuals_keep_only_the_existing_blocking_decisions() {
+        let baseline = serde_json::json!({"items":[1,2],"amount":1});
+        let permutation = classify_body(&body_pair(
+            baseline.clone(),
+            serde_json::json!({"items":[2,1],"amount":1}),
+        ));
+        assert!(permutation.blocking.is_empty());
+        let changed = classify_body(&body_pair(
+            baseline.clone(),
+            serde_json::json!({"items":[2,1],"amount":2}),
+        ));
+        assert_eq!(changed.blocking_leaf_count, changed.blocking.len());
+        assert_eq!(changed.blocking.len(), 1);
+        assert_eq!(changed.blocking[0].diff.json_path, "$.amount");
+        assert_eq!(changed.blocking[0].diff.candidate, serde_json::json!(2));
+        let duplicate = classify_body(&body_pair(
+            baseline,
+            serde_json::json!({"items":[1,1],"amount":1}),
+        ));
+        assert!(!duplicate.blocking.is_empty());
+        let wire = serde_json::to_value(&changed).unwrap();
+        assert_eq!(wire["blocking"][0]["json_path"], "$.amount");
+        assert!(wire["blocking"][0]["candidate_identity"].is_string());
+    }
+
+    #[test]
+    fn published_comparison_reason_reuses_the_existing_verdict() {
+        let verdict = ValueVerdict::Absorbed(ValueAbsorption::Canon(ValueCanonSource::Default));
+        assert_eq!(
+            serde_json::to_value(verdict).unwrap(),
+            serde_json::json!({
+                "kind":"absorbed", "reason":{"kind":"canon","source":"default"}
+            })
+        );
+        let raw = serde_json::to_value(Scorecard::empty("old".into())).unwrap();
+        assert!(raw.get("http_comparison").is_none());
+        assert!(serde_json::from_value::<Scorecard>(raw)
+            .unwrap()
+            .http_comparison
+            .is_none());
     }
 
     #[test]

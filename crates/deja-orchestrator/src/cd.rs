@@ -983,6 +983,7 @@ mod preview_tests {
         Row {
             address: Address::Body {
                 correlation: "corr-1".into(),
+                request_sequence: 0,
                 json_path: path.into(),
             },
             bucket,

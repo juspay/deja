@@ -367,8 +367,8 @@ pub fn diff_json(
             // `metadata[...]` pairs on every process. DISTINCT keys compare
             // order-insensitively; repeated same-named keys keep their
             // relative order (that order is array semantics, not noise).
-            if let (Some(bp), Some(cp)) = (parse_form_pairs(b), parse_form_pairs(c)) {
-                return diff_form_pairs(&bp, &cp, path, allowlist);
+            if let Some(diffs) = diff_form_strings(b, c, path, allowlist) {
+                return diffs;
             }
             vec![JsonFieldDiff {
                 json_path: path.to_owned(),
@@ -382,6 +382,23 @@ pub fn diff_json(
             candidate: c.clone(),
         }],
     }
+}
+
+/// Compare strings under the kernel's existing form grammar. `None` means
+/// either string is opaque; an empty diff means both forms agree. Repeated
+/// keys retain their ordered values, including in the returned residuals.
+pub fn diff_form_strings(
+    baseline: &str,
+    candidate: &str,
+    path: &str,
+    allowlist: &[&str],
+) -> Option<Vec<JsonFieldDiff>> {
+    Some(diff_form_pairs(
+        &parse_form_pairs(baseline)?,
+        &parse_form_pairs(candidate)?,
+        path,
+        allowlist,
+    ))
 }
 
 /// Read a string as form-urlencoded pairs, STRICTLY: at least two

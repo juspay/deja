@@ -206,6 +206,8 @@ export type AuditRow = {
 export type Scorecard = {
   verdict: { pass: boolean; inconclusive: boolean; reason: string };
   policy_digest?: string;
+  /** Published scorer decisions. Absent on runs scored before this format. */
+  http_comparison?: HttpComparison;
   summary: {
     matched_correlations: number;
     total_correlations: number;
@@ -252,6 +254,7 @@ export type Scorecard = {
   per_correlation?: {
     correlation_id: string;
     passed?: boolean;
+    inconclusive?: boolean;
     http_status_match?: boolean;
     http_body_match?: boolean;
     side_effect_divergences?: number;
@@ -319,9 +322,40 @@ export type CallRecord = {
   resolved_rank?: number;
   recorded?: CallSide;
   observed?: CallSide;
+  comparison?: ValueComparison;
 };
 
 export type JsonFieldDiff = { json_path: string; baseline: unknown; candidate: unknown };
+
+export type ClauseSource = "default" | "recorder" | "document" | "both";
+export type ValueAbsorption =
+  | { kind: "canon"; source: "default" | "recorder" }
+  | { kind: "document_text"; source: "default" | "recorder" | null }
+  | { kind: "args_identity" | "approved_noise" | "db_infrastructure" | "served_recorded_error" };
+export type ValueComparison = {
+  version: number;
+  subject: "arguments" | "result";
+  verdict: { kind: "equal" | "diverged" } | { kind: "absorbed"; reason: ValueAbsorption };
+  candidate_identity?: string;
+  candidate_alternatives?: string[];
+};
+export type HttpBodyClassification = {
+  blocking: (JsonFieldDiff & { candidate_identity: string })[];
+  blocking_leaf_count: number;
+  schema_derived_paths: string[];
+  order_only_paths: string[];
+  canon_absorbed: [string, ClauseSource][];
+  canon_conflicts: string[];
+  kernel_equivalent_paths: string[];
+  embedded_document_paths: string[];
+  document_text_paths: string[];
+  race_absorbed_paths?: string[];
+  hidden_form_paths?: string[];
+};
+export type HttpComparison = {
+  version: number;
+  responses: { correlation_id: string; request_sequence: number; body: HttpBodyClassification }[];
+};
 
 // Did the replay reach what the candidate changed? Computed by the orchestrator
 // from the git host's compare of the candidate against its base branch and the
@@ -372,6 +406,7 @@ export type HttpDiff = {
   // enables a true side-by-side before/after with unchanged context.
   baseline_body?: unknown;
   candidate_body?: unknown;
+  transport_error?: string | null;
 };
 
 // Raw execution-graph node (record or replay side).
@@ -912,7 +947,7 @@ export type DeltaAddress =
       occurrence: number;
     }
   | { kind: "status"; correlation: string; request_sequence: number }
-  | { kind: "body"; correlation: string; json_path: string };
+  | { kind: "body"; correlation: string; request_sequence?: number; json_path: string };
 
 /** What one side produced at an address: it reproduced the tape, never
  *  reached the address, or produced something else (hashed). */
@@ -1003,6 +1038,8 @@ export type Delta = {
   m_run: string;
   y_run: string;
   canon_version: number;
+  /** Absent on historical deltas. Determines where response values are read. */
+  http_comparison_mode?: "classified" | "legacy" | (string & {});
   verdict: {
     pass: boolean;
     /** Addresses by family: response fields and calls. */

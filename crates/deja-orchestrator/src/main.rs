@@ -3187,6 +3187,7 @@ impl Unavailable {
 /// A file a tree is built from that could not be read whole.
 enum ReadFailure {
     Missing(std::path::PathBuf),
+    InvalidComparison(String),
     Unparsable {
         path: std::path::PathBuf,
         line: usize,
@@ -3216,6 +3217,7 @@ fn read_jsonl_strict<T: serde::de::DeserializeOwned>(
 struct TreeSources {
     ledger: std::path::PathBuf,
     diffs: Option<std::path::PathBuf>,
+    scorecard: Option<std::path::PathBuf>,
     observed: Option<std::path::PathBuf>,
     cache: std::path::PathBuf,
 }
@@ -3250,6 +3252,11 @@ fn tree_sources(
     if diffs.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::HTTP_DIFFS.name)) {
         return Err(absent(artifact_kinds::HTTP_DIFFS.name, "http diffs"));
     }
+    let scorecard = confined(root.scorecard_path(id), &root.root.join("runs"));
+    if scorecard.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::SCORECARD.name))
+    {
+        return Err(absent(artifact_kinds::SCORECARD.name, "scorecard"));
+    }
     let observed = confined(root.observed_path(id), &root.root.join("observed"));
     if observed.is_none() && registered.is_some_and(|r| r.contains(artifact_kinds::OBSERVED.name)) {
         return Err(absent(artifact_kinds::OBSERVED.name, "observed stream"));
@@ -3260,6 +3267,7 @@ fn tree_sources(
     Ok(TreeSources {
         ledger,
         diffs,
+        scorecard,
         observed,
         cache,
     })
@@ -3272,36 +3280,63 @@ fn read_or_build_tree(
     id: &str,
     sources: &TreeSources,
     policy_digest: Option<&str>,
+    requested_mode: Option<divergence::behaviour_tree::HttpComparisonMode>,
 ) -> Result<divergence::behaviour_tree::BehaviourTree, ReadFailure> {
     use divergence::behaviour_tree::{self, BehaviourTree};
 
+    let diffs: Vec<deja_kernel::HttpDiff> = match &sources.diffs {
+        Some(path) => read_jsonl_strict(path)?,
+        None => Vec::new(),
+    };
+    let scorecard: Option<divergence::Scorecard> = sources
+        .scorecard
+        .as_ref()
+        .map(|path| {
+            let text =
+                std::fs::read_to_string(path).map_err(|_| ReadFailure::Missing(path.clone()))?;
+            serde_json::from_str(&text).map_err(|_| ReadFailure::Unparsable {
+                path: path.clone(),
+                line: 1,
+            })
+        })
+        .transpose()?;
+    let mode = behaviour_tree::http_comparison_mode(id, &diffs, scorecard.as_ref())
+        .map_err(ReadFailure::InvalidComparison)?;
+    let project = |mut tree: BehaviourTree| {
+        if let Some(requested) =
+            requested_mode.filter(|requested| *requested != tree.http_comparison_mode)
+        {
+            behaviour_tree::project_http(&mut tree, &diffs, scorecard.as_ref(), requested)
+                .map_err(ReadFailure::InvalidComparison)?;
+        }
+        Ok(tree)
+    };
     if let Some(tree) = std::fs::read_to_string(&sources.cache)
         .ok()
         .and_then(|t| BehaviourTree::from_jsonl(&t))
         .filter(|t| {
             t.canon_version == behaviour_tree::CANON_VERSION
                 && t.policy_digest.as_deref() == policy_digest
+                && t.http_comparison_mode == mode
+                && t.run_id == id
         })
     {
-        return Ok(tree);
+        return project(tree);
     }
     let rows: Vec<divergence::ledger::CallRecord> = read_jsonl_strict(&sources.ledger)?;
-    let diffs: Vec<deja_kernel::HttpDiff> = match &sources.diffs {
-        Some(path) => read_jsonl_strict(path)?,
-        None => Vec::new(),
-    };
     let event_schema_versions = match &sources.observed {
         Some(path) => behaviour_tree::event_schema_versions(
             &std::fs::read_to_string(path).map_err(|_| ReadFailure::Missing(path.clone()))?,
         ),
         None => Default::default(),
     };
-    let mut tree = behaviour_tree::build(id, &rows, &diffs);
+    let mut tree = behaviour_tree::build_with_scorecard(id, &rows, &diffs, scorecard.as_ref())
+        .map_err(ReadFailure::InvalidComparison)?;
     tree.policy_digest = policy_digest.map(str::to_owned);
     tree.event_schema_versions = event_schema_versions;
     // renamed into place, so a concurrent reader never sees a prefix
     let _ = tree.write_atomic(&sources.cache);
-    Ok(tree)
+    project(tree)
 }
 
 /// A run's behaviour tree: read from the cache beside its ledger when one is
@@ -3321,6 +3356,14 @@ fn read_or_build_tree(
 async fn behaviour_tree_for(
     st: &AppState,
     id: &str,
+) -> Result<divergence::behaviour_tree::BehaviourTree, Unavailable> {
+    behaviour_tree_for_mode(st, id, None).await
+}
+
+async fn behaviour_tree_for_mode(
+    st: &AppState,
+    id: &str,
+    requested_mode: Option<divergence::behaviour_tree::HttpComparisonMode>,
 ) -> Result<divergence::behaviour_tree::BehaviourTree, Unavailable> {
     let (state, _) = run_disposition(st, id).await;
     let params = run_params_read(st, id)
@@ -3343,10 +3386,11 @@ async fn behaviour_tree_for(
             state.as_deref(),
         )?;
         let kind_of = {
-            let (ledger, diffs, observed) = (
+            let (ledger, diffs, observed, scorecard) = (
                 sources.ledger.clone(),
                 sources.diffs.clone(),
                 sources.observed.clone(),
+                sources.scorecard.clone(),
             );
             move |path: &std::path::Path| -> &'static str {
                 if path == ledger {
@@ -3355,6 +3399,8 @@ async fn behaviour_tree_for(
                     artifact_kinds::HTTP_DIFFS.name
                 } else if observed.as_deref() == Some(path) {
                     artifact_kinds::OBSERVED.name
+                } else if scorecard.as_deref() == Some(path) {
+                    artifact_kinds::SCORECARD.name
                 } else {
                     ""
                 }
@@ -3363,7 +3409,7 @@ async fn behaviour_tree_for(
         let run = id.to_owned();
         let policy = policy_digest.clone();
         let read = tokio::task::spawn_blocking(move || {
-            read_or_build_tree(&run, &sources, policy.as_deref())
+            read_or_build_tree(&run, &sources, policy.as_deref(), requested_mode)
         })
         .await
         .map_err(|e| Unavailable::Pending(format!("build behaviour tree of run {id}: {e}")))?;
@@ -3373,6 +3419,9 @@ async fn behaviour_tree_for(
         };
         let path = match &failure {
             ReadFailure::Missing(path) | ReadFailure::Unparsable { path, .. } => path.clone(),
+            ReadFailure::InvalidComparison(why) => {
+                return Err(Unavailable::Refused(format!("run {id}: {why}")))
+            }
         };
         let pullable = hydrated
             .as_ref()
@@ -3395,6 +3444,7 @@ async fn behaviour_tree_for(
                 "line {line} of {} does not parse, so run {id}'s published artifact is not whole",
                 path.display()
             )),
+            ReadFailure::InvalidComparison(why) => Unavailable::Refused(why),
         });
     }
 }
@@ -3512,8 +3562,17 @@ async fn delta_between(
         ))
     };
     divergence::tape::same_tape(y_id, Some(&y_report), m_id, Some(&m_report)).map_err(refuse)?;
-    let y = behaviour_tree_for(st, y_id).await?;
-    let m = behaviour_tree_for(st, m_id).await?;
+    let mut y = behaviour_tree_for(st, y_id).await?;
+    let mut m = behaviour_tree_for(st, m_id).await?;
+    if m.http_comparison_mode != y.http_comparison_mode {
+        use divergence::behaviour_tree::HttpComparisonMode;
+        if m.http_comparison_mode != HttpComparisonMode::Legacy {
+            m = behaviour_tree_for_mode(st, m_id, Some(HttpComparisonMode::Legacy)).await?;
+        }
+        if y.http_comparison_mode != HttpComparisonMode::Legacy {
+            y = behaviour_tree_for_mode(st, y_id, Some(HttpComparisonMode::Legacy)).await?;
+        }
+    }
     let delta = divergence::delta::three_way(&m, &y).map_err(Unavailable::Refused)?;
     let verdict_of = |run: &str| -> serde_json::Value {
         confined(st.root.scorecard_path(run), &st.root.root.join("runs"))
@@ -7156,6 +7215,104 @@ mod tests {
     }
 
     #[test]
+    fn tree_cache_tracks_published_http_decisions_without_rewriting_the_scorecard() {
+        use divergence::{
+            behaviour_tree::{Address, BehaviourTree, HttpComparisonMode},
+            HttpBodyClassification, HttpComparison, HttpResponseComparison, Scorecard,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let st = run_with_ledger(
+            dir.path(),
+            "run-http",
+            RunStatus::Completed,
+            Some(LEDGER_ROW),
+        );
+        let diff: deja_kernel::HttpDiff = serde_json::from_value(serde_json::json!({
+            "correlation_id":"c1", "request_sequence":0, "request_path":"/test",
+            "status_baseline":200, "status_candidate":200, "status_match":true,
+            "body_diff":[{"json_path":"$.items[0]", "baseline":1, "candidate":2}]
+        }))
+        .unwrap();
+        std::fs::write(
+            st.root.http_diff_path("run-http"),
+            format!("{}\n", serde_json::to_string(&diff).unwrap()),
+        )
+        .unwrap();
+        let before = rt().block_on(behaviour_tree_for(&st, "run-http")).unwrap();
+        assert!(before
+            .entries
+            .iter()
+            .any(|e| matches!(e.address, Address::Body { .. })));
+        let mut card = Scorecard::empty("run-http".into());
+        card.http_comparison = Some(HttpComparison {
+            version: 1,
+            responses: vec![HttpResponseComparison {
+                correlation_id: "c1".into(),
+                request_sequence: 0,
+                body: HttpBodyClassification::default(),
+            }],
+        });
+        let published = serde_json::to_string(&card).unwrap();
+        std::fs::write(st.root.scorecard_path("run-http"), &published).unwrap();
+        let native = rt().block_on(behaviour_tree_for(&st, "run-http")).unwrap();
+        assert_eq!(native.http_comparison_mode, HttpComparisonMode::Classified);
+        assert!(!native
+            .entries
+            .iter()
+            .any(|e| matches!(e.address, Address::Body { .. })));
+        let compatible = rt()
+            .block_on(behaviour_tree_for_mode(
+                &st,
+                "run-http",
+                Some(HttpComparisonMode::Legacy),
+            ))
+            .unwrap();
+        assert_eq!(compatible.http_comparison_mode, HttpComparisonMode::Legacy);
+        assert!(compatible
+            .entries
+            .iter()
+            .any(|e| matches!(e.address, Address::Body { .. })));
+        let cache =
+            deja_orchestrator::behaviour_tree_cache_of(&st.root.call_ledger_path("run-http"));
+        let cached = BehaviourTree::from_jsonl(&std::fs::read_to_string(cache).unwrap()).unwrap();
+        assert_eq!(cached.http_comparison_mode, HttpComparisonMode::Classified);
+        assert_eq!(
+            std::fs::read_to_string(st.root.scorecard_path("run-http")).unwrap(),
+            published
+        );
+        card.http_comparison.as_mut().unwrap().version = 2;
+        std::fs::write(
+            st.root.scorecard_path("run-http"),
+            serde_json::to_string(&card).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(rt().block_on(behaviour_tree_for(&st, "run-http")), Err(Unavailable::Refused(why)) if why.contains("unsupported HTTP comparison"))
+        );
+    }
+
+    #[test]
+    fn registered_scorecard_must_arrive_before_building_a_legacy_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = run_with_ledger(
+            dir.path(),
+            "run-card",
+            RunStatus::Completed,
+            Some(LEDGER_ROW),
+        );
+        let registered = [
+            artifact_kinds::CALL_LEDGER.name,
+            artifact_kinds::SCORECARD.name,
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert!(
+            matches!(tree_sources(&st, "run-card", Some(&registered), Some("completed")), Err(Unavailable::Pending(why)) if why.contains("scorecard"))
+        );
+    }
+
+    #[test]
     fn the_row_says_which_kind_of_unavailable() {
         let computed = |pass| Ok(serde_json::json!({ "verdict": { "pass": pass } }));
         assert_eq!(delta_verdict_word(computed(true).as_ref()), "pass");
@@ -8273,7 +8430,7 @@ mod tests {
         let cache = deja_orchestrator::delta_cache_of(&ledger);
         let mut doc = serde_json::json!({
             "y_run": "run-Y", "m_run": "run-M", "canon_version": CANON_VERSION,
-            "semantic_revision": 1, "verdict": {"pass": true}, "requests": {},
+            "semantic_revision": 1, "http_comparison_mode": "legacy", "verdict": {"pass": true}, "requests": {},
         });
 
         std::fs::write(&cache, doc.to_string()).unwrap();

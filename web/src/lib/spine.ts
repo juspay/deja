@@ -29,7 +29,8 @@
 // real graph node ids — 324 of 325 rows end up addressable — without ever
 // trusting the graph for structure.
 
-import { CallRecord, GraphNode, HttpDiff, SpanShapeOutcome } from "./api";
+import { CallRecord, GraphNode, HttpDiff, Scorecard, SpanShapeOutcome } from "./api";
+import { responseMark } from "./comparison";
 
 export type Side = "rec" | "rep";
 
@@ -211,6 +212,7 @@ function markOf(c: CallRecord): Mark | null {
     case "identity_skew":
       return "identity-skew";
     case "matched":
+    case "approved_noise":
     case "recovered":
     case "deterministic":
       return "matched";
@@ -245,6 +247,7 @@ function markOf(c: CallRecord): Mark | null {
  * per request, not 159.
  */
 export function transportFailure(d: HttpDiff): string | null {
+  if (d.transport_error) return d.transport_error;
   const body = d.candidate_body as { error?: unknown } | null | undefined;
   const err = body && typeof body.error === "string" ? body.error : null;
   if (err && d.status_candidate === 0) return err;
@@ -265,6 +268,7 @@ export function buildSpine(
   https: HttpDiff[],
   spanShapes?: Map<string, SpanShapeOutcome[]>,
   opts?: {
+    scorecard?: Scorecard | null;
     /** Promote internal application spans (non-transport graph spans that made
      *  no instrumented call) to real rows under their nearest spine ancestor,
      *  instead of the countable hidden groups. The instrumented lattice —
@@ -401,7 +405,7 @@ export function buildSpine(
           ? "record-only"
           : "replay-only";
     for (const e of n.calls) n.mark = worse(n.mark, markOf(e.call));
-    if (n.http.length > 0) n.mark = worse(n.mark, "response");
+    for (const response of n.http) n.mark = worse(n.mark, responseMark(opts?.scorecard, response));
   }
 
   /* ---- hidden graph spans: attach each to its nearest spine row ---- */

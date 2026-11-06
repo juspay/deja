@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::ledger::CallRecord;
+use super::{ComparisonSubject, Scorecard};
 
 /// Which addressing and canonicalisation produced the tree. Two trees compare
 /// only when they agree, so a delta never mixes keys or hashes from different
@@ -51,7 +52,17 @@ use super::ledger::CallRecord;
 ///    rebuilding a historical ledger cannot relabel its old hashes as new.
 /// 8: retain the legacy hash beside semantic call hashes so existing baselines
 ///    compare across scorer revisions without requiring another replay.
-pub const CANON_VERSION: u32 = 8;
+/// 9: project published HTTP residuals and typed call comparison identities;
+///    HTTP addresses include the response sequence within their correlation.
+pub const CANON_VERSION: u32 = 9;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HttpComparisonMode {
+    #[default]
+    Legacy,
+    Classified,
+}
 
 /// One place a run's behaviour can be observed.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -80,8 +91,14 @@ pub enum Address {
     /// One path of the response body the kernel compared.
     Body {
         correlation: String,
+        #[serde(default, skip_serializing_if = "is_zero_sequence")]
+        request_sequence: u64,
         json_path: String,
     },
+}
+
+fn is_zero_sequence(sequence: &u64) -> bool {
+    *sequence == 0
 }
 
 impl Address {
@@ -126,6 +143,12 @@ pub struct Entry {
     /// Older entries already carry this representation in `value.hash`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison_subject: Option<ComparisonSubject>,
+    /// Independently valid result identities. These are alternatives, never
+    /// successive normalizations of the same value.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comparison_alternatives: Vec<String>,
     /// Whether this address blocks a verdict when it diverges — mirrors the
     /// ledger row's `blocking` for calls; responses always block.
     pub blocking: bool,
@@ -139,6 +162,8 @@ pub struct BehaviourTree {
     /// version used to rebuild this projection.
     #[serde(default)]
     pub argument_revision: u32,
+    #[serde(default)]
+    pub http_comparison_mode: HttpComparisonMode,
     pub entries: Vec<Entry>,
     /// The lane each correlation ran in, from its connector call.
     pub lanes: HashMap<String, Lane>,
@@ -335,6 +360,14 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             lanes.entry(correlation.clone()).or_insert(lane);
         }
         let observed_hash = || {
+            if let Some(comparison) = &row.comparison {
+                if let Some(identity) = &comparison.candidate_identity {
+                    return match comparison.subject {
+                        ComparisonSubject::Arguments => format!("semantic:{identity}"),
+                        ComparisonSubject::Result => identity.clone(),
+                    };
+                }
+            }
             row.semantic_digest.as_ref().map_or_else(
                 || {
                     row.observed
@@ -416,6 +449,16 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                     .and_then(|side| side.args.as_ref())
                     .map(hash_of)
             }),
+            comparison_subject: row.comparison.as_ref().map(|c| c.subject).or_else(|| {
+                row.semantic_digest
+                    .as_ref()
+                    .map(|_| ComparisonSubject::Arguments)
+            }),
+            comparison_alternatives: row
+                .comparison
+                .as_ref()
+                .map(|comparison| comparison.candidate_alternatives.clone())
+                .unwrap_or_default(),
             value,
             blocking: row.blocking,
         });
@@ -428,6 +471,8 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
                 request_sequence: d.request_sequence,
             },
             legacy_hash: None,
+            comparison_subject: None,
+            comparison_alternatives: Vec::new(),
             value: if d.status_match {
                 Value::Reproduced
             } else {
@@ -441,9 +486,12 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             entries.push(Entry {
                 address: Address::Body {
                     correlation: d.correlation_id.clone(),
+                    request_sequence: d.request_sequence,
                     json_path: p.json_path.clone(),
                 },
                 legacy_hash: None,
+                comparison_subject: None,
+                comparison_alternatives: Vec::new(),
                 value: Value::Diverged {
                     hash: hash_of(body_diff_value(d, p)),
                 },
@@ -459,12 +507,175 @@ pub fn build(run_id: &str, rows: &[CallRecord], diffs: &[HttpDiff]) -> Behaviour
             .map(|row| row.argument_revision)
             .min()
             .unwrap_or(super::ledger::ARGUMENT_REVISION),
+        http_comparison_mode: HttpComparisonMode::Legacy,
         entries,
         lanes,
         correlations,
         event_schema_versions: BTreeSet::new(),
         policy_digest: None,
     }
+}
+
+/// Check published comparison provenance before selecting a projection. A
+/// missing old section is legacy; a malformed or future section is not.
+pub fn http_comparison_mode(
+    run_id: &str,
+    diffs: &[HttpDiff],
+    scorecard: Option<&Scorecard>,
+) -> Result<HttpComparisonMode, String> {
+    let Some(card) = scorecard else {
+        return Ok(HttpComparisonMode::Legacy);
+    };
+    if card.run_id != run_id {
+        return Err("the scorecard belongs to a different run".into());
+    }
+    let Some(comparison) = &card.http_comparison else {
+        return Ok(HttpComparisonMode::Legacy);
+    };
+    if comparison.version != 1 {
+        return Err(format!(
+            "unsupported HTTP comparison version {}",
+            comparison.version
+        ));
+    }
+    let expected: BTreeSet<_> = diffs
+        .iter()
+        .map(|d| (d.correlation_id.as_str(), d.request_sequence))
+        .collect();
+    let mut actual = BTreeSet::new();
+    for response in &comparison.responses {
+        if !actual.insert((response.correlation_id.as_str(), response.request_sequence)) {
+            return Err("duplicate published response comparison".into());
+        }
+        if response.body.blocking_leaf_count != response.body.blocking.len() {
+            return Err("published response count disagrees with its residuals".into());
+        }
+        let mut paths = BTreeSet::new();
+        for residual in &response.body.blocking {
+            if residual.candidate_identity.is_empty() || !paths.insert(&residual.diff.json_path) {
+                return Err("invalid or duplicate published response residual".into());
+            }
+        }
+    }
+    if expected.len() != diffs.len() || actual != expected {
+        return Err("published response comparisons do not cover the HTTP artifact".into());
+    }
+    Ok(HttpComparisonMode::Classified)
+}
+
+/// Reuse the scorer's frozen response decisions. Compatibility comparisons
+/// replace only this part of a cached tree, retaining all call judgments.
+pub fn project_http(
+    tree: &mut BehaviourTree,
+    diffs: &[HttpDiff],
+    scorecard: Option<&Scorecard>,
+    mode: HttpComparisonMode,
+) -> Result<(), String> {
+    let available = http_comparison_mode(&tree.run_id, diffs, scorecard)?;
+    if mode == HttpComparisonMode::Classified && available != mode {
+        return Err("this run has no classified HTTP comparison".into());
+    }
+    tree.entries
+        .retain(|entry| !matches!(entry.address, Address::Body { .. }));
+    match mode {
+        HttpComparisonMode::Classified => {
+            let comparison = scorecard
+                .and_then(|c| c.http_comparison.as_ref())
+                .ok_or("this run has no classified HTTP comparison")?;
+            for response in &comparison.responses {
+                for residual in &response.body.blocking {
+                    tree.entries.push(Entry {
+                        address: Address::Body {
+                            correlation: response.correlation_id.clone(),
+                            request_sequence: response.request_sequence,
+                            json_path: residual.diff.json_path.clone(),
+                        },
+                        value: Value::Diverged {
+                            hash: format!("http:v1:{}", residual.candidate_identity),
+                        },
+                        legacy_hash: None,
+                        comparison_subject: None,
+                        comparison_alternatives: Vec::new(),
+                        blocking: true,
+                    });
+                }
+            }
+        }
+        HttpComparisonMode::Legacy => {
+            let accepted: BTreeSet<_> = scorecard
+                .into_iter()
+                .flat_map(|card| &card.per_correlation)
+                .filter(|outcome| outcome.http_body_match)
+                .map(|outcome| outcome.correlation_id.as_str())
+                .collect();
+            for diff in diffs {
+                if accepted.contains(diff.correlation_id.as_str()) {
+                    continue;
+                }
+                for body in &diff.body_diff {
+                    tree.entries.push(Entry {
+                        address: Address::Body {
+                            correlation: diff.correlation_id.clone(),
+                            request_sequence: diff.request_sequence,
+                            json_path: body.json_path.clone(),
+                        },
+                        value: Value::Diverged {
+                            // An old accepted response is omitted above. Its
+                            // remaining raw leaves carry no per-path allowance,
+                            // so keep array and text order strict here.
+                            hash: format!(
+                                "legacy-http:v1:{:016x}",
+                                super::written_hash(body_diff_value(diff, body), true)
+                            ),
+                        },
+                        legacy_hash: None,
+                        comparison_subject: None,
+                        comparison_alternatives: Vec::new(),
+                        blocking: true,
+                    });
+                }
+            }
+        }
+    }
+    tree.http_comparison_mode = mode;
+    Ok(())
+}
+
+pub fn build_with_scorecard(
+    run_id: &str,
+    rows: &[CallRecord],
+    diffs: &[HttpDiff],
+    scorecard: Option<&Scorecard>,
+) -> Result<BehaviourTree, String> {
+    for row in rows {
+        if let Some(comparison) = &row.comparison {
+            if comparison.version != 1 {
+                return Err(format!(
+                    "unsupported call comparison version {}",
+                    comparison.version
+                ));
+            }
+            if comparison.subject == ComparisonSubject::Result
+                && comparison
+                    .candidate_identity
+                    .as_ref()
+                    .is_none_or(String::is_empty)
+            {
+                return Err("a result has no published comparison identity".into());
+            }
+            if comparison
+                .candidate_alternatives
+                .iter()
+                .any(String::is_empty)
+            {
+                return Err("an alternative result comparison identity is empty".into());
+            }
+        }
+    }
+    let mode = http_comparison_mode(run_id, diffs, scorecard)?;
+    let mut tree = build(run_id, rows, diffs);
+    project_http(&mut tree, diffs, scorecard, mode)?;
+    Ok(tree)
 }
 
 /// Write `bytes` so that a concurrent reader sees either the previous file
@@ -506,6 +717,7 @@ impl BehaviourTree {
                 "run_id": self.run_id,
                 "canon_version": self.canon_version,
                 "argument_revision": self.argument_revision,
+                "http_comparison_mode": self.http_comparison_mode,
                 "entries": self.entries.len(),
                 "lanes": self.lanes,
                 "correlations": self.correlations,
@@ -543,6 +755,8 @@ impl BehaviourTree {
             run_id: head.get("run_id")?.as_str()?.to_owned(),
             canon_version: head.get("canon_version")?.as_u64()? as u32,
             argument_revision: head.get("argument_revision")?.as_u64()?.try_into().ok()?,
+            http_comparison_mode: serde_json::from_value(head.get("http_comparison_mode")?.clone())
+                .ok()?,
             entries,
             lanes: serde_json::from_value(head.get("lanes")?.clone()).ok()?,
             correlations: serde_json::from_value(head.get("correlations")?.clone()).ok()?,
@@ -591,6 +805,7 @@ mod tests {
         args: serde_json::Value,
     ) -> CallRecord {
         CallRecord {
+            comparison: None,
             argument_revision: super::super::ledger::ARGUMENT_REVISION,
             correlation_id: Some(corr.to_owned()),
             source_event_global_sequence: source_seq,
@@ -1067,5 +1282,171 @@ mod tests {
         tree.event_schema_versions = [10].into_iter().collect();
         let back = BehaviourTree::from_jsonl(&tree.to_jsonl()).unwrap();
         assert_eq!(back.event_schema_versions, tree.event_schema_versions);
+    }
+
+    fn response(sequence: u64) -> HttpDiff {
+        HttpDiff {
+            correlation_id: "c".into(),
+            request_sequence: sequence,
+            request_path: "/test".into(),
+            status_baseline: 200,
+            status_candidate: 200,
+            status_match: true,
+            body_diff: vec![JsonFieldDiff {
+                json_path: "$.items[0]".into(),
+                baseline: serde_json::json!(1),
+                candidate: serde_json::json!(2),
+            }],
+            baseline_body: None,
+            candidate_body: None,
+            transport_error: None,
+        }
+    }
+
+    fn accepted_card(run: &str) -> Scorecard {
+        let mut card = Scorecard::empty(run.into());
+        card.per_correlation.push(
+            serde_json::from_value(serde_json::json!({
+                "correlation_id":"c", "http_status_match":true, "http_body_match":true,
+                "side_effect_divergences":1, "scoring_mode":{"mode":"graph"}, "passed":false
+            }))
+            .unwrap(),
+        );
+        card
+    }
+
+    #[test]
+    fn historical_http_acceptance_is_preserved_without_erasing_call_drift() {
+        let call = row(
+            "value_diverged",
+            "c",
+            "s",
+            Some(7),
+            serde_json::json!({"amount":2}),
+        );
+        let tree =
+            build_with_scorecard("r", &[call], &[response(0)], Some(&accepted_card("r"))).unwrap();
+        assert_eq!(tree.http_comparison_mode, HttpComparisonMode::Legacy);
+        assert!(!tree
+            .entries
+            .iter()
+            .any(|e| matches!(e.address, Address::Body { .. })));
+        assert!(tree
+            .entries
+            .iter()
+            .any(|e| matches!(e.address, Address::Call { .. })
+                && matches!(e.value, Value::Diverged { .. })));
+        let unknown = build_with_scorecard("r", &[], &[response(0)], None).unwrap();
+        assert!(unknown
+            .entries
+            .iter()
+            .any(|e| matches!(e.address, Address::Body { .. })));
+    }
+
+    #[test]
+    fn published_http_residuals_are_addressed_by_response_and_use_their_own_values() {
+        use crate::divergence::{
+            HttpBodyClassification, HttpBodyResidual, HttpComparison, HttpResponseComparison,
+        };
+        let diffs = [response(0), response(1)];
+        let mut card = accepted_card("r");
+        card.http_comparison = Some(HttpComparison {
+            version: 1,
+            responses: diffs
+                .iter()
+                .map(|d| HttpResponseComparison {
+                    correlation_id: "c".into(),
+                    request_sequence: d.request_sequence,
+                    body: HttpBodyClassification {
+                        blocking_leaf_count: 1,
+                        blocking: vec![HttpBodyResidual {
+                            diff: JsonFieldDiff {
+                                json_path: "$.items".into(),
+                                baseline: serde_json::json!([1]),
+                                candidate: serde_json::json!([2, 3]),
+                            },
+                            candidate_identity: format!("residual-{}", d.request_sequence),
+                        }],
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+        });
+        let tree = build_with_scorecard("r", &[], &diffs, Some(&card)).unwrap();
+        let bodies: Vec<_> = tree
+            .entries
+            .iter()
+            .filter(|e| matches!(e.address, Address::Body { .. }))
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_ne!(bodies[0].address, bodies[1].address);
+        assert!(
+            matches!(&bodies[1].value, Value::Diverged { hash } if hash == "http:v1:residual-1")
+        );
+        let cached = BehaviourTree::from_jsonl(&tree.to_jsonl()).unwrap();
+        assert_eq!(cached.http_comparison_mode, HttpComparisonMode::Classified);
+
+        let mut future = card.clone();
+        future.http_comparison.as_mut().unwrap().version = 2;
+        assert!(build_with_scorecard("r", &[], &diffs, Some(&future)).is_err());
+        let mut partial = card.clone();
+        partial.http_comparison.as_mut().unwrap().responses.pop();
+        assert!(build_with_scorecard("r", &[], &diffs, Some(&partial)).is_err());
+        let mut invalid = card.clone();
+        invalid.http_comparison.as_mut().unwrap().responses[0]
+            .body
+            .blocking_leaf_count = 0;
+        assert!(build_with_scorecard("r", &[], &diffs, Some(&invalid)).is_err());
+        assert!(build_with_scorecard("other", &[], &diffs, Some(&card)).is_err());
+    }
+
+    #[test]
+    fn executed_calls_use_published_result_identity_even_when_arguments_are_unchanged() {
+        use crate::divergence::{CallComparison, ValueVerdict};
+        let mut call = row(
+            "value_diverged",
+            "c",
+            "s",
+            Some(7),
+            serde_json::json!({"same":"args"}),
+        );
+        call.comparison = Some(CallComparison {
+            version: 1,
+            subject: ComparisonSubject::Result,
+            verdict: ValueVerdict::Diverged,
+            candidate_identity: Some("result:v1:first".into()),
+            candidate_alternatives: Vec::new(),
+        });
+        let m = build_with_scorecard("m", &[call.clone()], &[], None).unwrap();
+        call.comparison.as_mut().unwrap().candidate_identity = Some("result:v1:second".into());
+        let y = build_with_scorecard("y", &[call.clone()], &[], None).unwrap();
+        let delta = super::super::delta::three_way(&m, &y).unwrap();
+        assert_eq!(delta.verdict.changed, 1);
+        assert!(!delta.verdict.pass);
+        call.comparison.as_mut().unwrap().version = 2;
+        assert!(build_with_scorecard("future", &[call.clone()], &[], None).is_err());
+        call.comparison.as_mut().unwrap().version = 1;
+        call.comparison.as_mut().unwrap().candidate_identity = None;
+        assert!(build_with_scorecard("invalid", &[call], &[], None).is_err());
+    }
+
+    #[test]
+    fn historical_unaccepted_form_residuals_keep_repeated_value_order() {
+        let make = |run: &str, text: &str| {
+            let mut diff = response(0);
+            diff.body_diff = deja_kernel::diff_form_strings("a=0&a=0&b=0", text, "$", &[]).unwrap();
+            let mut card = accepted_card(run);
+            card.per_correlation[0].http_body_match = false;
+            build_with_scorecard(run, &[], &[diff], Some(&card)).unwrap()
+        };
+        let m = make("m", "a=1&a=2&b=0");
+        let y = make("y", "a=2&a=1&b=0");
+        assert_eq!(
+            super::super::delta::three_way(&m, &y)
+                .unwrap()
+                .verdict
+                .changed,
+            1
+        );
     }
 }
