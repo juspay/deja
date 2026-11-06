@@ -1,8 +1,7 @@
 import React from "react";
-import { diffArgs, summarizeLeaves } from "../lib/argdiff";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, StageRow, runParams, ChangeReach } from "../lib/api";
+import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, Scorecard, StageRow, runParams, ChangeReach } from "../lib/api";
 import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { VerdictBanner } from "../components/Result";
@@ -11,8 +10,10 @@ import { KillRun } from "../components/KillRun";
 import UnifiedView from "../components/UnifiedView";
 import { BaselineNote, DeltaPanel } from "../components/DeltaSummary";
 import { AcknowledgeButton } from "../components/Acknowledgements";
+import { CorrelationOutcome } from "../components/Comparison";
 import { Side, transportFailure } from "../lib/spine";
 import { emptyFindingsText, evidenceOf } from "../lib/evidence";
+import { callComparisonText, responseFinding } from "../lib/comparison";
 
 /* ---------------------------------------------------------------- header --- */
 
@@ -140,13 +141,8 @@ type Finding = {
    */
   nodeId: number | null;
   side: Side;
-  /**
-   * What changed, for a value divergence: the first changed leaves of the
-   * recorded-vs-attempted arguments, so the list says `headers.prefer:
-   * return=representation → return=minimal` and nobody has to open thirty
-   * header lines to find it.
-   */
-  what?: ReturnType<typeof summarizeLeaves>;
+  /** The scorer's published explanation, without re-comparing captured values. */
+  why?: string;
 };
 
 // The order a reader should meet them: what changed, what that changed, what the
@@ -167,7 +163,7 @@ const RANK_BLURB: Record<FindingRank, string> = {
   origin:
     "an Execute boundary ran during replay and returned a value that differs from the recording — the cause",
   consequence: "a call downstream of an origin, carrying the changed value",
-  http: "what the caller saw: the recorded response and the replayed response differ",
+  http: "response findings published by the scorer",
   omitted:
     "the recording made this call and the candidate did not. NOT a claim the span never ran — /calls carries no span-presence evidence",
   novel: "the candidate made a call the recording did not",
@@ -190,7 +186,7 @@ function spanOf(c: CallRecord): string {
   return c.observed?.span_path ?? c.recorded?.span_path ?? "";
 }
 
-function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
+function buildFindings(calls: CallRecord[], https: HttpDiff[], scorecard?: Scorecard | null): Finding[] {
   const out: Finding[] = [];
   for (const c of calls) {
     let rank: FindingRank | null = null;
@@ -237,10 +233,6 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
         ? [[rep, "rep"], [rec, "rec"]]
         : [[rec, "rec"], [rep, "rep"]];
     const [nodeId, side] = order.find(([id]) => id != null) ?? [null, "rec" as Side];
-    const what =
-      c.kind === "value_diverged" && c.recorded?.args !== undefined && c.observed?.args !== undefined
-        ? summarizeLeaves(diffArgs(c.recorded.args, c.observed.args))
-        : undefined;
     out.push({
       rank,
       correlation: c.correlation_id ?? null,
@@ -249,29 +241,18 @@ function buildFindings(calls: CallRecord[], https: HttpDiff[]): Finding[] {
       span: spanOf(c),
       nodeId,
       side,
-      // Kept when it is EMPTY as well. An empty leaf-diff on a flagged finding
-      // means the two sides hold the same values in a different order, and
-      // dropping it here rendered nothing at all — the silent case `UnifiedView`
-      // was taught to name as "order only", still live in this view because the
-      // fix landed in one of the two places that needed it.
-      what,
+      why: c.comparison ? callComparisonText(c) : undefined,
     });
   }
   for (const d of https) {
-    if (d.status_match && d.body_diff.length === 0) continue;
+    const finding = responseFinding(scorecard, d);
+    if (!finding) continue;
     const failed = transportFailure(d);
     out.push({
-      rank: "http",
+      rank: finding.unavailable ? "unknown" : "http",
       correlation: d.correlation_id,
       title: `${d.request_path} · seq ${d.request_sequence}`,
-      // ONE failure, not 54 fields. When the candidate produced no parseable
-      // response every recorded field is reported as differing; saying "54
-      // fields differ" would present one failure as 54.
-      where: failed
-        ? `no response — ${failed}`
-        : d.status_match
-          ? `${d.body_diff.length} field${d.body_diff.length === 1 ? "" : "s"} differ`
-          : `${d.status_baseline} → ${d.status_candidate}`,
+      where: failed ? `no response — ${failed}` : finding.label,
       span: "",
       nodeId: null,
       side: "rep",
@@ -291,36 +272,8 @@ function FindingRow({ f, onOpen }: { f: Finding; onOpen: (f: Finding) => void })
         <span className="fwhere mono">{f.where}</span>
         {f.correlation && <span className="fcorr mono">{f.correlation.slice(0, 8)}</span>}
       </button>
-      {f.what && <ChangedLeaves what={f.what} />}
+      {f.why && <div className="fwhat">{f.why}</div>}
     </li>
-  );
-}
-
-/** The changed leaves of a finding, inline under its row. */
-function ChangedLeaves({ what }: { what: NonNullable<Finding["what"]> }) {
-  // No leaf differs, yet the finding was flagged: same values, different order.
-  // Saying so is not a guess — it is what an empty leaf-diff here means.
-  if (what.shown.length === 0) {
-    return (
-      <div
-        className="fwhat mono"
-        title="the two sides hold the same values in a different order — no leaf differs"
-      >
-        <span className="jpath">order only</span>
-      </div>
-    );
-  }
-  return (
-    <div className="fwhat mono">
-      {what.shown.map((l) => (
-        <span key={l.path} className="fleaf">
-          <span className="jpath">{l.path}</span>
-          <del>{l.recorded}</del>
-          <ins>{l.candidate}</ins>
-        </span>
-      ))}
-      {what.more > 0 && <span className="fmore">+{what.more} more</span>}
-    </div>
   );
 }
 
@@ -592,10 +545,10 @@ function CorrelationTable({ run }: { run: RunRow }) {
         {rows.map((row) => (
           <tr key={row.correlation_id}>
             <td className="mono">{row.correlation_id}</td>
-            <td><span className={`chip ${row.http_status_match ? "pass" : "fail"}`}>{row.http_status_match ? "match" : "mismatch"}</span></td>
-            <td><span className={`chip ${row.http_body_match ? "pass" : "fail"}`}>{row.http_body_match ? "match" : "mismatch"}</span></td>
+            <td><span className={`chip ${row.http_status_match === undefined ? "muted" : row.http_status_match ? "pass" : "fail"}`}>{row.http_status_match === undefined ? "not published" : row.http_status_match ? "accepted" : "mismatch"}</span></td>
+            <td><span className={`chip ${row.http_body_match === undefined ? "muted" : row.http_body_match ? "pass" : "fail"}`}>{row.http_body_match === undefined ? "not published" : row.http_body_match ? "accepted" : "mismatch"}</span></td>
             <td className="num">{row.side_effect_divergences ?? 0}</td>
-            <td><span className={`chip ${row.passed ? "pass" : "fail"}`}>{row.passed ? "reproduced" : "diverged"}</span></td>
+            <td><CorrelationOutcome row={row} /></td>
           </tr>
         ))}
       </tbody>
@@ -728,8 +681,8 @@ export default function ReportPage() {
     [calls.data, calls.error, https.data, https.error],
   );
   const findings = React.useMemo(
-    () => buildFindings(evidence.calls, evidence.https),
-    [evidence],
+    () => buildFindings(evidence.calls, evidence.https, run.data?.scorecard),
+    [evidence, run.data?.scorecard],
   );
 
   // A finding is an anchor into the one execution view — the same

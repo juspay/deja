@@ -9,7 +9,8 @@
 //! hand-rolled HTTP/1.1 client, gRPC ingress (`rpc`) over the [`grpc`]
 //! module's HTTP/2 client — one kernel binary, one `KERNEL_*` contract.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -294,6 +295,133 @@ fn extract_body_bytes(body: Option<&serde_json::Value>) -> Option<Vec<u8>> {
     None
 }
 
+/// A member name is distinct from an array index, including when the member
+/// contains dots, brackets, quotes, or an empty string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonPathSegment {
+    Member(String),
+    Index(Option<usize>),
+}
+
+/// Keep ordinary HTTP paths readable; quote only names that would otherwise
+/// be interpreted as path syntax. The quote uses JSON string escaping.
+pub fn append_json_path_member(path: &str, key: &str) -> String {
+    if key.is_empty() || key.contains(['.', '[', ']', '"', '\\']) {
+        format!(
+            "{path}[{}]",
+            serde_json::to_string(key).expect("a string serializes")
+        )
+    } else {
+        format!("{path}.{key}")
+    }
+}
+
+/// Read the HTTP evidence path grammar, including `[]` declaration indices.
+/// Bare selectors retain their historical optional `$` prefix.
+pub fn parse_json_path(path: &str) -> Option<Vec<JsonPathSegment>> {
+    let path = path.strip_prefix('$').unwrap_or(path);
+    let mut at = 0;
+    let mut segments = Vec::new();
+    while at < path.len() {
+        match path.as_bytes()[at] {
+            b'[' => {
+                at += 1;
+                if path.as_bytes().get(at) == Some(&b'"') {
+                    let mut strings =
+                        serde_json::Deserializer::from_str(&path[at..]).into_iter::<String>();
+                    let member = strings.next()?.ok()?;
+                    at += strings.byte_offset();
+                    if path.as_bytes().get(at) != Some(&b']') {
+                        return None;
+                    }
+                    at += 1;
+                    segments.push(JsonPathSegment::Member(member));
+                } else {
+                    let end = at + path[at..].find(']')?;
+                    let index = if end == at {
+                        None
+                    } else {
+                        Some(path[at..end].parse().ok()?)
+                    };
+                    segments.push(JsonPathSegment::Index(index));
+                    at = end + 1;
+                }
+            }
+            b'.' => {
+                at += 1;
+                let end = path[at..]
+                    .find(['.', '[', ']', '"', '\\'])
+                    .map_or(path.len(), |n| at + n);
+                if end == at {
+                    return None;
+                }
+                segments.push(JsonPathSegment::Member(path[at..end].to_owned()));
+                at = end;
+            }
+            _ if at == 0 => {
+                let end = path.find(['.', '[', ']', '"', '\\']).unwrap_or(path.len());
+                if end == 0 {
+                    return None;
+                }
+                segments.push(JsonPathSegment::Member(path[..end].to_owned()));
+                at = end;
+            }
+            _ => return None,
+        }
+    }
+    Some(segments)
+}
+
+pub fn format_json_path(segments: &[JsonPathSegment]) -> String {
+    let mut path = "$".to_owned();
+    for segment in segments {
+        match segment {
+            JsonPathSegment::Member(member) => path = append_json_path_member(&path, member),
+            JsonPathSegment::Index(Some(index)) => path.push_str(&format!("[{index}]")),
+            JsonPathSegment::Index(None) => path.push_str("[]"),
+        }
+    }
+    path
+}
+
+/// The original spelling is used only at stored-evidence/allowance boundaries,
+/// never for containment between unambiguous addresses.
+pub fn legacy_json_path(path: &str) -> Option<String> {
+    let mut legacy = "$".to_owned();
+    for segment in parse_json_path(path)? {
+        match segment {
+            JsonPathSegment::Member(member) => {
+                legacy.push('.');
+                legacy.push_str(&member);
+            }
+            JsonPathSegment::Index(Some(index)) => legacy.push_str(&format!("[{index}]")),
+            JsonPathSegment::Index(None) => legacy.push_str("[]"),
+        }
+    }
+    Some(legacy)
+}
+
+#[derive(Clone, Copy)]
+enum PathSpelling {
+    Legacy,
+    Addressed,
+}
+
+impl PathSpelling {
+    fn member(self, path: &str, key: &str) -> String {
+        match self {
+            Self::Legacy => format!("{path}.{key}"),
+            Self::Addressed => append_json_path_member(path, key),
+        }
+    }
+
+    fn allowed(self, path: &str, allowlist: &[&str]) -> bool {
+        allowlist.contains(&path)
+            || matches!(self, Self::Addressed)
+                && legacy_json_path(path).is_some_and(|legacy| allowlist.contains(&legacy.as_str()))
+    }
+}
+
 /// Compute a path-level diff between two JSON values. `path` is the JSONPath
 /// prefix the caller is recursing under (starts as `"$"`). `allowlist`
 /// suppresses divergences at any JSONPath in the set (e.g. `$.payment_id`
@@ -304,7 +432,34 @@ pub fn diff_json(
     path: &str,
     allowlist: &[&str],
 ) -> Vec<JsonFieldDiff> {
-    if allowlist.contains(&path) {
+    diff_json_paths(baseline, candidate, path, allowlist, PathSpelling::Legacy)
+}
+
+/// The same kernel comparison with unambiguous member addresses. Raw artifacts
+/// keep their existing spelling; this view identifies their stored evidence.
+pub fn addressed_diff_json(
+    baseline: &serde_json::Value,
+    candidate: &serde_json::Value,
+    path: &str,
+    allowlist: &[&str],
+) -> Vec<JsonFieldDiff> {
+    diff_json_paths(
+        baseline,
+        candidate,
+        path,
+        allowlist,
+        PathSpelling::Addressed,
+    )
+}
+
+fn diff_json_paths(
+    baseline: &serde_json::Value,
+    candidate: &serde_json::Value,
+    path: &str,
+    allowlist: &[&str],
+    spelling: PathSpelling,
+) -> Vec<JsonFieldDiff> {
+    if spelling.allowed(path, allowlist) {
         return Vec::new();
     }
     if baseline == candidate {
@@ -317,10 +472,12 @@ pub fn diff_json(
             keys.sort();
             keys.dedup();
             for k in keys {
-                let next_path = format!("{path}.{k}");
+                let next_path = spelling.member(path, k);
                 let b_val = b.get(k).unwrap_or(&serde_json::Value::Null);
                 let c_val = c.get(k).unwrap_or(&serde_json::Value::Null);
-                diffs.extend(diff_json(b_val, c_val, &next_path, allowlist));
+                diffs.extend(diff_json_paths(
+                    b_val, c_val, &next_path, allowlist, spelling,
+                ));
             }
             diffs
         }
@@ -331,7 +488,9 @@ pub fn diff_json(
                 let next_path = format!("{path}[{i}]");
                 let b_val = b.get(i).unwrap_or(&serde_json::Value::Null);
                 let c_val = c.get(i).unwrap_or(&serde_json::Value::Null);
-                diffs.extend(diff_json(b_val, c_val, &next_path, allowlist));
+                diffs.extend(diff_json_paths(
+                    b_val, c_val, &next_path, allowlist, spelling,
+                ));
             }
             diffs
         }
@@ -358,7 +517,7 @@ pub fn diff_json(
             ) {
                 let structural = |v: &serde_json::Value| v.is_object() || v.is_array();
                 if structural(&bv) && structural(&cv) {
-                    return diff_json(&bv, &cv, path, allowlist);
+                    return diff_json_paths(&bv, &cv, path, allowlist, spelling);
                 }
             }
             // Same rule, second encoding: a form-urlencoded body is a map
@@ -368,7 +527,7 @@ pub fn diff_json(
             // order-insensitively; repeated same-named keys keep their
             // relative order (that order is array semantics, not noise).
             if let (Some(bp), Some(cp)) = (parse_form_pairs(b), parse_form_pairs(c)) {
-                return diff_form_pairs(&bp, &cp, path, allowlist);
+                return diff_form_pairs(&bp, &cp, path, allowlist, spelling);
             }
             vec![JsonFieldDiff {
                 json_path: path.to_owned(),
@@ -382,6 +541,40 @@ pub fn diff_json(
             candidate: c.clone(),
         }],
     }
+}
+
+/// Compare strings under the kernel's existing form grammar. `None` means
+/// either string is opaque; an empty diff means both forms agree. Repeated
+/// keys retain their ordered values, including in the returned residuals.
+pub fn diff_form_strings(
+    baseline: &str,
+    candidate: &str,
+    path: &str,
+    allowlist: &[&str],
+) -> Option<Vec<JsonFieldDiff>> {
+    Some(diff_form_pairs(
+        &parse_form_pairs(baseline)?,
+        &parse_form_pairs(candidate)?,
+        path,
+        allowlist,
+        PathSpelling::Legacy,
+    ))
+}
+
+/// Form residuals under the same grammar with unambiguous field addresses.
+pub fn addressed_diff_form_strings(
+    baseline: &str,
+    candidate: &str,
+    path: &str,
+    allowlist: &[&str],
+) -> Option<Vec<JsonFieldDiff>> {
+    Some(diff_form_pairs(
+        &parse_form_pairs(baseline)?,
+        &parse_form_pairs(candidate)?,
+        path,
+        allowlist,
+        PathSpelling::Addressed,
+    ))
 }
 
 /// Read a string as form-urlencoded pairs, STRICTLY: at least two
@@ -405,6 +598,23 @@ fn parse_form_pairs(raw: &str) -> Option<Vec<(&str, &str)>> {
         .collect()
 }
 
+/// The same strict form grammar used by response comparison, grouped by key.
+/// Key order is incidental; each key's value order and multiplicity remain.
+pub fn parse_form_fields(raw: &str) -> Option<BTreeMap<String, Vec<String>>> {
+    Some(group_form_pairs(&parse_form_pairs(raw)?))
+}
+
+fn group_form_pairs(pairs: &[(&str, &str)]) -> BTreeMap<String, Vec<String>> {
+    let mut by_key: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (key, value) in pairs {
+        by_key
+            .entry((*key).to_owned())
+            .or_default()
+            .push((*value).to_owned());
+    }
+    by_key
+}
+
 /// Compare two pair lists: per key, the ordered list of its values must be
 /// equal (repeated-key order is meaningful; distinct-key order is not). A
 /// differing key reports at `{path}.{key}` — the key names the field, which
@@ -414,26 +624,17 @@ fn diff_form_pairs(
     candidate: &[(&str, &str)],
     path: &str,
     allowlist: &[&str],
+    spelling: PathSpelling,
 ) -> Vec<JsonFieldDiff> {
-    let group = |pairs: &[(&str, &str)]| {
-        let mut by_key: std::collections::BTreeMap<String, Vec<String>> = Default::default();
-        for (k, v) in pairs {
-            by_key
-                .entry((*k).to_owned())
-                .or_default()
-                .push((*v).to_owned());
-        }
-        by_key
-    };
-    let b = group(baseline);
-    let c = group(candidate);
+    let b = group_form_pairs(baseline);
+    let c = group_form_pairs(candidate);
     let mut keys: Vec<&String> = b.keys().chain(c.keys()).collect();
     keys.sort();
     keys.dedup();
     let mut diffs = Vec::new();
     for k in keys {
-        let key_path = format!("{path}.{k}");
-        if allowlist.contains(&key_path.as_str()) {
+        let key_path = spelling.member(path, k);
+        if spelling.allowed(&key_path, allowlist) {
             continue;
         }
         let bv = b.get(k);
@@ -453,6 +654,155 @@ fn diff_form_pairs(
         });
     }
     diffs
+}
+
+/// Give existing raw rows unique field addresses without changing which rows
+/// were reported or their operands. Reconstruction supplies identity only: a
+/// row absent from the stored artifact can never become a new finding here.
+pub fn addressed_body_diff(diff: &HttpDiff) -> Result<Cow<'_, [JsonFieldDiff]>, String> {
+    if diff.body_diff.is_empty() {
+        return Ok(Cow::Borrowed(&diff.body_diff));
+    }
+    let (Some(baseline), Some(candidate)) = (&diff.baseline_body, &diff.candidate_body) else {
+        let paths: BTreeSet<_> = diff.body_diff.iter().map(|row| &row.json_path).collect();
+        if paths.len() != diff.body_diff.len() {
+            return Err(
+                "ambiguous response paths have no captured bodies to distinguish their fields"
+                    .into(),
+            );
+        }
+        if diff.body_diff.iter().any(|row| {
+            parse_json_path(&row.json_path)
+                .is_none_or(|segments| format_json_path(&segments) != row.json_path)
+        }) {
+            return Err("legacy response member spelling needs captured bodies to recover its field address".into());
+        }
+        return Ok(Cow::Borrowed(&diff.body_diff));
+    };
+    let mut sites: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    collect_body_sites(baseline, "$", "$", &mut sites);
+    collect_body_sites(candidate, "$", "$", &mut sites);
+    let mut groups: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (index, row) in diff.body_diff.iter().enumerate() {
+        groups.entry(&row.json_path).or_default().push(index);
+    }
+    let mut addressed = diff.body_diff.clone();
+    let mut reconstructed = None;
+    for (legacy, indices) in groups {
+        let Some(concrete) = sites.get(legacy) else {
+            // Older kernels can report an opaque value that the captured
+            // bodies do not describe. Keep unique ordinary evidence as written;
+            // ambiguous spelling still needs proof and can never be guessed.
+            if indices.len() == 1
+                && !legacy.contains("[\"")
+                && parse_json_path(legacy).is_some_and(|parts| format_json_path(&parts) == legacy)
+            {
+                continue;
+            }
+            return Err(format!(
+                "stored response path {legacy} cannot be located in its captured bodies"
+            ));
+        };
+        if concrete.len() == 1 {
+            let path = concrete.first().expect("a concrete site");
+            for index in indices {
+                addressed[index].json_path.clone_from(path);
+            }
+            continue;
+        }
+        let fresh =
+            reconstructed.get_or_insert_with(|| addressed_diff_json(baseline, candidate, "$", &[]));
+        let available: Vec<_> = fresh
+            .iter()
+            .filter(|row| legacy_json_path(&row.json_path).as_deref() == Some(legacy))
+            .collect();
+        let mut pending = indices;
+        while let Some(&first) = pending.first() {
+            let stored = &diff.body_diff[first];
+            let same_values = |row: &JsonFieldDiff| {
+                row.baseline == stored.baseline && row.candidate == stored.candidate
+            };
+            let (same, other): (Vec<_>, Vec<_>) = pending
+                .into_iter()
+                .partition(|&index| same_values(&diff.body_diff[index]));
+            let mut matches: Vec<_> = available.iter().filter(|row| same_values(row)).collect();
+            if matches.len() != same.len() {
+                return Err(format!(
+                    "stored response path {legacy} has ambiguous or incomplete field evidence"
+                ));
+            }
+            matches.sort_by(|a, b| a.json_path.cmp(&b.json_path));
+            for (index, concrete) in same.into_iter().zip(matches) {
+                addressed[index].json_path.clone_from(&concrete.json_path);
+            }
+            pending = other;
+        }
+    }
+    if addressed
+        .iter()
+        .map(|row| &row.json_path)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != addressed.len()
+    {
+        return Err("stored response rows do not identify distinct fields".into());
+    }
+    if addressed == diff.body_diff {
+        Ok(Cow::Borrowed(&diff.body_diff))
+    } else {
+        Ok(Cow::Owned(addressed))
+    }
+}
+
+fn collect_body_sites(
+    value: &serde_json::Value,
+    legacy: &str,
+    addressed: &str,
+    sites: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    sites
+        .entry(legacy.to_owned())
+        .or_default()
+        .insert(addressed.to_owned());
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                collect_body_sites(
+                    value,
+                    &format!("{legacy}.{key}"),
+                    &append_json_path_member(addressed, key),
+                    sites,
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (index, value) in items.iter().enumerate() {
+                collect_body_sites(
+                    value,
+                    &format!("{legacy}[{index}]"),
+                    &format!("{addressed}[{index}]"),
+                    sites,
+                );
+            }
+        }
+        serde_json::Value::String(text) => {
+            if let Ok(document) = serde_json::from_str::<serde_json::Value>(text) {
+                if document.is_object() || document.is_array() {
+                    collect_body_sites(&document, legacy, addressed, sites);
+                    return;
+                }
+            }
+            if let Some(fields) = parse_form_fields(text) {
+                for key in fields.keys() {
+                    sites
+                        .entry(format!("{legacy}.{key}"))
+                        .or_default()
+                        .insert(append_json_path_member(addressed, key));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Build an `HttpDiff` from baseline + candidate, applying the allowlist.
@@ -932,5 +1282,217 @@ mod tests {
         assert_eq!(diffs[0].json_path, "$[3]");
         assert_eq!(diffs[0].baseline, serde_json::Value::Null);
         assert_eq!(diffs[0].candidate, serde_json::json!(4));
+    }
+
+    #[test]
+    fn addressed_paths_round_trip_literal_members_and_indices() {
+        let names = [
+            "ordinary", "a.b", "a[0]", "", "quote\"", "slash\\", "雪", "0", "]", "a\nb",
+        ];
+        for name in names {
+            let parts = vec![
+                JsonPathSegment::Member(name.into()),
+                JsonPathSegment::Index(Some(7)),
+                JsonPathSegment::Member("nested".into()),
+            ];
+            let rendered = format_json_path(&parts);
+            assert_eq!(parse_json_path(&rendered), Some(parts), "{name:?}");
+        }
+        assert_eq!(append_json_path_member("$", "ordinary"), "$.ordinary");
+        assert_eq!(append_json_path_member("$", "a.b"), "$[\"a.b\"]");
+        assert_eq!(
+            parse_json_path("$.items[].id"),
+            Some(vec![
+                JsonPathSegment::Member("items".into()),
+                JsonPathSegment::Index(None),
+                JsonPathSegment::Member("id".into())
+            ])
+        );
+        for invalid in ["$..a", "$[abc]", "$[\"unterminated]", "$.a]", "$[0]tail"] {
+            assert!(parse_json_path(invalid).is_none(), "{invalid}");
+        }
+    }
+
+    fn captured_diff(baseline: serde_json::Value, candidate: serde_json::Value) -> HttpDiff {
+        let body_diff = diff_json(&baseline, &candidate, "$", &[]);
+        HttpDiff {
+            correlation_id: "c".into(),
+            request_sequence: 0,
+            request_path: "/test".into(),
+            status_baseline: 200,
+            status_candidate: 200,
+            status_match: true,
+            body_diff,
+            baseline_body: Some(baseline),
+            candidate_body: Some(candidate),
+            transport_error: None,
+        }
+    }
+
+    #[test]
+    fn addressed_evidence_distinguishes_colliding_literal_and_nested_fields() {
+        let baseline =
+            serde_json::json!({"a.b":0,"a":{"b":0},"items[0]":0,"items":[0],"":0,"quote\"\\":0});
+        let candidate =
+            serde_json::json!({"a.b":1,"a":{"b":1},"items[0]":1,"items":[1],"":1,"quote\"\\":1});
+        let diff = captured_diff(baseline.clone(), candidate.clone());
+        let original = serde_json::to_value(&diff).expect("raw artifact");
+        assert_eq!(
+            diff.body_diff
+                .iter()
+                .filter(|row| row.json_path == "$.a.b")
+                .count(),
+            2
+        );
+        let addressed = addressed_body_diff(&diff).expect("all fields have captured evidence");
+        assert_eq!(addressed.len(), diff.body_diff.len());
+        assert_eq!(
+            addressed
+                .iter()
+                .map(|row| &row.json_path)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            addressed.len()
+        );
+        for path in [
+            "$.a.b",
+            "$[\"a.b\"]",
+            "$.items[0]",
+            "$[\"items[0]\"]",
+            "$[\"\"]",
+        ] {
+            assert!(addressed.iter().any(|row| row.json_path == path), "{path}");
+        }
+        assert_eq!(serde_json::to_value(&diff).expect("raw artifact"), original);
+        assert!(
+            diff_json(&baseline, &candidate, "$", &["$.a.b"])
+                .iter()
+                .all(|row| row.json_path != "$.a.b"),
+            "existing raw allowlists retain their meaning"
+        );
+        assert!(addressed_diff_json(&baseline, &candidate, "$", &["$.a.b"])
+            .iter()
+            .all(|row| row.json_path != "$.a.b" && row.json_path != "$[\"a.b\"]"));
+    }
+
+    #[test]
+    fn addressed_evidence_preserves_multiplicity_and_refuses_missing_ambiguity_proof() {
+        let mut diff = captured_diff(
+            serde_json::json!({"a.b":0,"a":{"b":0}}),
+            serde_json::json!({"a.b":1,"a":{"b":1}}),
+        );
+        let complete = addressed_body_diff(&diff)
+            .expect("both identical raw rows identify two sites")
+            .into_owned();
+        diff.body_diff.reverse();
+        assert_eq!(
+            addressed_body_diff(&diff)
+                .expect("row order is not identity")
+                .into_owned(),
+            complete
+        );
+        diff.body_diff.pop();
+        assert!(
+            addressed_body_diff(&diff).is_err(),
+            "one raw row cannot stand in for both fields"
+        );
+        let mut incomplete = captured_diff(
+            serde_json::json!({"a.b":0,"a":{"b":0}}),
+            serde_json::json!({"a.b":1,"a":{"b":1}}),
+        );
+        incomplete.candidate_body = None;
+        assert!(addressed_body_diff(&incomplete).is_err());
+        for path in ["$.metadata[foo]", "$..x", "$.quote\"", "$.items[01]"] {
+            incomplete.body_diff = vec![JsonFieldDiff {
+                json_path: path.into(),
+                baseline: serde_json::json!(0),
+                candidate: serde_json::json!(1),
+            }];
+            assert!(addressed_body_diff(&incomplete).is_err(), "{path}");
+        }
+        for path in ["$", "$.echo", "$.items[0].x"] {
+            incomplete.body_diff = vec![JsonFieldDiff {
+                json_path: path.into(),
+                baseline: serde_json::json!(0),
+                candidate: serde_json::json!(1),
+            }];
+            assert!(addressed_body_diff(&incomplete).is_ok(), "{path}");
+        }
+    }
+
+    #[test]
+    fn addressed_evidence_does_not_restore_a_colliding_field_masked_by_an_ancestor() {
+        let baseline = serde_json::json!({"a.b":0,"a":{"b":0}});
+        let candidate = serde_json::json!({"a.b":1,"a":{"b":2}});
+        let mut diff = captured_diff(baseline.clone(), candidate.clone());
+        diff.body_diff = diff_json(&baseline, &candidate, "$", &["$.a"]);
+        let addressed = addressed_body_diff(&diff)
+            .expect("stored operands uniquely identify the surviving literal field");
+        assert_eq!(addressed.len(), 1);
+        assert_eq!(addressed[0].json_path, "$[\"a.b\"]");
+        assert_eq!(addressed[0].candidate, serde_json::json!(1));
+        let candidate = serde_json::json!({"a.b":1,"a":{"b":1}});
+        diff.candidate_body = Some(candidate.clone());
+        diff.body_diff = diff_json(&baseline, &candidate, "$", &["$.a"]);
+        assert!(
+            addressed_body_diff(&diff).is_err(),
+            "identical stored operands cannot distinguish which field an old allowlist suppressed"
+        );
+    }
+
+    #[test]
+    fn addressed_evidence_keeps_unique_historical_parent_rows_and_operands() {
+        let mut diff = captured_diff(
+            serde_json::json!({"echo":"{\"a\":0}"}),
+            serde_json::json!({"echo":"{\"a\":1}"}),
+        );
+        diff.body_diff = vec![JsonFieldDiff {
+            json_path: "$.echo".into(),
+            baseline: serde_json::json!("{\"a\":0}"),
+            candidate: serde_json::json!("{\"a\":1}"),
+        }];
+        assert_eq!(
+            &*addressed_body_diff(&diff).expect("historical encoded parent"),
+            &diff.body_diff
+        );
+        diff.body_diff = vec![JsonFieldDiff {
+            json_path: "$".into(),
+            baseline: serde_json::json!({"raw_b64":"before"}),
+            candidate: serde_json::json!({"raw_b64":"after"}),
+        }];
+        assert_eq!(
+            &*addressed_body_diff(&diff).expect("whole-body bytes"),
+            &diff.body_diff
+        );
+        diff.body_diff = vec![JsonFieldDiff {
+            json_path: "$.opaque_kernel_value".into(),
+            baseline: serde_json::json!(0),
+            candidate: serde_json::json!(1),
+        }];
+        assert_eq!(
+            &*addressed_body_diff(&diff).expect("unspoken ordinary kernel evidence survives"),
+            &diff.body_diff
+        );
+    }
+
+    #[test]
+    fn addressed_evidence_reads_literal_members_inside_encoded_json_and_forms() {
+        let diff = captured_diff(
+            serde_json::json!({"echo":"{\"a.b\":0,\"a\":{\"b\":0}}", "form":"x.y=0&x[0]=0"}),
+            serde_json::json!({"echo":"{\"a.b\":1,\"a\":{\"b\":1}}", "form":"x[0]=1&x.y=1"}),
+        );
+        let addressed = addressed_body_diff(&diff).expect("shared parser supplies field identity");
+        for path in [
+            "$.echo[\"a.b\"]",
+            "$.echo.a.b",
+            "$.form[\"x.y\"]",
+            "$.form[\"x[0]\"]",
+        ] {
+            assert!(addressed.iter().any(|row| row.json_path == path), "{path}");
+        }
+        assert_eq!(
+            parse_form_fields("a=2&b=0&a=1").expect("form")["a"],
+            vec!["2", "1"]
+        );
     }
 }

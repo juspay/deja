@@ -289,6 +289,7 @@ mod tests {
     fn body(corr: &str, path: &str) -> Address {
         Address::Body {
             correlation: corr.into(),
+            request_sequence: 0,
             json_path: path.into(),
         }
     }
@@ -329,6 +330,7 @@ mod tests {
             m_run: "m".into(),
             y_run: "y".into(),
             canon_version: 4,
+            http_comparison_mode: Default::default(),
             verdict: DeltaVerdict {
                 pass,
                 introduced: rows

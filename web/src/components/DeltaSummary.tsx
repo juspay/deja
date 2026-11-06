@@ -5,9 +5,7 @@ import {
   api,
   Delta,
   DeltaFamily,
-  DeltaRow,
   DeltaSideInfo,
-  HttpDiff,
   RunRow,
   deltaFamily,
   deltaUnavailable,
@@ -17,6 +15,7 @@ import { candidateRef } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { comparedDiffs, pollPending, readState, sealLine } from "../lib/deltaPanel";
 import { AcknowledgeLine } from "./Acknowledgements";
+import { deltaRequestCounts, joinDeltaResponses, responseKey, SAME_AS_RECORDING, type DeltaOutcome as Outcome, type DeltaRequest as Req, type FieldSide } from "../lib/comparison";
 
 /**
  * "Compared with main": what a pull request's run changed relative to main
@@ -33,7 +32,7 @@ import { AcknowledgeLine } from "./Acknowledgements";
 export const FAMILY_ORDER: DeltaFamily[] = ["changed", "introduced", "resolved", "inherited", "clean"];
 
 /** The outcome of one request, from the families of its addresses. */
-export type Outcome = "conflict" | "new" | "restored" | "same" | "clean";
+export type { DeltaOutcome as Outcome } from "../lib/comparison";
 
 export const OUTCOME_LABEL: Record<Outcome, string> = {
   new: "only this PR differs from the recording",
@@ -44,14 +43,6 @@ export const OUTCOME_LABEL: Record<Outcome, string> = {
 };
 
 const OUTCOME_ORDER: Outcome[] = ["conflict", "new", "restored", "same", "clean"];
-
-function outcomeOf(families: Set<DeltaFamily>): Outcome {
-  if (families.has("changed")) return "conflict";
-  if (families.has("introduced")) return "new";
-  if (families.has("resolved")) return "restored";
-  if (families.has("inherited")) return "same";
-  return "clean";
-}
 
 /** Kept for the standalone delta page. */
 export const FAMILY_MEANING: Record<DeltaFamily, string> = {
@@ -89,75 +80,12 @@ const GLYPH: Record<Outcome, [Dot, Dot, Dot]> = {
 // ---------------------------------------------------------------------------
 // per-request view of the delta, joined with both runs' http diffs
 
-const SAME_AS_RECORDING = Symbol("same as recording");
-type FieldSide = unknown | typeof SAME_AS_RECORDING;
-
-type Req = {
-  correlation: string;
-  sequence: number;
-  method: string;
-  lane: string;
-  outcome: Outcome;
-  status: [number, number | null, number];
-  /** every response field either side differs on: recording, main, PR */
-  fields: { path: string; recording: unknown; main: FieldSide; pr: FieldSide }[];
-};
-
-function joinRequests(d: Delta, prDiffs: HttpDiff[], mainDiffs: HttpDiff[]): Req[] {
-  const rowsBy = new Map<string, DeltaRow[]>();
-  const laneBy = new Map<string, string>(
-    Object.entries(d.request_lanes ?? {}).map(([c, l]) => [c, `${l.connector} · ${l.flow}`]),
-  );
-  for (const r of d.rows) {
-    const c = r.address.correlation;
-    rowsBy.set(c, [...(rowsBy.get(c) ?? []), r]);
-    if (r.lane) laneBy.set(c, `${r.lane.connector} · ${r.lane.flow}`);
-  }
-  const mainBy = new Map(mainDiffs.map((x) => [x.correlation_id, x]));
-  const out: Req[] = [];
-  for (const diff of prDiffs) {
-    const c = diff.correlation_id;
-    const families = new Set<DeltaFamily>((rowsBy.get(c) ?? []).map((r) => deltaFamily(r.bucket)));
-    const m = mainBy.get(c);
-    const paths = new Set<string>([
-      ...diff.body_diff.map((p) => p.json_path),
-      ...(m?.body_diff.map((p) => p.json_path) ?? []),
-    ]);
-    const fields = [...paths].map((path) => {
-      const inPr = diff.body_diff.find((p) => p.json_path === path);
-      const inMain = m?.body_diff.find((p) => p.json_path === path);
-      return {
-        path,
-        recording: (inPr ?? inMain)?.baseline,
-        main: m ? (inMain ? inMain.candidate : SAME_AS_RECORDING) : undefined,
-        pr: inPr ? inPr.candidate : SAME_AS_RECORDING,
-      };
-    });
-    out.push({
-      correlation: c,
-      sequence: diff.request_sequence,
-      method: diff.request_path.split("/").pop() ?? diff.request_path,
-      // a request that made no connector call has no lane; say so, with the
-      // flow read off its method, rather than leave a dash
-      lane: laneBy.get(c) ?? `no connector call · ${(diff.request_path.split("/").pop() ?? "").toLowerCase()}`,
-      outcome: outcomeOf(families),
-      status: [diff.status_baseline, m?.status_candidate ?? null, diff.status_candidate],
-      fields,
-    });
-  }
-  return out.sort((a, b) => a.sequence - b.sequence);
-}
-
-function isPresent(v: FieldSide): boolean {
-  return v !== null && v !== undefined && v !== SAME_AS_RECORDING;
-}
-
-function SideCell({ v, compare }: { v: FieldSide; compare?: FieldSide }) {
-  if (v === undefined) return <td className="val faint">—</td>;
-  if (v === null) return <td className="val gone">absent</td>;
+export function SideCell({ v, sameAsMain = false }: { v: FieldSide; sameAsMain?: boolean }) {
+  if (v === undefined) return <td className="val faint">not published</td>;
+  if (v === null) return <td className="val gone">null / absent</td>;
   if (v === SAME_AS_RECORDING) return <td className="val rec">= recording</td>;
   const text = typeof v === "string" ? v : JSON.stringify(v);
-  const same = compare !== undefined && compare !== SAME_AS_RECORDING && JSON.stringify(compare) === JSON.stringify(v);
+  const same = sameAsMain;
   return (
     <td className={`val${same ? " samev" : ""}`} title={text.length > 160 ? text.slice(0, 2000) : undefined}>
       {text.length > 160 ? `${text.slice(0, 160)}…` : text}
@@ -233,16 +161,14 @@ function counts(reqs: Req[]) {
   };
 }
 
-function Headline({ d, reqs }: { d: Delta; reqs: Req[] }) {
+export function Headline({ d }: { d: Delta }) {
   const v = d.verdict;
   const total = d.covered_correlations;
-  const { n, recVsMain, mainVsPr } = counts(reqs);
+  const { n, recVsMain, mainVsPr } = deltaRequestCounts(d);
   const tone = v.pass ? "good" : "bad";
-  const chip = v.pass ? "nothing new from this PR" : `${n("new") + n("conflict")} requests changed by this PR`;
+  const chip = v.pass ? "no new blocking difference" : `${n("new") + n("conflict")} requests changed by this PR`;
   const head = v.pass
-    ? recVsMain > 0
-      ? `The ${recVsMain} requests that differ from the recording differ the same way on main.`
-      : `Every one of ${total} requests matches the recording on main and on this PR.`
+    ? `The delta attributes no new blocking difference to this PR.${recVsMain > 0 ? ` Main has findings relative to the recording on ${recVsMain} request${recVsMain === 1 ? "" : "s"}.` : ""}`
     : n("conflict") > 0
       ? `${n("conflict")} requests differ from both the recording and main.`
       : `${n("new")} requests differ from the recording on this PR but not on main.`;
@@ -288,13 +214,12 @@ function Fold({ title, count, open, children }: { title: string; count?: string;
   );
 }
 
-function Matrix({ d, reqs, mainKnown }: { d: Delta; reqs: Req[]; mainKnown: boolean }) {
+function Matrix({ d, mainKnown }: { d: Delta; mainKnown: boolean }) {
   const total = d.covered_correlations;
-  const { recVsMain, recVsPr, mainVsPr } = counts(reqs);
-  const fieldsWhere = (pred: (f: Req["fields"][number]) => boolean) =>
-    reqs.reduce((a, r) => a + r.fields.filter(pred).length, 0);
-  const statusesWhere = (pred: (r: Req) => boolean) => reqs.filter(pred).length;
-  const word = (i: DeltaSideInfo) => (!i.tape_verdict ? "unscored" : i.tape_verdict.pass ? "reproduced" : "diverged");
+  const { recVsMain, recVsPr, mainVsPr } = deltaRequestCounts(d);
+  const addresses = (kind: "body" | "status", families: DeltaFamily[]) =>
+    d.rows.filter((row) => row.address.kind === kind && families.includes(deltaFamily(row.bucket))).length;
+  const word = (i: DeltaSideInfo) => (!i.tape_verdict ? "unscored" : i.tape_verdict.inconclusive ? "inconclusive" : i.tape_verdict.pass ? "accepted" : "diverged");
   // null: main's response diffs are not known, so a count would be a guess
   const cell = (x: number | null, hot: boolean) =>
     x === null ? (
@@ -318,23 +243,23 @@ function Matrix({ d, reqs, mainKnown }: { d: Delta; reqs: Req[]; mainKnown: bool
         <tr><th></th><th className="num">requests differing</th><th className="num">response fields</th><th className="num">response statuses</th><th>verdict</th></tr>
       </thead>
       <tbody>
-        {row("recording → main", recVsMain, onMain(fieldsWhere((f) => f.main !== SAME_AS_RECORDING && f.main !== undefined)), onMain(statusesWhere((r) => r.status[1] !== null && r.status[1] !== r.status[0])), `${word(d.sides.m)} · main's own run against the recording`, true)}
-        {row("recording → this PR", recVsPr, fieldsWhere((f) => f.pr !== SAME_AS_RECORDING), statusesWhere((r) => r.status[2] !== r.status[0]), `${word(d.sides.y)} · the banner above`, true)}
-        {row("main → this PR", mainVsPr, d.verdict.introduced + d.verdict.changed + d.verdict.resolved, onMain(statusesWhere((r) => r.status[1] !== null && r.status[1] !== r.status[2])),
+        {row("recording → main", recVsMain, onMain(addresses("body", ["inherited", "changed", "resolved"])), onMain(addresses("status", ["inherited", "changed", "resolved"])), `${word(d.sides.m)} · main's own run against the recording`, true)}
+        {row("recording → this PR", recVsPr, addresses("body", ["inherited", "changed", "introduced"]), addresses("status", ["inherited", "changed", "introduced"]), `${word(d.sides.y)} · the banner above`, true)}
+        {row("main → this PR", mainVsPr, addresses("body", ["introduced", "changed", "resolved"]), onMain(addresses("status", ["introduced", "changed", "resolved"])),
           <span className={`rchip ${d.verdict.pass ? "good" : "bad"}`}>{d.verdict.pass ? "nothing new" : "changed by this PR"}</span>, !d.verdict.pass)}
       </tbody>
     </table>
   );
 }
 
-function Tiles({ d, reqs }: { d: Delta; reqs: Req[] }) {
-  const { n } = counts(reqs);
+function Tiles({ d }: { d: Delta }) {
+  const { n } = deltaRequestCounts(d);
   const fields: Record<Outcome, number> = { new: d.verdict.introduced, conflict: d.verdict.changed, restored: d.verdict.resolved, same: d.verdict.inherited, clean: 0 };
   return (
     <div className="delta-tiles">
       {OUTCOME_ORDER.map((o) => (
         <div key={o} className={`tile o-${o}${n(o) === 0 ? " zero" : ""}`}>
-          <span className="n">{n(o)}{o !== "clean" && <small>{fields[o]} fields</small>}</span>
+          <span className="n">{n(o)}{o !== "clean" && <small>{fields[o]} points</small>}</span>
           <span className="g"><Glyph dots={GLYPH[o]} /></span>
           <span className="k">{OUTCOME_LABEL[o]}</span>
         </div>
@@ -357,7 +282,7 @@ function ByLane({ reqs }: { reqs: Req[] }) {
   return (
     <table className="delta-lanes">
       <thead>
-        <tr><th>connector · flow</th><th>methods</th><th className="num">requests</th><th className="num">only this PR</th><th className="num">differ differently</th><th className="num">back on recording</th><th className="num">same as main</th><th className="num">all agree</th></tr>
+        <tr><th>connector · flow</th><th>methods</th><th className="num">responses</th><th className="num">only this PR</th><th className="num">differ differently</th><th className="num">back on recording</th><th className="num">same as main</th><th className="num">all agree</th></tr>
       </thead>
       <tbody>
         {groupByLane(reqs).map(([lane, rs]) => {
@@ -392,7 +317,7 @@ function RequestMap({ reqs, runId }: { reqs: Req[]; runId: string }) {
           <div className="cells">
             {rs.map((r) => (
               <Link
-                key={r.correlation}
+                key={responseKey(r.correlation, r.sequence)}
                 className={`cell ${r.outcome}`}
                 title={`${r.correlation} · ${r.method} · ${r.fields.length} fields differ`}
                 to={withDebug(`/r/${runId}?case=${encodeURIComponent(r.correlation)}`, debug)}
@@ -413,35 +338,39 @@ function RequestMap({ reqs, runId }: { reqs: Req[]; runId: string }) {
 }
 
 /** The response fields a group of requests differ on, as presence per side. */
-function FieldTable({ reqs, mainSha }: { reqs: Req[]; mainSha: string }) {
-  const byPath = new Map<string, { recording: number; main: number; pr: number; total: number; sameAsMain: number }>();
+export function FieldTable({ reqs, mainSha }: { reqs: Req[]; mainSha: string }) {
+  const byPath = new Map<string, { recording: number; main: number; pr: number; recordingUnknown: number; mainUnknown: number; prUnknown: number; total: number; sameAsMain: number }>();
   for (const r of reqs) {
     for (const f of r.fields) {
-      const e = byPath.get(f.path) ?? { recording: 0, main: 0, pr: 0, total: 0, sameAsMain: 0 };
+      const e = byPath.get(f.path) ?? { recording: 0, main: 0, pr: 0, recordingUnknown: 0, mainUnknown: 0, prUnknown: 0, total: 0, sameAsMain: 0 };
       e.total += 1;
-      if (isPresent(f.recording)) e.recording += 1;
-      if (isPresent(f.main) || f.main === SAME_AS_RECORDING) e.main += 1;
-      if (isPresent(f.pr) || f.pr === SAME_AS_RECORDING) e.pr += 1;
-      const mv = f.main === SAME_AS_RECORDING ? f.recording : f.main;
-      const pv = f.pr === SAME_AS_RECORDING ? f.recording : f.pr;
-      if (JSON.stringify(mv) === JSON.stringify(pv)) e.sameAsMain += 1;
+      for (const side of ["recording", "main", "pr"] as const) {
+        const value = f[side] === SAME_AS_RECORDING ? f.recording : f[side];
+        if (value === undefined) e[`${side}Unknown`] += 1;
+        else if (value !== null) e[side] += 1;
+      }
+      if (f.sameAsMain) e.sameAsMain += 1;
       byPath.set(f.path, e);
     }
   }
-  const state = (present: number, total: number) =>
-    present === 0 ? <td className="absent">absent</td> : present === total ? <td className="present">present</td> : <td className="mixed">present on {present} of {total}</td>;
+  const state = (values: number, unknown: number, total: number) =>
+    unknown === total ? <td className="faint">not published</td>
+      : unknown > 0 ? <td className="mixed">not published on {unknown} of {total}</td>
+      : values === 0 ? <td className="absent">null / absent</td>
+      : values === total ? <td className="present">value published</td>
+      : <td className="mixed">value on {values} of {total}; rest null / absent</td>;
   return (
     <table className="delta-fields">
       <thead>
-        <tr><th>response field</th><th className="col-rec">recording</th><th className="col-main">main at {mainSha}</th><th className="col-pr">this PR</th><th>requests</th></tr>
+        <tr><th>response field</th><th className="col-rec">recording</th><th className="col-main">main at {mainSha}</th><th className="col-pr">this PR</th><th>responses</th></tr>
       </thead>
       <tbody>
         {[...byPath.entries()].sort((a, b) => b[1].total - a[1].total).map(([path, e]) => (
           <tr key={path}>
             <td className="f">{path}</td>
-            {state(e.recording, e.total)}
-            {state(e.main, e.total)}
-            {state(e.pr, e.total)}
+            {state(e.recording, e.recordingUnknown, e.total)}
+            {state(e.main, e.mainUnknown, e.total)}
+            {state(e.pr, e.prUnknown, e.total)}
             <td className="cnt">
               {e.total} of {reqs.length}
               {e.sameAsMain !== e.total && <span className="cmp"> · {e.sameAsMain} same as main</span>}
@@ -460,7 +389,7 @@ function RequestList({ reqs, runId, mainSha }: { reqs: Req[]; runId: string; mai
   return (
     <details className="delta-list">
       <summary className="listhead">
-        <span>Show the {reqs.length} requests</span>
+        <span>Show the {reqs.length} responses</span>
         <span className="c">expand a row for its field values on all three sides</span>
       </summary>
       <div className="reqhead">
@@ -471,7 +400,7 @@ function RequestList({ reqs, runId, mainSha }: { reqs: Req[]; runId: string; mai
         const first = !opened.has(key);
         opened.add(key);
         return (
-          <details className="req" key={r.correlation} open={first}>
+          <details className="req" key={responseKey(r.correlation, r.sequence)} open={first}>
             <summary>
               <span className="id">{short(r.correlation)}</span>
               <span>{r.method}</span>
@@ -485,6 +414,7 @@ function RequestList({ reqs, runId, mainSha }: { reqs: Req[]; runId: string; mai
                 <Link to={withDebug(`/r/${runId}?case=${encodeURIComponent(r.correlation)}`, debug)}>open case →</Link>
               </span>
             </summary>
+            {r.notes.map((note) => <p className="hint" key={note}>{note}</p>)}
             {r.fields.length > 0 && (
               <table className="delta-vals">
                 <thead>
@@ -496,7 +426,7 @@ function RequestList({ reqs, runId, mainSha }: { reqs: Req[]; runId: string; mai
                       <td className="p">{f.path}</td>
                       <SideCell v={f.recording} />
                       <SideCell v={f.main} />
-                      <SideCell v={f.pr} compare={f.main} />
+                      <SideCell v={f.pr} sameAsMain={f.sameAsMain} />
                     </tr>
                   ))}
                 </tbody>
@@ -520,7 +450,7 @@ const GROUP_TITLE: Record<Outcome, string> = {
   conflict: "Where this PR and main both changed the recording, differently",
   restored: "What main changed that this PR put back",
   same: "What main changed from the recording, and this PR carries",
-  clean: "All three agree",
+  clean: "Responses with no published delta differences",
 };
 
 function OutcomeGroup({ outcome, reqs, runId, mainSha, open }: { outcome: Outcome; reqs: Req[]; runId: string; mainSha: string; open: boolean }) {
@@ -528,7 +458,7 @@ function OutcomeGroup({ outcome, reqs, runId, mainSha, open }: { outcome: Outcom
   const fields = reqs.reduce((a, r) => a + r.fields.length, 0);
   const patterns = new Set(reqs.map((r) => r.fields.map((f) => f.path).join("|")));
   return (
-    <Fold title={GROUP_TITLE[outcome]} count={`${reqs.length} requests · ${fields} response fields · ${patterns.size} pattern${patterns.size === 1 ? "" : "s"}`} open={open}>
+    <Fold title={GROUP_TITLE[outcome]} count={`${reqs.length} responses · ${fields} judged response differences · ${patterns.size} pattern${patterns.size === 1 ? "" : "s"}`} open={open}>
       {fields > 0 && <FieldTable reqs={reqs} mainSha={mainSha} />}
       <RequestList reqs={reqs} runId={runId} mainSha={mainSha} />
     </Fold>
@@ -538,12 +468,12 @@ function OutcomeGroup({ outcome, reqs, runId, mainSha, open }: { outcome: Outcom
 function CleanList({ reqs }: { reqs: Req[] }) {
   if (reqs.length === 0) return null;
   return (
-    <Fold title={GROUP_TITLE.clean} count={`${reqs.length} requests reproduce the recording on main and on this PR`}>
+    <Fold title={GROUP_TITLE.clean} count={`${reqs.length} responses have no published delta differences`}>
       <table>
         <thead><tr><th>request</th><th>method</th><th>connector · flow</th><th>status</th></tr></thead>
         <tbody>
           {reqs.map((r) => (
-            <tr key={r.correlation}><td className="mono">{short(r.correlation)}</td><td>{r.method}</td><td className="mono">{r.lane}</td><td className="mono">{r.status[0]}</td></tr>
+            <tr key={responseKey(r.correlation, r.sequence)}><td className="mono">{short(r.correlation)}</td><td>{r.method}</td><td className="mono">{r.lane}</td><td className="mono">{r.status[0]}</td></tr>
           ))}
         </tbody>
       </table>
@@ -696,9 +626,9 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
   const reqs = React.useMemo(
     () =>
       d && prDiffs.data && !prDiffs.error
-        ? joinRequests(d, comparedDiffs(d, prDiffs.data), mainDiffs.error ? [] : mainDiffs.data ?? [])
+        ? joinDeltaResponses(d, comparedDiffs(d, prDiffs.data), mainDiffs.error ? [] : mainDiffs.data ?? [], prRun.data?.scorecard, mainRun.data?.scorecard)
         : [],
-    [d, prDiffs.data, prDiffs.error, mainDiffs.data, mainDiffs.error],
+    [d, prDiffs.data, prDiffs.error, mainDiffs.data, mainDiffs.error, prRun.data?.scorecard, mainRun.data?.scorecard],
   );
   const deltaUpdates = useQueryClient().getQueryState(["delta", runId, against])?.dataUpdateCount ?? 0;
   const stillPolling = pollPending(delta.data, deltaUpdates);
@@ -734,7 +664,7 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
           ) : prRead.state === "pending" ? (
             <p className="hint">loading the responses…</p>
           ) : (
-            <Headline d={d} reqs={reqs} />
+            <Headline d={d} />
           )}
           <AcknowledgeLine runId={runId} d={d} />
           {mainRead.state === "failed" && (
@@ -746,13 +676,14 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
           {prRead.state === "ok" && reqs.length > 0 && (
             <>
               <Fold title="The three comparisons, in numbers" count="requests, then what differed inside them" open>
-                <Matrix d={d} reqs={reqs} mainKnown={mainRead.state === "ok"} />
+                <Matrix d={d} mainKnown={mainRead.state === "ok"} />
               </Fold>
-              <Tiles d={d} reqs={reqs} />
-              <Fold title="By connector and flow" count="requests per outcome; fields in parentheses" open>
+              <Tiles d={d} />
+              <p className="hint">The response groups below use published status and body delta addresses. Call changes are listed separately.</p>
+              <Fold title="Responses by connector and flow" count="responses per outcome; judged differences in parentheses" open>
                 <ByLane reqs={reqs} />
               </Fold>
-              <Fold title="Every request" count="one square per recorded request, in recording order; hover for the request, click to open its case" open>
+              <Fold title="Every response" count="one square per response, in recording order; hover for the response, click to open its case" open>
                 <RequestMap reqs={reqs} runId={runId} />
               </Fold>
               {OUTCOME_ORDER.filter((o) => o !== "clean").map((o) => (

@@ -1,3 +1,5 @@
+// Raw inspection only. Published scorer judgments determine behavioral
+// equivalence, findings, and counts; this helper only presents captured values.
 // Deep argument diff: find the leaves that changed between a recorded call's
 // args and the candidate's args, so a MODIFIED call shows *what* changed — not
 // just "args differ". Handles the common Hyperswitch shape where the meaningful

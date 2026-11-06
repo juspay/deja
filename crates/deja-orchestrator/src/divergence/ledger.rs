@@ -123,6 +123,10 @@ pub struct CallRecord {
     /// of representation bytes; it never contains the raw captured payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_digest: Option<String>,
+    /// The operand the scorer actually compared, its verdict and candidate
+    /// identity. Historical rows without a published decision retain None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<super::CallComparison>,
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
@@ -425,6 +429,37 @@ pub(crate) fn build_with_inconclusive_into(
     plan: Option<&GraphScoringPlan>,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
+    build_with_prepared_into(
+        events,
+        observed,
+        table,
+        idempotent_delete_demote,
+        inconclusive_race,
+        tail_gap,
+        unplanted,
+        cascade,
+        policy,
+        plan,
+        None,
+        sink,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_with_prepared_into(
+    events: &[BoundaryEvent],
+    observed: &[ObservedCall],
+    table: &deja::LookupTable,
+    idempotent_delete_demote: &HashSet<u64>,
+    inconclusive_race: &InconclusiveRaceEvidence,
+    tail_gap: &TailGapEvidence,
+    unplanted: &super::UnplantedPresence,
+    cascade: &super::SeedGapCascade,
+    policy: Option<&crate::policy::BoundaryPolicySnapshot>,
+    plan: Option<&GraphScoringPlan>,
+    prepared: Option<&super::PreparedCallComparisons>,
+    sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let expected_seqs = &expected_sequences(table);
     let span_paths = &recorded_span_paths(table);
     let by_seq: HashMap<u64, &BoundaryEvent> =
@@ -449,7 +484,14 @@ pub(crate) fn build_with_inconclusive_into(
     // is ONE row, not a novel call beside an omitted one, at whatever tier its
     // boundary sits; and structure never pairs, because a span holding one event
     // on each side says nothing about whether they are one call.
-    let pairing = super::CallPairing::build(table, events, observed, &column_provenance, policy);
+    let computed_pairing;
+    let pairing = if let Some(prepared) = prepared {
+        &prepared.pairing
+    } else {
+        computed_pairing =
+            super::CallPairing::build(table, events, observed, &column_provenance, policy);
+        &computed_pairing
+    };
     // How far each argument-divergent substitution could have carried, from the
     // same seam the scorecard reads so the rows and the counts cannot come apart.
     // Attribution only: it sets no `kind` and no `blocking`.
@@ -464,7 +506,7 @@ pub(crate) fn build_with_inconclusive_into(
     // A novel call before a correlation's last divergence is an origin; one
     // with nothing diverging after it is not a finding at all.
     let last_divergence =
-        last_divergence_per_correlation(observed, &by_seq, tail_gap, &pairing, policy);
+        last_divergence_per_correlation(observed, &by_seq, tail_gap, pairing, policy);
     for (observed_index, obs) in observed.iter().enumerate() {
         let arg_divergence_reach = arg_divergence.serve(observed_index);
         let reached = arg_divergence.reached(observed_index);
@@ -475,7 +517,11 @@ pub(crate) fn build_with_inconclusive_into(
         let source_event = obs
             .source_event_global_sequence
             .and_then(|seq| by_seq.get(&seq).copied());
-        let is_value_origin = observed_value_diverged(obs, source_event);
+        let result_verdict = match prepared {
+            Some(prepared) => prepared.results[observed_index],
+            None => super::observed_value_verdict(obs, source_event),
+        };
+        let is_value_origin = matches!(result_verdict, Some(super::ValueVerdict::Diverged));
 
         if is_value_origin {
             consumed.extend(obs.source_event_global_sequence);
@@ -508,6 +554,9 @@ pub(crate) fn build_with_inconclusive_into(
                 served_event_global_sequence: None,
                 semantic_pair: false,
                 semantic_digest: None,
+                comparison: result_verdict.and_then(|verdict| {
+                    super::result_comparison_from_verdict(obs, source_event, verdict)
+                }),
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
@@ -559,7 +608,11 @@ pub(crate) fn build_with_inconclusive_into(
             let twin_event = by_seq.get(&twin_seq).copied();
             let (recorded_val, observed_val) =
                 args_free_effective_values(&recorded_result, obs, twin_event);
-            let verdict = super::pair_request_verdict(obs, twin_event, policy);
+            let verdict = match prepared {
+                Some(prepared) => prepared.arguments[observed_index]
+                    .expect("a prepared pair has an argument verdict"),
+                None => super::pair_request_verdict(obs, twin_event, policy),
+            };
             let value_diverged = pairing.changed(
                 observed_index,
                 matches!(verdict, super::ValueVerdict::Diverged),
@@ -590,17 +643,11 @@ pub(crate) fn build_with_inconclusive_into(
                     SchemaDefaultVerdict::Confirmed(d) => Some(schema_default_row_kind(d.kind())),
                     _ => None,
                 });
-            sink(CallRecord {
-                argument_revision: ARGUMENT_REVISION,
-                correlation_id: obs.correlation_id.clone(),
-                source_event_global_sequence: Some(twin_seq),
-                // The recorded event the candidate served, where it served one
-                // by address alone: auditable against the twin paired here.
-                served_event_global_sequence: obs.served_event_global_sequence,
-                semantic_pair: !twin.order_mismatch
-                    && (!obs.arg_divergent || obs.served_event_global_sequence == Some(twin_seq)),
-                semantic_digest: (value_diverged
-                    && !twin.order_mismatch
+            let comparison = super::CallComparison {
+                version: 1,
+                subject: super::ComparisonSubject::Arguments,
+                verdict,
+                candidate_identity: (!twin.order_mismatch
                     && (!obs.arg_divergent || obs.served_event_global_sequence == Some(twin_seq)))
                 .then(|| {
                     super::noise::semantic_digest(
@@ -612,6 +659,21 @@ pub(crate) fn build_with_inconclusive_into(
                     )
                 })
                 .flatten(),
+                candidate_alternatives: Vec::new(),
+            };
+            sink(CallRecord {
+                argument_revision: ARGUMENT_REVISION,
+                correlation_id: obs.correlation_id.clone(),
+                source_event_global_sequence: Some(twin_seq),
+                // The recorded event the candidate served, where it served one
+                // by address alone: auditable against the twin paired here.
+                served_event_global_sequence: obs.served_event_global_sequence,
+                semantic_pair: !twin.order_mismatch
+                    && (!obs.arg_divergent || obs.served_event_global_sequence == Some(twin_seq)),
+                semantic_digest: value_diverged
+                    .then(|| comparison.candidate_identity.clone())
+                    .flatten(),
+                comparison: Some(comparison),
                 boundary: obs.boundary.clone(),
                 trait_name: obs.trait_name.clone(),
                 method_name: obs.method_name.clone(),
@@ -751,6 +813,9 @@ pub(crate) fn build_with_inconclusive_into(
             },
             semantic_pair: false,
             semantic_digest: None,
+            comparison: result_verdict.and_then(|verdict| {
+                super::result_comparison_from_verdict(obs, source_event, verdict)
+            }),
             boundary: obs.boundary.clone(),
             trait_name: obs.trait_name.clone(),
             method_name: obs.method_name.clone(),
@@ -796,6 +861,7 @@ pub(crate) fn build_with_inconclusive_into(
             served_event_global_sequence: None,
             semantic_pair: false,
             semantic_digest: None,
+            comparison: None,
             boundary: ev.boundary.clone(),
             trait_name: ev.trait_name.clone(),
             method_name: ev.method_name.clone(),
@@ -852,13 +918,14 @@ pub(crate) fn build_with_plan_into(
     cascade: &super::SeedGapCascade,
     policy: Option<&crate::policy::BoundaryPolicySnapshot>,
     plan: &GraphScoringPlan,
+    prepared: Option<&super::PreparedCallComparisons>,
     sink: &mut dyn FnMut(CallRecord) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     // One builder over every call. The shared `CallPairing` decides what pairs;
     // the plan only labels what the addresses left unpaired or unclaimed, so a
     // graph-scored correlation and a flat one produce the same rows for the same
     // calls.
-    build_with_inconclusive_into(
+    build_with_prepared_into(
         events,
         observed,
         table,
@@ -869,6 +936,7 @@ pub(crate) fn build_with_plan_into(
         cascade,
         policy,
         Some(plan),
+        prepared,
         sink,
     )
 }

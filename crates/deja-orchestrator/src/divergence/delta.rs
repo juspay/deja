@@ -28,7 +28,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 
 use super::acknowledgement::{Effective, RowAcknowledgement};
-use super::behaviour_tree::{Address, BehaviourTree, Lane, Value};
+use super::behaviour_tree::{Address, BehaviourTree, HttpComparisonMode, Lane, Value};
+use super::ComparisonSubject;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -182,6 +183,8 @@ pub struct Delta {
     pub m_run: String,
     pub y_run: String,
     pub canon_version: u32,
+    #[serde(default)]
+    pub http_comparison_mode: HttpComparisonMode,
     pub verdict: DeltaVerdict,
     pub buckets: BTreeMap<Bucket, usize>,
     pub lanes: Vec<LaneSummary>,
@@ -251,6 +254,7 @@ pub fn cached_is_current(doc: &serde_json::Value, y: &str, m: &str, canon_versio
         && doc.get("m_run").and_then(|v| v.as_str()) == Some(m)
         && doc.get("canon_version").and_then(|v| v.as_u64()) == Some(u64::from(canon_version))
         && doc.get("semantic_revision").and_then(|v| v.as_u64()) == Some(1)
+        && matches!(doc.get("http_comparison_mode").and_then(|v| v.as_str()), Some("legacy" | "classified"))
         && doc.get("verdict").is_some()
         // A delta cached before request counts existed lacks them; recompute it.
         && doc.get("requests").is_some()
@@ -270,6 +274,9 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
             "the candidates use different boundary policies ({:?} and {:?}); read each run's tape verdict instead",
             m.policy_digest, y.policy_digest
         ));
+    }
+    if m.http_comparison_mode != y.http_comparison_mode {
+        return Err("the trees use different HTTP comparison projections; select their common projection before comparing".into());
     }
     // The trees hash what each candidate captured, in the encoding of the
     // deja it links. Across two encodings every affected address would read
@@ -326,13 +333,28 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         }
         let me = m_by.get(address).copied();
         let ye = y_by.get(address).copied();
+        if let (Some(me), Some(ye)) = (me, ye) {
+            let has_identity =
+                |value: &Value| matches!(value, Value::Diverged { .. } | Value::Novel { .. });
+            if has_identity(&me.value)
+                && has_identity(&ye.value)
+                && me.comparison_subject != ye.comparison_subject
+                && [me.comparison_subject, ye.comparison_subject]
+                    .contains(&Some(ComparisonSubject::Result))
+            {
+                return Err("a result comparison cannot be compared with a historical argument identity; use a baseline that publishes result identities".into());
+            }
+        }
         // the tape holds the address unless every side that has it calls it novel
         let tape_has = [me, ye]
             .iter()
             .flatten()
             .any(|e| !matches!(e.value, Value::Novel { .. }));
         let compatible_side = |entry: Option<&super::behaviour_tree::Entry>| {
-            if m.argument_revision != y.argument_revision {
+            if m.argument_revision != y.argument_revision
+                && entry
+                    .is_none_or(|entry| entry.comparison_subject != Some(ComparisonSubject::Result))
+            {
                 if let Some(entry) = entry {
                     if let Value::Diverged { hash } | Value::Novel { hash } = &entry.value {
                         if let Some(legacy) = &entry.legacy_hash {
@@ -351,7 +373,22 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         };
         let m_side = compatible_side(me)?;
         let y_side = compatible_side(ye)?;
-        let bucket = classify(tape_has, &m_side, &y_side);
+        let same_result = match (me, ye, &m_side, &y_side) {
+            (Some(me), Some(ye), Side::Hash(_), Side::Hash(_))
+                if me.comparison_subject == Some(ComparisonSubject::Result)
+                    && ye.comparison_subject == Some(ComparisonSubject::Result) =>
+            {
+                me.comparison_alternatives
+                    .iter()
+                    .any(|identity| ye.comparison_alternatives.contains(identity))
+            }
+            _ => false,
+        };
+        let bucket = if same_result {
+            classify(tape_has, &m_side, &m_side)
+        } else {
+            classify(tape_has, &m_side, &y_side)
+        };
         let blocking =
             me.map(|e| e.blocking).unwrap_or(false) || ye.map(|e| e.blocking).unwrap_or(false);
         let lane = y
@@ -512,6 +549,7 @@ pub fn three_way(m: &BehaviourTree, y: &BehaviourTree) -> Result<Delta, String> 
         m_run: m.run_id.clone(),
         y_run: y.run_id.clone(),
         canon_version: m.canon_version,
+        http_comparison_mode: m.http_comparison_mode,
         verdict: DeltaVerdict {
             pass,
             introduced,
@@ -589,12 +627,15 @@ mod tests {
             run_id: run.into(),
             canon_version: CANON_VERSION,
             argument_revision: super::super::ledger::ARGUMENT_REVISION,
+            http_comparison_mode: HttpComparisonMode::Legacy,
             entries: entries
                 .into_iter()
                 .map(|(address, value)| Entry {
                     address,
                     value,
                     legacy_hash: None,
+                    comparison_subject: None,
+                    comparison_alternatives: Vec::new(),
                     blocking: true,
                 })
                 .collect(),
@@ -889,6 +930,7 @@ mod tests {
         let report = serde_json::json!({"members": ["rec-a"], "correlations": 3});
         let mut doc = doc;
         doc["semantic_revision"] = serde_json::json!(1);
+        doc["http_comparison_mode"] = serde_json::json!("legacy");
         super::super::tape::record_tape_check(&mut doc, "y", Some(&report), "m", Some(&report))
             .unwrap();
         doc
@@ -929,6 +971,11 @@ mod tests {
             serde_json::json!({"y_run": "y", "m_run": "m", "canon_version": CANON_VERSION, "verdict": {"pass": true}, "requests": {}}),
         );
         assert!(cached_is_current(&doc, "y", "m", CANON_VERSION));
+        for unsupported in [serde_json::Value::Null, serde_json::json!("future")] {
+            let mut unknown = doc.clone();
+            unknown["http_comparison_mode"] = unsupported;
+            assert!(!cached_is_current(&unknown, "y", "m", CANON_VERSION));
+        }
         let mut old_draft = doc.clone();
         old_draft
             .as_object_mut()
@@ -978,5 +1025,44 @@ mod tests {
         bumped.event_schema_versions = [11].into_iter().collect();
         let why = three_way(&m, &bumped).err().unwrap();
         assert!(why.contains("different event schemas"), "{why}");
+    }
+
+    #[test]
+    fn mixed_http_projections_refuse_instead_of_charging_the_representation() {
+        let m = tree("m", vec![(call("c", 0), Value::Reproduced)]);
+        let mut y = tree("y", vec![(call("c", 0), Value::Reproduced)]);
+        y.http_comparison_mode = HttpComparisonMode::Classified;
+        assert!(three_way(&m, &y).unwrap_err().contains("common projection"));
+    }
+
+    #[test]
+    fn result_identities_never_fall_back_to_historical_argument_hashes() {
+        let mut m = tree("m", vec![(call("c", 0), div("same-args"))]);
+        let mut y = tree("y", vec![(call("c", 0), div("result:v1:new"))]);
+        y.entries[0].comparison_subject = Some(ComparisonSubject::Result);
+        assert!(three_way(&m, &y)
+            .unwrap_err()
+            .contains("historical argument"));
+        m.entries[0].comparison_subject = Some(ComparisonSubject::Result);
+        m.entries[0].value = div("result:v1:new");
+        m.argument_revision = 0;
+        assert!(three_way(&m, &y).unwrap().verdict.pass);
+        y.entries[0].value = div("result:v1:changed");
+        assert!(!three_way(&m, &y).unwrap().verdict.pass);
+    }
+
+    #[test]
+    fn result_comparison_accepts_one_shared_rule_without_composing_alternatives() {
+        let mut m = tree("m", vec![(call("c", 0), div("result:v1:m"))]);
+        let mut y = tree("y", vec![(call("c", 0), div("result:v1:y"))]);
+        m.entries[0].comparison_subject = Some(ComparisonSubject::Result);
+        y.entries[0].comparison_subject = Some(ComparisonSubject::Result);
+        m.entries[0].comparison_alternatives = vec!["project:a:1".into(), "project:b:0".into()];
+        y.entries[0].comparison_alternatives = vec!["project:a:2".into(), "project:b:0".into()];
+        let inherited = three_way(&m, &y).unwrap();
+        assert!(inherited.verdict.pass);
+        assert_eq!(inherited.rows[0].bucket, Bucket::Inherited);
+        y.entries[0].comparison_alternatives = vec!["project:a:2".into(), "other:b:0".into()];
+        assert_eq!(three_way(&m, &y).unwrap().verdict.changed, 1);
     }
 }
