@@ -64,6 +64,7 @@ export function ResponseEvidence({ diff, scorecard }: { diff: HttpDiff; scorecar
       <details className="evraw">
         <summary>Raw captured response · {diff.body_diff.length} raw diff row{diff.body_diff.length === 1 ? "" : "s"}</summary>
         <p className="hint">Captured values and their raw rendering. These highlights are not behavioral findings.</p>
+        {diff.body_diff_address_error !== undefined && <p className="hint">Raw field addresses are unavailable: {diff.body_diff_address_error || "the server could not safely address these rows."}</p>}
         <JsonDiff before={diff.baseline_body} after={diff.candidate_body} />
       </details>
     </div>

@@ -2923,9 +2923,40 @@ async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
 }
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
-/// (status + field-level body diff), from the run's published http-diff stream.
+/// with field addresses resolved for display. Stored rows/operands and the raw
+/// artifact remain untouched; old ambiguous evidence stays inspectable with a
+/// reason when its field addresses cannot be recovered.
 async fn v1_http_diffs(State(st): State<AppState>, id: RunId) -> Response {
-    serve_jsonl_artifact(&st, &id, &artifact_kinds::HTTP_DIFFS).await
+    hydrate_run_artifacts(&st, &id).await;
+    match read_jsonl_artifact(
+        &artifact_kinds::HTTP_DIFFS.path(&st.root, &id),
+        artifact_kinds::HTTP_DIFFS.name,
+    ) {
+        Ok(Some(rows)) => match rows
+            .into_iter()
+            .map(http_diff_display_view)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(rows) => json_ok(serde_json::Value::Array(rows)),
+            Err(why) => error_resp(500, &why),
+        },
+        Ok(None) => absent_artifact(&st, &id, artifact_kinds::HTTP_DIFFS.name).await,
+        Err(why) => error_resp(500, &why),
+    }
+}
+
+fn http_diff_display_view(mut row: serde_json::Value) -> Result<serde_json::Value, String> {
+    let diff: deja_kernel::HttpDiff = serde_json::from_value(row.clone())
+        .map_err(|_| "published HTTP diff has an invalid shape".to_owned())?;
+    match deja_kernel::addressed_body_diff(&diff) {
+        Ok(addressed) => {
+            row["body_diff"] = serde_json::to_value(addressed.as_ref())
+                .map_err(|_| "response field evidence could not be serialized".to_owned())?;
+            row["body_diff_address_version"] = serde_json::json!(1);
+        }
+        Err(why) => row["body_diff_address_error"] = serde_json::Value::String(why),
+    }
+    Ok(row)
 }
 
 /// `GET /api/v1/runs/{id}/graph` — the record-side and replay-side execution
@@ -8253,6 +8284,67 @@ mod tests {
     }
 
     /// The other polarity: a stream the run published empty is served empty.
+    #[tokio::test]
+    async fn http_diff_api_resolves_field_addresses_without_rewriting_raw_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        run_in(&state, "run-addresses", RunStatus::Completed, None);
+        let baseline = serde_json::json!({"a.b":0,"a":{"b":0}});
+        let candidate = serde_json::json!({"a.b":1,"a":{"b":2}});
+        let mut diff = deja_kernel::HttpDiff {
+            correlation_id: "c".into(),
+            request_sequence: 0,
+            request_path: "/test".into(),
+            status_baseline: 200,
+            status_candidate: 200,
+            status_match: true,
+            body_diff: deja_kernel::diff_json(&baseline, &candidate, "$", &[]),
+            baseline_body: Some(baseline),
+            candidate_body: Some(candidate),
+            transport_error: None,
+        };
+        let path = state.root.http_diff_path("run-addresses");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let raw = format!("{}\n", serde_json::to_string(&diff).unwrap());
+        std::fs::write(&path, &raw).unwrap();
+        let (status, response) = get_json(
+            state.clone(),
+            "/api/v1/runs/run-addresses/http-diffs".into(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response[0]["body_diff_address_version"], 1);
+        let fields = response[0]["body_diff"].as_array().unwrap();
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field["json_path"] == "$[\"a.b\"]")
+                .unwrap()["candidate"],
+            1
+        );
+        assert_eq!(
+            fields
+                .iter()
+                .find(|field| field["json_path"] == "$.a.b")
+                .unwrap()["candidate"],
+            2
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        diff.candidate_body = None;
+        let raw = format!("{}\n", serde_json::to_string(&diff).unwrap());
+        std::fs::write(&path, &raw).unwrap();
+        let (status, response) =
+            get_json(state, "/api/v1/runs/run-addresses/http-diffs".into()).await;
+        assert_eq!(status, StatusCode::OK, "raw evidence remains inspectable");
+        assert!(response[0]["body_diff_address_error"].is_string());
+        assert!(response[0].get("body_diff_address_version").is_none());
+        assert_eq!(
+            response[0]["body_diff"],
+            serde_json::to_value(&diff.body_diff).unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+    }
+
     #[tokio::test]
     async fn a_published_empty_http_diff_stream_is_served_empty() {
         let dir = tempfile::tempdir().unwrap();

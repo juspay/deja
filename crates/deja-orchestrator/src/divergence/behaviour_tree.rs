@@ -54,7 +54,9 @@ use super::{ComparisonSubject, Scorecard};
 ///    compare across scorer revisions without requiring another replay.
 /// 9: project published HTTP residuals and typed call comparison identities;
 ///    HTTP addresses include the response sequence within their correlation.
-pub const CANON_VERSION: u32 = 9;
+/// 10: HTTP form identities participate in array matching, and literal JSON
+///     members have unambiguous addresses even in historical raw evidence.
+pub const CANON_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -544,6 +546,11 @@ pub fn http_comparison_mode(
         .collect();
     let mut actual = BTreeSet::new();
     for response in &comparison.responses {
+        if let Some(why) = &response.body.unavailable_reason {
+            return Err(format!(
+                "published response comparison is unavailable: {why}"
+            ));
+        }
         if !actual.insert((response.correlation_id.as_str(), response.request_sequence)) {
             return Err("duplicate published response comparison".into());
         }
@@ -612,7 +619,8 @@ pub fn project_http(
                 if accepted.contains(diff.correlation_id.as_str()) {
                     continue;
                 }
-                for body in &diff.body_diff {
+                let addressed = deja_kernel::addressed_body_diff(diff)?;
+                for body in addressed.iter() {
                     tree.entries.push(Entry {
                         address: Address::Body {
                             correlation: diff.correlation_id.clone(),
@@ -1448,5 +1456,57 @@ mod tests {
                 .changed,
             1
         );
+    }
+
+    #[test]
+    fn historical_raw_path_collisions_keep_distinct_field_addresses() {
+        let make = |run: &str, nested: u64| {
+            let baseline = serde_json::json!({"a.b":0,"a":{"b":0}});
+            let candidate = serde_json::json!({"a.b":1,"a":{"b":nested}});
+            let mut diff = response(0);
+            diff.body_diff = deja_kernel::diff_json(&baseline, &candidate, "$", &[]);
+            diff.baseline_body = Some(baseline);
+            diff.candidate_body = Some(candidate);
+            let mut card = accepted_card(run);
+            card.per_correlation[0].http_body_match = false;
+            build_with_scorecard(run, &[], &[diff], Some(&card)).unwrap()
+        };
+        let m = make("m", 1);
+        let y = make("y", 1);
+        let inherited = super::super::delta::three_way(&m, &y).unwrap();
+        assert!(inherited.verdict.pass);
+        assert_eq!(inherited.verdict.inherited, 2);
+        let paths: BTreeSet<_> = inherited
+            .rows
+            .iter()
+            .filter_map(|row| match &row.address {
+                Address::Body { json_path, .. } => Some(json_path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, ["$.a.b", "$[\"a.b\"]"].into_iter().collect());
+        let changed = super::super::delta::three_way(&m, &make("y-changed", 2)).unwrap();
+        assert_eq!(changed.verdict.changed, 1);
+        assert_eq!(changed.verdict.inherited, 1);
+    }
+
+    #[test]
+    fn published_address_unavailability_cannot_fall_back_to_a_clean_tree() {
+        use crate::divergence::{HttpBodyClassification, HttpComparison, HttpResponseComparison};
+        let mut card = accepted_card("r");
+        card.http_comparison = Some(HttpComparison {
+            version: 1,
+            responses: vec![HttpResponseComparison {
+                correlation_id: "c".into(),
+                request_sequence: 0,
+                body: HttpBodyClassification {
+                    unavailable_reason: Some("ambiguous stored field evidence".into()),
+                    ..Default::default()
+                },
+            }],
+        });
+        assert!(build_with_scorecard("r", &[], &[response(0)], Some(&card))
+            .unwrap_err()
+            .contains("ambiguous stored field evidence"));
     }
 }

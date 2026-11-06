@@ -351,6 +351,8 @@ export type HttpBodyClassification = {
   document_text_paths: string[];
   race_absorbed_paths?: string[];
   hidden_form_paths?: string[];
+  /** Stored evidence could not be given safe comparison addresses. */
+  unavailable_reason?: string;
 };
 export type HttpComparison = {
   version: number;
@@ -402,6 +404,9 @@ export type HttpDiff = {
   status_candidate: number;
   status_match: boolean;
   body_diff: JsonFieldDiff[];
+  /** Address format supplied by the HTTP-diffs endpoint, independent of raw storage. */
+  body_diff_address_version?: number;
+  body_diff_address_error?: string;
   // Full recorded + replayed bodies (present once the kernel persists them) —
   // enables a true side-by-side before/after with unchanged context.
   baseline_body?: unknown;

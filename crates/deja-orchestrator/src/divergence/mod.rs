@@ -2974,6 +2974,17 @@ fn args_served_reason(verdict: ValueVerdict) -> &'static str {
 /// A reported path with every array index written `[]`, so a row reordered
 /// in place (`$.rows[]`) and the rows reordered (`$.rows`) stay two sites.
 fn site_path(path: &str) -> String {
+    if path.contains("[\"") {
+        if let Some(mut segments) = deja_kernel::parse_json_path(path) {
+            for segment in &mut segments {
+                if let deja_kernel::JsonPathSegment::Index(index) = segment {
+                    *index = None;
+                }
+            }
+            return deja_kernel::format_json_path(&segments);
+        }
+        return path.to_owned();
+    }
     let mut out = String::with_capacity(path.len());
     let mut rest = path;
     while let Some(open) = rest.find('[') {
@@ -4181,17 +4192,47 @@ fn project_excludes_json_diff_path(exclude: &[String], json_path: &str) -> bool 
 const HTTP_REPLY_PROJECT_FIELD_ALIASES: &[(&str, &str)] = &[("created", "created_at")];
 
 fn http_project_excludes_json_diff_path(exclude: &[String], json_path: &str) -> bool {
-    if project_excludes_json_diff_path(exclude, json_path) {
+    // Existing declarations retain their original allowance at this boundary.
+    // Address containment and schema provenance never use this legacy alias.
+    let legacy = deja_kernel::legacy_json_path(json_path).unwrap_or_else(|| json_path.to_owned());
+    let legacy_exclude: Vec<_> = exclude
+        .iter()
+        .filter(|field| !field.contains("[\""))
+        .cloned()
+        .collect();
+    if project_excludes_json_diff_path(&legacy_exclude, &legacy) {
         return true;
     }
-    let normalized_path = normalize_project_path(json_path);
+    if exclude
+        .iter()
+        .filter(|field| field.contains("[\""))
+        .any(|field| {
+            let (Some(selector), Some(mut target)) = (
+                deja_kernel::parse_json_path(field),
+                deja_kernel::parse_json_path(json_path),
+            ) else {
+                return false;
+            };
+            if selector
+                .iter()
+                .any(|part| matches!(part, deja_kernel::JsonPathSegment::Index(_)))
+            {
+                return path_covers(field, json_path);
+            }
+            target.retain(|part| matches!(part, deja_kernel::JsonPathSegment::Member(_)));
+            target.starts_with(&selector) && !selector.is_empty()
+        })
+    {
+        return true;
+    }
+    let normalized_path = normalize_project_path(&legacy);
     let unindexed_path = remove_json_indexes(&normalized_path);
     let leaf = unindexed_path.rsplit('.').next().unwrap_or(&unindexed_path);
     HTTP_REPLY_PROJECT_FIELD_ALIASES
         .iter()
         .find_map(|(reply_field, declared_field)| (*reply_field == leaf).then_some(*declared_field))
         .is_some_and(|declared_field| {
-            project_excludes_path(exclude, declared_field, declared_field)
+            project_excludes_path(&legacy_exclude, declared_field, declared_field)
         })
 }
 
@@ -4572,8 +4613,8 @@ fn canon_verdict_for(
         bag_clause_paths(document_clauses),
     );
     let (in_rec, in_doc) = (
-        rec_bags.iter().any(|p| p == &path),
-        doc_bags.iter().any(|p| p == &path),
+        rec_bags.iter().any(|p| http_bag_path_matches(p, &path)),
+        doc_bags.iter().any(|p| http_bag_path_matches(p, &path)),
     );
     if in_rec || in_doc {
         // A path one source calls a set and the other excludes from comparison
@@ -4604,6 +4645,13 @@ fn canon_verdict_for(
         }
     }
     CanonVerdict::NotGoverned
+}
+
+fn http_bag_path_matches(selector: &str, path: &str) -> bool {
+    selector == path
+        || !selector.contains("[\"")
+            && deja_kernel::legacy_json_path(path)
+                .is_some_and(|legacy| canonical_set_path(&legacy) == selector)
 }
 
 fn http_diff_absorbed_by_whole_body_canon(
@@ -4909,6 +4957,7 @@ fn order_canonical_diff_into(
     path: &str,
     out: &mut Vec<JsonFieldDiff>,
     strict_form_paths: &mut Vec<String>,
+    completed_array_paths: &mut Vec<String>,
 ) {
     if baseline == candidate {
         return;
@@ -4919,13 +4968,14 @@ fn order_canonical_diff_into(
             keys.sort();
             keys.dedup();
             for key in keys {
-                let next = format!("{path}.{key}");
+                let next = deja_kernel::append_json_path_member(path, key);
                 order_canonical_diff_into(
                     b.get(key).unwrap_or(&serde_json::Value::Null),
                     c.get(key).unwrap_or(&serde_json::Value::Null),
                     &next,
                     out,
                     strict_form_paths,
+                    completed_array_paths,
                 );
             }
         }
@@ -4935,7 +4985,14 @@ fn order_canonical_diff_into(
             // re-describe it as however many positions this run's two orders
             // happened to disagree on — which is the count that will not sit
             // still between runs.
-            if deja::identity::same(baseline, candidate) {
+            let b_identity = http_identity_view(baseline);
+            let c_identity = http_identity_view(candidate);
+            let form_view_used = matches!(b_identity, std::borrow::Cow::Owned(_))
+                || matches!(c_identity, std::borrow::Cow::Owned(_));
+            if deja::identity::same(&b_identity, &c_identity) {
+                if form_view_used {
+                    completed_array_paths.push(path.to_owned());
+                }
                 out.push(JsonFieldDiff {
                     json_path: path.to_owned(),
                     baseline: baseline.clone(),
@@ -4949,11 +5006,28 @@ fn order_canonical_diff_into(
             // however far apart they sit, so substituting one element of nine
             // is one difference and not the run of positional disagreements
             // that the substitution shifted everything else into.
-            let (only_baseline, only_candidate) = cancel_common(b, c);
+            let b_views = b_identity
+                .as_array()
+                .expect("an array identity stays an array");
+            let c_views = c_identity
+                .as_array()
+                .expect("an array identity stays an array");
+            let b_members: Vec<_> = b
+                .iter()
+                .zip(b_views)
+                .map(|(original, identity)| HttpArrayMember { original, identity })
+                .collect();
+            let c_members: Vec<_> = c
+                .iter()
+                .zip(c_views)
+                .map(|(original, identity)| HttpArrayMember { original, identity })
+                .collect();
+            let (only_baseline, only_candidate) = cancel_common_members(&b_members, &c_members);
             // Pair each leftover member with the one it shares most with, so a
             // member that changed one field reports that field alone; order-free,
             // so the paths it names are the same on every run.
-            let (only_baseline, only_candidate) = pair_residues(only_baseline, only_candidate);
+            let (only_baseline, only_candidate) =
+                pair_residue_members(only_baseline, only_candidate);
             for index in 0..only_baseline.len().max(only_candidate.len()) {
                 // The index is into the residue, not into the original array:
                 // once order carries no information, a position cannot be
@@ -4962,16 +5036,20 @@ fn order_canonical_diff_into(
                 order_canonical_diff_into(
                     only_baseline
                         .get(index)
-                        .copied()
+                        .map(|member| member.original)
                         .unwrap_or(&serde_json::Value::Null),
                     only_candidate
                         .get(index)
-                        .copied()
+                        .map(|member| member.original)
                         .unwrap_or(&serde_json::Value::Null),
                     &next,
                     out,
                     strict_form_paths,
+                    completed_array_paths,
                 );
+            }
+            if form_view_used {
+                completed_array_paths.push(path.to_owned());
             }
         }
         (serde_json::Value::String(b), serde_json::Value::String(c)) => {
@@ -4985,7 +5063,15 @@ fn order_canonical_diff_into(
                 let form_context = contains_kernel_form(&b) || contains_kernel_form(&c);
                 let mut document_rows = Vec::new();
                 let mut document_forms = Vec::new();
-                order_canonical_diff_into(&b, &c, path, &mut document_rows, &mut document_forms);
+                let mut document_arrays = Vec::new();
+                order_canonical_diff_into(
+                    &b,
+                    &c,
+                    path,
+                    &mut document_rows,
+                    &mut document_forms,
+                    &mut document_arrays,
+                );
                 if !form_context || document_rows.is_empty() {
                     // Ordinary inline documents keep their existing string
                     // site: reconciliation records where the kernel judged
@@ -4999,8 +5085,9 @@ fn order_canonical_diff_into(
                 } else {
                     out.extend(document_rows);
                     strict_form_paths.extend(document_forms);
+                    completed_array_paths.extend(document_arrays);
                 }
-            } else if let Some(rows) = deja_kernel::diff_form_strings(b, c, path, &[]) {
+            } else if let Some(rows) = deja_kernel::addressed_diff_form_strings(b, c, path, &[]) {
                 // Keep the form site even when every key matched, so an outer
                 // inline document still follows the kernel's parsed reading.
                 strict_form_paths.push(path.to_owned());
@@ -5029,7 +5116,14 @@ fn order_canonical_diff(
     path: &str,
     out: &mut Vec<JsonFieldDiff>,
 ) {
-    order_canonical_diff_into(baseline, candidate, path, out, &mut Vec::new());
+    order_canonical_diff_into(
+        baseline,
+        candidate,
+        path,
+        out,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
 }
 
 /// Is this row an ordering difference — two arrays with identical members in a
@@ -5090,29 +5184,97 @@ pub(crate) fn written_hash(member: &serde_json::Value, keys_sorted: bool) -> u64
     )
 }
 
+/// A kernel form stays a string in the HTTP identity view. Its per-key
+/// ordered values are serialized under a reserved prefix, so the JSON identity
+/// comparator cannot reinterpret those values as bags or embedded documents.
+/// An ordinary string using that prefix is escaped into a separate namespace.
+/// JSON objects stay objects, and documents carried by strings stay strings.
+fn http_identity_view(value: &serde_json::Value) -> std::borrow::Cow<'_, serde_json::Value> {
+    use std::borrow::Cow;
+    const PREFIX: &str = "\u{1}deja-http:";
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(document) = deja::identity::embedded_document(text) {
+                match http_identity_view(&document) {
+                    Cow::Owned(normalized) => Cow::Owned(serde_json::Value::String(
+                        serde_json::to_string(&normalized)
+                            .expect("a JSON identity view serializes"),
+                    )),
+                    Cow::Borrowed(_) => Cow::Borrowed(value),
+                }
+            } else if let Some(fields) = deja_kernel::parse_form_fields(text) {
+                Cow::Owned(serde_json::Value::String(format!(
+                    "{PREFIX}form:{}",
+                    serde_json::to_string(&fields).expect("form fields serialize"),
+                )))
+            } else if text.starts_with(PREFIX) {
+                Cow::Owned(serde_json::Value::String(format!("{PREFIX}text:{text}")))
+            } else {
+                Cow::Borrowed(value)
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let members: Vec<_> = map
+                .iter()
+                .map(|(key, value)| (key, http_identity_view(value)))
+                .collect();
+            if members
+                .iter()
+                .any(|(_, value)| matches!(value, Cow::Owned(_)))
+            {
+                Cow::Owned(serde_json::Value::Object(
+                    members
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), value.into_owned()))
+                        .collect(),
+                ))
+            } else {
+                Cow::Borrowed(value)
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let members: Vec<_> = items.iter().map(http_identity_view).collect();
+            if members.iter().any(|value| matches!(value, Cow::Owned(_))) {
+                Cow::Owned(serde_json::Value::Array(
+                    members.into_iter().map(Cow::into_owned).collect(),
+                ))
+            } else {
+                Cow::Borrowed(value)
+            }
+        }
+        _ => Cow::Borrowed(value),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HttpArrayMember<'a, 'view> {
+    original: &'a serde_json::Value,
+    identity: &'view serde_json::Value,
+}
+
 /// Cancel the members two arrays share, one partner each and the closest
-/// first: one written identically, then one written identically but for key
-/// order, then one the exact hash reads alike (a body in another rendering),
-/// then one of the same identity written another way. Each tier holds the one
-/// before it. Both sides are read in content order (identity, exact hash, key
-/// order aside, as written), so which member cancels and which is left never
-/// depends on the order either side wrote them in, and a lost duplicate still
-/// surfaces. Returns each side's leftovers in that order.
-fn cancel_common<'a>(
-    baseline: &'a [serde_json::Value],
-    candidate: &'a [serde_json::Value],
-) -> (Vec<&'a serde_json::Value>, Vec<&'a serde_json::Value>) {
+/// first. Identity buckets and confirmation use the cached HTTP view; the
+/// original written tiers preserve the closest-partner preference and stable
+/// original evidence when several renderings have that same identity.
+fn cancel_common_members<'a, 'view>(
+    baseline: &[HttpArrayMember<'a, 'view>],
+    candidate: &[HttpArrayMember<'a, 'view>],
+) -> (
+    Vec<HttpArrayMember<'a, 'view>>,
+    Vec<HttpArrayMember<'a, 'view>>,
+) {
     use std::collections::VecDeque;
-    type Keyed<'a> = (u64, u64, u64, u64, &'a serde_json::Value);
-    let in_content_order = |members: &'a [serde_json::Value]| {
-        let mut keyed: Vec<Keyed<'a>> = members
+    type Keyed<'a, 'view> = (u64, u64, u64, u64, HttpArrayMember<'a, 'view>);
+    let in_content_order = |members: &[HttpArrayMember<'a, 'view>]| {
+        let mut keyed: Vec<Keyed<'a, 'view>> = members
             .iter()
+            .copied()
             .map(|member| {
                 (
-                    deja::identity::element_hash(member),
-                    deja::canonical_args_hash(member),
-                    written_hash(member, true),
-                    written_hash(member, false),
+                    deja::identity::element_hash(member.identity),
+                    deja::canonical_args_hash(member.original),
+                    written_hash(member.original, true),
+                    written_hash(member.original, false),
                     member,
                 )
             })
@@ -5123,7 +5285,7 @@ fn cancel_common<'a>(
         keyed
     };
     let (baseline, candidate) = (in_content_order(baseline), in_content_order(candidate));
-    let queues = |key: fn(&Keyed<'a>) -> u64| {
+    let queues = |key: fn(&Keyed<'a, 'view>) -> u64| {
         let mut queues: HashMap<u64, VecDeque<usize>> = HashMap::new();
         for (index, member) in candidate.iter().enumerate() {
             queues.entry(key(member)).or_default().push_back(index);
@@ -5132,10 +5294,10 @@ fn cancel_common<'a>(
     };
     let mut used = vec![false; candidate.len()];
     let mut cancelled = vec![false; baseline.len()];
-    let written: fn(&Keyed<'a>) -> u64 = |&(_, _, _, written, _)| written;
-    let sorted: fn(&Keyed<'a>) -> u64 = |&(_, _, sorted, _, _)| sorted;
-    let exact: fn(&Keyed<'a>) -> u64 = |&(_, exact, _, _, _)| exact;
-    let identity: fn(&Keyed<'a>) -> u64 = |&(identity, _, _, _, _)| identity;
+    let written: fn(&Keyed<'a, 'view>) -> u64 = |&(_, _, _, written, _)| written;
+    let sorted: fn(&Keyed<'a, 'view>) -> u64 = |&(_, _, sorted, _, _)| sorted;
+    let exact: fn(&Keyed<'a, 'view>) -> u64 = |&(_, exact, _, _, _)| exact;
+    let identity: fn(&Keyed<'a, 'view>) -> u64 = |&(identity, _, _, _, _)| identity;
     for key in [written, sorted, exact, identity] {
         let mut queues = queues(key);
         for (index, member) in baseline.iter().enumerate() {
@@ -5148,9 +5310,8 @@ fn cancel_common<'a>(
             while queue.front().is_some_and(|&other| used[other]) {
                 queue.pop_front();
             }
-            // Past the front only on a hash shared by another identity.
             let found = queue.iter().position(|&other| {
-                !used[other] && deja::identity::same(member.4, candidate[other].4)
+                !used[other] && deja::identity::same(member.4.identity, candidate[other].4.identity)
             });
             if let Some(other) = found.and_then(|found| queue.remove(found)) {
                 used[other] = true;
@@ -5158,7 +5319,7 @@ fn cancel_common<'a>(
             }
         }
     }
-    let left = |members: Vec<Keyed<'a>>, gone: Vec<bool>| {
+    let left = |members: Vec<Keyed<'a, 'view>>, gone: Vec<bool>| {
         members
             .into_iter()
             .zip(gone)
@@ -5168,20 +5329,15 @@ fn cancel_common<'a>(
     (left(baseline, cancelled), left(candidate, used))
 }
 
-/// Pair two arrays' leftover members for the report, each taken in content
-/// order: each recorded member with the observed member sharing the most
-/// fields with it, ties to the earliest. A field is an object's member, read
-/// with its key so a byte string keeps its order, or an array's member.
-/// Nothing here depends on the order either side wrote its members in. Each
-/// member's fields are read once. Past a bound on the work (every recorded
-/// member's fields against every observed member) the members pair in content
-/// order unscored, and a leftover paired with a stranger reports each field
-/// they differ in. Returns the two sides aligned by index; unpaired members
-/// follow.
-fn pair_residues<'a>(
-    baseline: Vec<&'a serde_json::Value>,
-    candidate: Vec<&'a serde_json::Value>,
-) -> (Vec<&'a serde_json::Value>, Vec<&'a serde_json::Value>) {
+/// The same bounded field-overlap pairing as before, using the cached view
+/// that cancellation and content ordering already used.
+fn pair_residue_members<'a, 'view>(
+    baseline: Vec<HttpArrayMember<'a, 'view>>,
+    candidate: Vec<HttpArrayMember<'a, 'view>>,
+) -> (
+    Vec<HttpArrayMember<'a, 'view>>,
+    Vec<HttpArrayMember<'a, 'view>>,
+) {
     const MAX_WORK: usize = 1 << 22;
     let fields = |member: &serde_json::Value| -> HashMap<u64, usize> {
         let hashes: Vec<u64> = match member {
@@ -5204,7 +5360,7 @@ fn pair_residues<'a>(
         }
         counts
     };
-    let width = |member: &serde_json::Value| match member {
+    let width = |member: &HttpArrayMember<'_, '_>| match member.identity {
         serde_json::Value::Object(map) => map.len(),
         serde_json::Value::Array(items) => items.len(),
         _ => 0,
@@ -5217,10 +5373,13 @@ fn pair_residues<'a>(
     if work > MAX_WORK {
         return (baseline, candidate);
     }
-    let own: Vec<HashMap<u64, usize>> = baseline.iter().map(|member| fields(member)).collect();
-    let mut candidates: Vec<(&'a serde_json::Value, HashMap<u64, usize>)> = candidate
+    let own: Vec<HashMap<u64, usize>> = baseline
+        .iter()
+        .map(|member| fields(member.identity))
+        .collect();
+    let mut candidates: Vec<_> = candidate
         .into_iter()
-        .map(|member| (member, fields(member)))
+        .map(|member| (member, fields(member.identity)))
         .collect();
     let mut paired = Vec::with_capacity(candidates.len());
     for own in &own {
@@ -5247,7 +5406,11 @@ fn pair_residues<'a>(
 
 /// The same predicate as [`json_order_only_difference`], for a reported row.
 fn is_order_only_difference(row: &JsonFieldDiff) -> bool {
-    json_order_only_difference(&row.baseline, &row.candidate)
+    row.baseline != row.candidate
+        && deja::identity::same(
+            &http_identity_view(&row.baseline),
+            &http_identity_view(&row.candidate),
+        )
 }
 
 /// How a document held in a string is read, for the warnings that name one.
@@ -5536,10 +5699,11 @@ fn embedded_document_pairs(
 ///
 /// The recompute RE-SHAPES the kernel's differences; it does not get a second,
 /// independent opinion about whether they exist. See [`reconciled_with_kernel`].
-fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
+fn reconciled_body_diff(diff: &HttpDiff, kernel_rows: &[JsonFieldDiff]) -> Option<Reconciliation> {
     let (baseline, candidate) = (diff.baseline_body.as_ref()?, diff.candidate_body.as_ref()?);
     let mut rows = Vec::new();
     let mut strict_form_paths = Vec::new();
+    let mut completed_array_paths = Vec::new();
     // A non-JSON body carrying JSON documents is compared as those documents,
     // when the text around them is identical. Only at the root: a JSON body is
     // never re-scanned.
@@ -5558,18 +5722,38 @@ fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
                     &format!("$.~embedded[{index}]"),
                     &mut rows,
                     &mut strict_form_paths,
+                    &mut completed_array_paths,
                 );
             }
             vec!["$".to_owned()]
         }
         None => {
-            order_canonical_diff_into(baseline, candidate, "$", &mut rows, &mut strict_form_paths);
+            order_canonical_diff_into(
+                baseline,
+                candidate,
+                "$",
+                &mut rows,
+                &mut strict_form_paths,
+                &mut completed_array_paths,
+            );
             Vec::new()
         }
     };
-    let mut reconciled = reconciled_with_kernel(rows, &diff.body_diff);
+    let mut reconciled = reconciled_with_kernel(rows, kernel_rows);
     reconciled.embedded_document_paths = embedded_document_paths;
     reconciled.strict_form_paths = strict_form_paths;
+    reconciled.completed_array_paths = completed_array_paths;
+    // A complete structural comparison can account for positional rows that
+    // its captured bodies actually support. It cannot speak for older opaque
+    // kernel evidence absent from those bodies, even under a matching array.
+    let captured_rows = (!reconciled.completed_array_paths.is_empty())
+        .then(|| deja_kernel::addressed_diff_json(baseline, candidate, "$", &[]));
+    let captured_by_path: HashMap<_, _> = captured_rows
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .map(|row| (row.json_path.as_str(), row))
+        .collect();
     // The invariant holds in BOTH directions: the recompute may re-shape the
     // kernel's findings and may not invent one — and may not erase one either.
     // A kernel row that no surviving recompute row speaks about was not
@@ -5577,16 +5761,29 @@ fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
     // row: a backed row beside it must not decide its fate. Judged against the
     // recompute's survivors alone, so that two unspoken-for kernel rows in one
     // collection cannot speak for each other and lose one.
-    let unspoken_for: Vec<JsonFieldDiff> = diff
-        .body_diff
+    let unspoken_for: Vec<JsonFieldDiff> = kernel_rows
         .iter()
         .filter(|found| {
+            let in_completed_array = reconciled
+                .completed_array_paths
+                .iter()
+                .any(|path| path_covers(path, &found.json_path));
+            let captured = captured_by_path
+                .get(found.json_path.as_str())
+                .is_some_and(|row| {
+                    row.baseline == found.baseline && row.candidate == found.candidate
+                });
+            if in_completed_array && !captured {
+                return true;
+            }
             !reconciled
                 .rows
                 .iter()
                 .any(|row| paths_overlap(&row.json_path, &found.json_path))
                 // A text read as its embedded documents is spoken for by that
                 // reading, including when the documents are equal as JSON.
+                && !reconciled.completed_array_paths.iter()
+                    .any(|path| path_covers(path, &found.json_path))
                 && !reconciled
                     .embedded_document_paths
                     .iter()
@@ -5601,7 +5798,8 @@ fn reconciled_body_diff(diff: &HttpDiff) -> Option<Reconciliation> {
 /// The rows of [`reconciled_body_diff`] alone, for tests that assert on shape.
 #[cfg(test)]
 fn order_canonical_body_diff(diff: &HttpDiff) -> Option<Vec<JsonFieldDiff>> {
-    reconciled_body_diff(diff).map(|reconciled| reconciled.rows)
+    let addressed = deja_kernel::addressed_body_diff(diff).ok()?;
+    reconciled_body_diff(diff, &addressed).map(|reconciled| reconciled.rows)
 }
 
 /// What holding the recompute to the kernel's findings produced.
@@ -5616,16 +5814,36 @@ struct Reconciliation {
     embedded_document_paths: Vec<String>,
     /// Kernel form-key residuals whose repeated values retain their order.
     strict_form_paths: Vec<String>,
+    /// Array regions exhaustively compared through the HTTP identity view:
+    /// all members were cancelled or recursively compared, including additions,
+    /// removals and repeated values. Their positional kernel rows are spoken for
+    /// by that complete structural comparison, not by one overlapping residue.
+    completed_array_paths: Vec<String>,
 }
 
 /// Is a difference reported at `inner` the same difference as, or part of, one
 /// reported at `outer`? Prefix by PATH SEGMENT, so `$.ab` is never read as
 /// sitting under `$.a`.
 fn path_covers(outer: &str, inner: &str) -> bool {
-    outer == inner
-        || inner
-            .strip_prefix(outer)
-            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with('['))
+    match (
+        deja_kernel::parse_json_path(outer),
+        deja_kernel::parse_json_path(inner),
+    ) {
+        (Some(outer), Some(inner)) => {
+            outer.len() <= inner.len()
+                && outer.iter().zip(&inner).all(|(a, b)| {
+                    a == b
+                        || matches!(
+                            (a, b),
+                            (
+                                deja_kernel::JsonPathSegment::Index(None),
+                                deja_kernel::JsonPathSegment::Index(_)
+                            )
+                        )
+                })
+        }
+        _ => false,
+    }
 }
 
 /// Do two reported paths speak about the same region of the body?
@@ -5691,6 +5909,7 @@ fn reconciled_with_kernel(
         kernel_equivalent_paths,
         embedded_document_paths: Vec::new(),
         strict_form_paths: Vec::new(),
+        completed_array_paths: Vec::new(),
     }
 }
 
@@ -5716,6 +5935,9 @@ pub struct HttpComparison {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpBodyClassification {
+    /// Why the stored response evidence cannot be projected unambiguously.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     pub blocking_leaf_count: usize,
     pub blocking: Vec<HttpBodyResidual>,
     pub schema_derived_paths: Vec<String>,
@@ -5761,6 +5983,28 @@ pub struct HttpBodyClassification {
 /// declaration was ever read — and a declaration that is silently never read is
 /// the failure this codebase keeps paying for.
 fn canonical_set_path(path: &str) -> String {
+    if path.contains("[\"") {
+        if let Some(mut segments) = deja_kernel::parse_json_path(path) {
+            for segment in &mut segments {
+                if let deja_kernel::JsonPathSegment::Index(index) = segment {
+                    *index = None;
+                }
+            }
+            if matches!(
+                segments.last(),
+                Some(deja_kernel::JsonPathSegment::Index(_))
+            ) {
+                segments.pop();
+            }
+            let rendered = deja_kernel::format_json_path(&segments);
+            return if path.starts_with('$') {
+                rendered
+            } else {
+                normalize_project_path(&rendered)
+            };
+        }
+        return path.to_owned();
+    }
     let mut out = String::with_capacity(path.len());
     let mut in_index = false;
     for ch in path.chars() {
@@ -5777,16 +6021,15 @@ fn canonical_set_path(path: &str) -> String {
     out.strip_suffix("[]").unwrap_or(&out).to_owned()
 }
 
-fn json_diff_leaf_field(json_path: &str) -> Option<&str> {
-    let mut path = json_path.trim();
-    while path.ends_with(']') {
-        let index = path.rfind('[')?;
-        path = &path[..index];
-    }
-    path.rsplit('.')
-        .next()
-        .map(str::trim)
-        .filter(|leaf| !leaf.is_empty() && *leaf != "$")
+fn json_diff_leaf_field(json_path: &str) -> Option<String> {
+    let leaf = deja_kernel::parse_json_path(json_path)?
+        .into_iter()
+        .rev()
+        .find_map(|segment| match segment {
+            deja_kernel::JsonPathSegment::Member(member) => Some(member),
+            _ => None,
+        })?;
+    (!leaf.is_empty()).then_some(leaf)
 }
 
 /// What a body difference is judged against that is the same for every diff in
@@ -5818,13 +6061,39 @@ fn classify_http_body_diff(
             ..HttpBodyClassification::default()
         };
     }
+    let addressed = match deja_kernel::addressed_body_diff(diff) {
+        Ok(rows) => rows,
+        Err(why) => {
+            // Preserve the kernel's differences conservatively. Incomplete
+            // addressing cannot turn them into an accepted response, and the
+            // explicit reason prevents tree/UI consumers from guessing sites.
+            return HttpBodyClassification {
+                unavailable_reason: Some(why),
+                blocking_leaf_count: diff.body_diff.len(),
+                blocking: diff
+                    .body_diff
+                    .iter()
+                    .map(|row| HttpBodyResidual {
+                        diff: row.clone(),
+                        candidate_identity: format!(
+                            "written:v1:{:016x}",
+                            written_hash(&row.candidate, true)
+                        ),
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+        }
+    };
     let mut classification = HttpBodyClassification::default();
     // Ordering is resolved BEFORE anything is classified, so every absorber
     // below sees the path a difference will be reported at rather than
     // whichever positions this run's ordering scattered it across.
     let mut conflicted = false;
-    let reconciled = reconciled_body_diff(diff);
-    let rows: &[JsonFieldDiff] = reconciled.as_ref().map_or(&diff.body_diff, |r| &r.rows);
+    let reconciled = reconciled_body_diff(diff, &addressed);
+    let rows: &[JsonFieldDiff] = reconciled
+        .as_ref()
+        .map_or(addressed.as_ref(), |r| r.rows.as_slice());
     classification.kernel_equivalent_paths = reconciled
         .as_ref()
         .map(|r| r.kernel_equivalent_paths.clone())
@@ -5860,7 +6129,7 @@ fn classify_http_body_diff(
             continue;
         }
         if json_diff_leaf_field(&body.json_path).is_some_and(|column| {
-            provenance.is_established_in_correlation(Some(&diff.correlation_id), column)
+            provenance.is_established_in_correlation(Some(&diff.correlation_id), &column)
         }) {
             classification
                 .schema_derived_paths
@@ -5888,7 +6157,7 @@ fn classify_http_body_diff(
             } else {
                 format!(
                     "identity:v1:{:016x}",
-                    deja::identity::identity_args_hash(&body.candidate)
+                    deja::identity::identity_args_hash(&http_identity_view(&body.candidate))
                 )
             };
             classification.blocking.push(HttpBodyResidual {
@@ -5936,7 +6205,9 @@ fn http_clean_from_comparison(
 ) -> HashMap<String, bool> {
     let mut clean_by_correlation: HashMap<String, bool> = HashMap::new();
     for (diff, decision) in diffs.iter().zip(&comparison.responses) {
-        let clean = diff.status_match && decision.body.blocking.is_empty();
+        let clean = diff.status_match
+            && decision.body.unavailable_reason.is_none()
+            && decision.body.blocking.is_empty();
         clean_by_correlation
             .entry(diff.correlation_id.clone())
             .and_modify(|existing| *existing &= clean)
@@ -8770,6 +9041,300 @@ mod tests {
             ),
             (0, 0, 1)
         );
+    }
+
+    #[test]
+    fn published_form_array_identity_is_invariant_under_member_and_key_permutations() {
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let wrap = |forms: Vec<String>, shape: usize| -> serde_json::Value {
+            match shape {
+                0 => serde_json::json!(forms),
+                1 => serde_json::Value::Array(
+                    forms
+                        .into_iter()
+                        .map(|form| serde_json::json!({"form":form}))
+                        .collect(),
+                ),
+                2 => serde_json::Value::Array(
+                    forms
+                        .into_iter()
+                        .map(|form| {
+                            serde_json::json!(serde_json::json!({"payload":form}).to_string())
+                        })
+                        .collect(),
+                ),
+                _ => serde_json::json!(serde_json::json!({"items":forms}).to_string()),
+            }
+        };
+        let tree = |run: &str, baseline: serde_json::Value, candidate: serde_json::Value| {
+            let mut artifacts = art(Vec::new(), Vec::new(), vec![body_pair(baseline, candidate)]);
+            artifacts.run_id = run.into();
+            let card = detect(&artifacts);
+            behaviour_tree::build_with_scorecard(run, &[], &artifacts.http_diffs, Some(&card))
+                .unwrap()
+        };
+        for duplicate in [false, true] {
+            let source = [
+                "a=0&b=0",
+                "c=0&d=0",
+                if duplicate { "c=0&d=0" } else { "x=0&x=1&y=0" },
+            ];
+            let candidate = ["a=1&b=0", "c=0&d=0", source[2]];
+            let reordered = [
+                "b=0&a=1",
+                "d=0&c=0",
+                if duplicate { "d=0&c=0" } else { "y=0&x=0&x=1" },
+            ];
+            for shape in 0..4 {
+                for source_order in permutations {
+                    let baseline = wrap(
+                        source_order.iter().map(|&i| source[i].to_owned()).collect(),
+                        shape,
+                    );
+                    let m = tree(
+                        "m",
+                        baseline.clone(),
+                        wrap(candidate.iter().map(|s| (*s).to_owned()).collect(), shape),
+                    );
+                    if duplicate {
+                        let missing = tree(
+                            "missing",
+                            baseline.clone(),
+                            wrap(
+                                vec![candidate[0].to_owned(), candidate[1].to_owned()],
+                                shape,
+                            ),
+                        );
+                        assert!(!delta::three_way(&m, &missing).unwrap().verdict.pass,
+                            "losing one identical member must charge Y: shape={shape} baseline={source_order:?}");
+                    }
+                    for order in permutations {
+                        for mask in 0..8 {
+                            let varied: Vec<String> = order
+                                .iter()
+                                .map(|&i| {
+                                    if mask & (1 << i) == 0 {
+                                        candidate[i]
+                                    } else {
+                                        reordered[i]
+                                    }
+                                    .to_owned()
+                                })
+                                .collect();
+                            let y = tree("y", baseline.clone(), wrap(varied, shape));
+                            let delta = delta::three_way(&m, &y).unwrap();
+                            assert_eq!((delta.verdict.pass, delta.verdict.introduced,
+                                delta.verdict.changed, delta.verdict.inherited), (true,0,0,1),
+                                "shape={shape} duplicates={duplicate} baseline={source_order:?} order={order:?} keys={mask}");
+                            let changed: Vec<String> = order
+                                .iter()
+                                .map(|&i| {
+                                    if i == 0 {
+                                        if mask & 1 == 0 {
+                                            "a=2&b=0"
+                                        } else {
+                                            "b=0&a=2"
+                                        }
+                                    } else if mask & (1 << i) == 0 {
+                                        candidate[i]
+                                    } else {
+                                        reordered[i]
+                                    }
+                                    .to_owned()
+                                })
+                                .collect();
+                            let changed = tree("changed", baseline.clone(), wrap(changed, shape));
+                            assert!(!delta::three_way(&m, &changed).unwrap().verdict.pass,
+                                "a real value change must charge Y: shape={shape} duplicates={duplicate} baseline={source_order:?} order={order:?} keys={mask}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn published_form_array_identity_keeps_values_types_duplicates_and_repeated_order() {
+        let baseline = serde_json::json!(["a=0&b=0", "c=0&d=0", "x=0&x=1&y=0"]);
+        let candidate = serde_json::json!(["a=1&b=0", "c=0&d=0", "x=0&x=1&y=0"]);
+        let tree = |run: &str, value: serde_json::Value| {
+            let mut artifacts = art(
+                Vec::new(),
+                Vec::new(),
+                vec![body_pair(baseline.clone(), value)],
+            );
+            artifacts.run_id = run.into();
+            let card = detect(&artifacts);
+            behaviour_tree::build_with_scorecard(run, &[], &artifacts.http_diffs, Some(&card))
+                .unwrap()
+        };
+        let m = tree("m", candidate);
+        for (name, changed) in [
+            (
+                "different value",
+                serde_json::json!(["a=2&b=0", "c=0&d=0", "x=0&x=1&y=0"]),
+            ),
+            (
+                "repeated-key order",
+                serde_json::json!(["a=1&b=0", "c=0&d=0", "x=1&x=0&y=0"]),
+            ),
+            ("missing member", serde_json::json!(["a=1&b=0", "c=0&d=0"])),
+            (
+                "form became object",
+                serde_json::json!([{"a":"1","b":"0"},"c=0&d=0","x=0&x=1&y=0"]),
+            ),
+        ] {
+            let y = tree("y", changed);
+            assert!(
+                !delta::three_way(&m, &y).unwrap().verdict.pass,
+                "{name} must still charge Y"
+            );
+        }
+        let form = serde_json::json!("a=1&b=0");
+        let object = serde_json::json!({"a":["1"],"b":["0"]});
+        assert!(!deja::identity::same(
+            &http_identity_view(&form),
+            &http_identity_view(&object)
+        ));
+        let fake = http_identity_view(&form).into_owned();
+        assert!(
+            !deja::identity::same(&http_identity_view(&form), &http_identity_view(&fake)),
+            "ordinary text cannot impersonate the reserved form identity namespace"
+        );
+    }
+
+    #[test]
+    fn completed_form_arrays_never_erase_opaque_authoritative_kernel_rows() {
+        for candidate in ["b=0&a=0", "b=0&a=1"] {
+            let mut diff = body_pair(
+                serde_json::json!({"items":["a=0&b=0"]}),
+                serde_json::json!({"items":[candidate]}),
+            );
+            diff.body_diff.push(JsonFieldDiff {
+                json_path: "$.items[0].mystery".into(),
+                baseline: serde_json::json!("old"),
+                candidate: serde_json::json!("new"),
+            });
+            let body = classify_body(&diff);
+            assert!(body.blocking.iter().any(
+                |row| row.diff.json_path == "$.items[0].mystery" && row.diff.candidate == "new"
+            ));
+            assert_eq!(
+                body.blocking.len(),
+                if candidate.ends_with("a=1") { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[test]
+    fn published_literal_member_addresses_remain_distinct_through_tree_and_delta() {
+        let make = |run: &str, nested: u64| {
+            let diff = body_pair(
+                serde_json::json!({"a.b":0,"a":{"b":0},"items[0]":0,"items":[0]}),
+                serde_json::json!({"a.b":1,"a":{"b":nested},"items[0]":1,"items":[1]}),
+            );
+            let mut artifacts = art(Vec::new(), Vec::new(), vec![diff]);
+            artifacts.run_id = run.into();
+            let card = detect(&artifacts);
+            let body = &card.http_comparison.as_ref().unwrap().responses[0].body;
+            assert!(body.unavailable_reason.is_none());
+            assert_eq!(body.blocking.len(), 4);
+            let paths: BTreeSet<_> = body
+                .blocking
+                .iter()
+                .map(|row| row.diff.json_path.as_str())
+                .collect();
+            assert_eq!(
+                paths,
+                ["$.a.b", "$[\"a.b\"]", "$.items[0]", "$[\"items[0]\"]"]
+                    .into_iter()
+                    .collect()
+            );
+            behaviour_tree::build_with_scorecard(run, &[], &artifacts.http_diffs, Some(&card))
+                .unwrap()
+        };
+        let m = make("m", 1);
+        let same = delta::three_way(&m, &make("same", 1)).unwrap();
+        assert!(same.verdict.pass);
+        assert_eq!(same.verdict.inherited, 4);
+        let changed = delta::three_way(&m, &make("changed", 2)).unwrap();
+        assert!(!changed.verdict.pass);
+        assert_eq!(changed.verdict.changed, 1);
+        assert_eq!(changed.verdict.inherited, 3);
+    }
+
+    #[test]
+    fn http_path_consumers_distinguish_members_from_index_and_selector_syntax() {
+        assert!(!paths_overlap("$[\"a.b\"]", "$.a.b"));
+        assert!(!path_covers("$.a", "$[\"a.b\"]"));
+        assert!(paths_overlap("$[\"a.b\"][1].x", "$[\"a.b\"][3].x"));
+        assert_eq!(
+            canonical_set_path("$[\"items[0]\"][2][\"a.b\"]"),
+            "$[\"items[0]\"][][\"a.b\"]"
+        );
+        assert_eq!(site_path("$[\"items[0]\"][2]"), "$[\"items[0]\"][]");
+        assert_eq!(
+            json_diff_leaf_field("$[\"meta.created_at\"]"),
+            Some("meta.created_at".to_owned())
+        );
+        assert_eq!(
+            json_diff_leaf_field("$.meta.created_at[0]"),
+            Some("created_at".to_owned())
+        );
+        assert_eq!(json_diff_leaf_field("$.id[\"\"]"), None);
+        assert!(
+            http_bag_path_matches("$.a.b", "$[\"a.b\"]"),
+            "old declarations retain their original allowance"
+        );
+        assert!(!http_bag_path_matches("$[\"a.b\"]", "$.a.b"));
+        assert!(http_project_excludes_json_diff_path(
+            &["a.b".into()],
+            "$[\"a.b\"]"
+        ));
+        assert!(http_project_excludes_json_diff_path(
+            &["$[\"a.b\"]".into()],
+            "$[\"a.b\"]"
+        ));
+        assert!(!http_project_excludes_json_diff_path(
+            &["$[\"a.b\"]".into()],
+            "$.a.b"
+        ));
+        assert!(!http_project_excludes_json_diff_path(
+            &["$.items[0][\"a.b\"]".into()],
+            "$.items[1][\"a.b\"]"
+        ));
+    }
+
+    #[test]
+    fn unaddressable_kernel_evidence_publishes_unavailability_without_clean_acceptance() {
+        let mut diff = body_pair(
+            serde_json::json!({"a.b":0,"a":{"b":0}}),
+            serde_json::json!({"a.b":1,"a":{"b":1}}),
+        );
+        diff.baseline_body = None;
+        diff.candidate_body = None;
+        let mut artifacts = art(Vec::new(), Vec::new(), vec![diff]);
+        artifacts.run_id = "missing-bodies".into();
+        let card = detect(&artifacts);
+        let body = &card.http_comparison.as_ref().unwrap().responses[0].body;
+        assert!(body.unavailable_reason.is_some());
+        assert_eq!(body.blocking.len(), 2);
+        assert!(!card.verdict.pass);
+        assert!(behaviour_tree::build_with_scorecard(
+            "missing-bodies",
+            &[],
+            &artifacts.http_diffs,
+            Some(&card)
+        )
+        .unwrap_err()
+        .contains("unavailable"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-import type { CallRecord, ClauseSource, Delta, DeltaBucket, DeltaFamily, DeltaRow, HttpBodyClassification, HttpDiff, JsonFieldDiff, Scorecard, ValueAbsorption } from "./api";
+import type { CallRecord, ClauseSource, Delta, DeltaBucket, DeltaFamily, DeltaRow, HttpBodyClassification, HttpComparison, HttpDiff, JsonFieldDiff, Scorecard, ValueAbsorption } from "./api";
 import { deltaFamily } from "./api";
 
 /** Keys identify published responses; they do not compare captured values. */
@@ -28,24 +28,76 @@ function validBody(body: HttpBodyClassification): boolean {
   return Array.isArray(body.canon_absorbed) && body.canon_absorbed.every((entry) => Array.isArray(entry) && entry.length === 2 && typeof entry[0] === "string" && ["default", "recorder", "document", "both"].includes(entry[1]));
 }
 
+type PreparedComparison =
+  | { kind: "indexed"; responses: ReadonlyMap<string, HttpBodyClassification> }
+  | Extract<HttpJudgment, { kind: "unavailable" }>;
+
+// API publications are immutable React Query JSON snapshots. Cache validation
+// and indexing together, including rejection; a replacement object is checked
+// afresh. Weak keys let discarded query snapshots be collected.
+const preparedComparisons = new WeakMap<HttpComparison, PreparedComparison>();
+const historicalCorrelations = new WeakMap<NonNullable<Scorecard["per_correlation"]>, ReadonlyMap<string, boolean | undefined>>();
+
+function prepareComparison(published: HttpComparison): PreparedComparison {
+  const cached = preparedComparisons.get(published);
+  if (cached) return cached;
+  const reject = (reason: string): PreparedComparison => {
+    const result = { kind: "unavailable" as const, reason };
+    preparedComparisons.set(published, result);
+    return result;
+  };
+  const version = published.version;
+  if (version !== 1) return reject(`Response comparison version ${version} is not supported by this dashboard.`);
+  const rows = published.responses;
+  const inconsistent = "Published response comparison details are inconsistent or incomplete.";
+  if (!Array.isArray(rows)) return reject(inconsistent);
+  const responses = new Map<string, HttpBodyClassification>();
+  for (const response of rows) {
+    if (!response) return reject(inconsistent);
+    const { correlation_id, request_sequence, body } = response;
+    if (typeof correlation_id !== "string" || !Number.isSafeInteger(request_sequence) || request_sequence < 0 || !validBody(body)) return reject(inconsistent);
+    const unavailable = body.unavailable_reason;
+    if (unavailable !== undefined) {
+      if (typeof unavailable !== "string") return reject(inconsistent);
+      return reject(unavailable.trim() ? `Response comparison unavailable: ${unavailable}` : "The scorer marked response comparison unavailable.");
+    }
+    const key = responseKey(correlation_id, request_sequence);
+    if (responses.has(key)) return reject(inconsistent);
+    responses.set(key, body);
+  }
+  const result = { kind: "indexed" as const, responses };
+  preparedComparisons.set(published, result);
+  return result;
+}
+
+function historicalAcceptance(rows: Scorecard["per_correlation"], correlation: string): boolean | undefined {
+  if (!rows) return undefined;
+  let index = historicalCorrelations.get(rows);
+  if (!index) {
+    const prepared = new Map<string, boolean | undefined>();
+    for (const row of rows) {
+      // Preserve the former Array.find behavior if a historical payload carries
+      // duplicate correlations, including an undefined first judgment.
+      if (!prepared.has(row.correlation_id)) prepared.set(row.correlation_id, row.http_body_match);
+    }
+    historicalCorrelations.set(rows, prepared);
+    index = prepared;
+  }
+  return index.get(correlation);
+}
+
 export function httpJudgment(scorecard: Scorecard | null | undefined, diff: HttpDiff): HttpJudgment {
   const published = scorecard?.http_comparison;
   if (published) {
-    if (published.version !== 1) return { kind: "unavailable", reason: `Response comparison version ${published.version} is not supported by this dashboard.` };
-    const keys = new Set<string>();
-    if (!Array.isArray(published.responses) || published.responses.some((response) => {
-      if (!response || typeof response.correlation_id !== "string" || !Number.isSafeInteger(response.request_sequence) || response.request_sequence < 0 || !validBody(response.body)) return true;
-      const key = responseKey(response.correlation_id, response.request_sequence);
-      if (keys.has(key)) return true;
-      keys.add(key);
-      return false;
-    })) return { kind: "unavailable", reason: "Published response comparison details are inconsistent or incomplete." };
-    const row = published.responses.find((r) => r.correlation_id === diff.correlation_id && r.request_sequence === diff.request_sequence);
-    return row
-      ? { kind: "published", body: row.body }
+    if (typeof published !== "object") return { kind: "unavailable", reason: "Published response comparison details are inconsistent or incomplete." };
+    const prepared = prepareComparison(published);
+    if (prepared.kind === "unavailable") return prepared;
+    const body = prepared.responses.get(responseKey(diff.correlation_id, diff.request_sequence));
+    return body
+      ? { kind: "published", body }
       : { kind: "unavailable", reason: "The scorer did not publish comparison details for this response." };
   }
-  return { kind: "historical", accepted: scorecard?.per_correlation?.find((r) => r.correlation_id === diff.correlation_id)?.http_body_match };
+  return { kind: "historical", accepted: historicalAcceptance(scorecard?.per_correlation, diff.correlation_id) };
 }
 
 /** Default findings follow the scorer; raw differences are only a legacy view. */
@@ -148,7 +200,16 @@ export function deltaRequestCounts(delta: Delta) {
 
 function responseFields(mode: string, scorecard: Scorecard | null | undefined, diff: HttpDiff | undefined): { fields: JsonFieldDiff[]; note?: string } {
   if (!diff) return { fields: [], note: "This response's captured values are unavailable." };
-  if (mode === "legacy") return { fields: diff.body_diff };
+  if (mode === "legacy") {
+    if (diff.body_diff_address_error !== undefined) return { fields: [], note: `Response field addresses are unavailable: ${diff.body_diff_address_error || "the server could not safely address these rows."}` };
+    if (diff.body_diff_address_version !== undefined && diff.body_diff_address_version !== 1) return { fields: [], note: `Response field address version ${diff.body_diff_address_version} is not supported by this dashboard.` };
+    const paths = new Set<string>();
+    for (const field of diff.body_diff) {
+      if (paths.has(field.json_path)) return { fields: [], note: "Response field values are unavailable because raw diff paths are duplicated and ambiguous." };
+      paths.add(field.json_path);
+    }
+    return { fields: diff.body_diff };
+  }
   if (mode !== "classified") return { fields: [], note: `Response comparison mode ${mode} is not supported by this dashboard.` };
   const judgment = httpJudgment(scorecard, diff);
   return judgment.kind === "published"
