@@ -26,11 +26,12 @@ deja-diesel = { path = "../deja-diesel", optional = true }
 # live next to the wire type (the orphan rule permits it — the target type is
 # ours), so capture and replay in a vendor call `.into()`/`.try_into()` instead
 # of maintaining a private twin enum coupled to ours by serde variant-name
-# agreement. Versions track hyperswitch's pins (fred 8.0.6 / redis 1.2.0);
-# the consumer's single lockfile keeps the client resolved once, so the
-# adapter and the vendor's own client are always the same crate version.
+# agreement. Fred adapters target the 9.0.x line (>=9.0.3); consumers enabling
+# them must use compatible Fred requirements from the same source. Redis
+# adapters target redis 1.2.0. Cargo must resolve each adapter and its consumer
+# to the same client crate version so they share concrete value types.
 # `default-features = false`: only the value-type layer is used here.
-fred = { version = "8.0.6", default-features = false, optional = true }
+fred = { version = "~9.0.3", default-features = false, optional = true }
 redis = { version = "1.2.0", default-features = false, optional = true }
 
 [features]
