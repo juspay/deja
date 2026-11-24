@@ -5,7 +5,7 @@
 // for display and call the four endpoints.
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ApiError, Delta, DeltaAddress, DeltaRow, EffectiveVerdict, api, deltaFamily } from "./api";
+import { ApiError, CallRecord, Delta, DeltaAddress, DeltaRow, EffectiveVerdict, api, deltaFamily } from "./api";
 import { useActor } from "./me";
 
 /** The server's key, recomputed only to group rows for display. */
@@ -51,7 +51,7 @@ export function groupCharged(d: Delta): Group[] {
   const by = new Map<string, Group>();
   for (const r of d.rows) {
     const family = deltaFamily(r.bucket);
-    if (family !== "introduced" && family !== "changed") continue;
+    if (!r.blocking || (family !== "introduced" && family !== "changed")) continue;
     const lane = r.lane ? `${r.lane.connector} · ${r.lane.flow}` : "no connector call";
     const key = `${lane} | ${shapeOf(r.address)}`;
     const g = by.get(key);
@@ -81,6 +81,39 @@ export function effectiveOf(d: Delta): EffectiveVerdict {
 
 export function requestsOf(groups: Group[]): number {
   return new Set(groups.flatMap((g) => g.rows.map((r) => r.address.correlation))).size;
+}
+
+/** Resolve published call addresses, never a fuzzy call-site or value match.
+ * Repeated novel calls have no recorded event; without a published occurrence
+ * on the ledger, leave those at the request rather than guessing an instance. */
+export function callAtAddress(address: DeltaAddress, calls: CallRecord[]): CallRecord | null {
+  if (address.kind !== "call") return null;
+  if (address.recorded_event !== undefined && address.occurrence !== 0) return null;
+  const candidates = calls.filter((call) => {
+    if (call.correlation_id !== address.correlation || call.boundary !== address.boundary || call.method_name !== address.operation) return false;
+    if (address.recorded_event !== undefined) {
+      return call.source_event_global_sequence === address.recorded_event
+        && (call.recorded?.span_path ?? call.observed?.span_path ?? "") === address.span_path;
+    }
+    return call.source_event_global_sequence === undefined
+      && (call.observed?.span_path ?? call.recorded?.span_path ?? "") === address.span_path;
+  });
+  if (address.recorded_event === undefined && address.occurrence !== 0) return null;
+  if (candidates.length !== 1) return null;
+  const call = candidates[0];
+  return address.recorded_event !== undefined || ["novel", "novel_subtree", "environmental", "novel_absorbed"].includes(call.kind) ? call : null;
+}
+
+/** A link to an exact published graph node, or no link if it is unavailable. */
+export function callEvidenceHref(runId: string, address: DeltaAddress, calls: CallRecord[]): string | null {
+  const call = callAtAddress(address, calls);
+  if (!call) return null;
+  const observed = call.observed?.graph_node_id;
+  const recorded = call.recorded?.graph_node_id;
+  const node = observed ?? recorded;
+  if (node === undefined || !Number.isSafeInteger(node) || node < 0) return null;
+  const params = new URLSearchParams({ case: address.correlation, node: String(node), side: observed !== undefined ? "rep" : "rec" });
+  return `/r/${encodeURIComponent(runId)}?${params}`;
 }
 
 /** What the button on the report says, for the person looking at it. */

@@ -1,10 +1,11 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
-import { Acknowledgement, DeltaRow, DeltaSide, api, deltaUnavailable, runParams } from "../lib/api";
+import { Acknowledgement, CallRecord, DeltaRow, api, deltaFamily, deltaUnavailable, runParams } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
-import { Group, effectiveOf, groupCharged, requestsOf, useAckActions, useAcknowledgements } from "../lib/acknowledge";
+import { Group, callAtAddress, callEvidenceHref, effectiveOf, groupCharged, requestsOf, useAckActions, useAcknowledgements } from "../lib/acknowledge";
 import { needsSignIn, useHasRole, useMe } from "../lib/me";
+import { JsonView } from "../components/JsonView";
 
 /**
  * `/r/:runId/acknowledge`: the divergences a pull request is charged with,
@@ -14,12 +15,6 @@ import { needsSignIn, useHasRole, useMe } from "../lib/me";
  */
 
 type Tab = "todo" | "done" | "history";
-
-function side(s: DeltaSide): string {
-  if (s === "tape") return "as recorded";
-  if (s === "absent") return "absent";
-  return `value ${s.hash.slice(0, 8)}…`;
-}
 
 function when(ts: string | null): string {
   if (!ts) return "";
@@ -100,6 +95,7 @@ export default function AcknowledgePage() {
   const gh = acks.data.github;
   const history = acks.data.acknowledgements;
   const groups = groupCharged(d);
+  const informational = d.rows.filter((r) => !r.blocking && ["introduced", "changed"].includes(deltaFamily(r.bucket))).length;
   const effective = effectiveOf(d);
   const v = d.verdict;
   const isMine = (g: Group) => !!g.ack && g.ack.by.trim().toLowerCase() === me.trim().toLowerCase();
@@ -135,11 +131,13 @@ export default function AcknowledgePage() {
         </div>
       </div>
       <div className="ack-steps">
-        <span className="done">1 · the replay found {groups.length} shapes in {requestsOf(groups)} requests</span>
+        <span className="done">1 · {groups.length} blocking shapes in {requestsOf(groups)} requests</span>
         <span className={step > 2 ? "done" : step === 2 ? "now" : ""}>2 · the author marks what is intended</span>
         <span className={step > 3 ? "done" : step === 3 ? "now" : ""}>3 · a second person acknowledges</span>
-        <span className={step === 4 ? "done" : ""}>4 · the check turns green</span>
+        <span className={step === 4 ? "done" : ""}>4 · the Deja delta is accepted</span>
       </div>
+      {informational > 0 && <p className="hint">{informational} informational PR observation{informational === 1 ? "" : "s"} remain in the report and require no acknowledgment.</p>}
+      <p className="hint">This decision changes Deja's effective delta. GitHub check requirements are configured separately.</p>
       {!me && !signedInRequired && <p className="hint">Set your name in the top right to mark or acknowledge.</p>}
       {signedInRequired && <p className="hint">Sign in to mark or acknowledge; reading needs no account.</p>}
       {whoami.data?.authenticated && !maintainer && todo.some((g) => g.ack?.state === "proposed") && (
@@ -166,7 +164,7 @@ export default function AcknowledgePage() {
               <thead>
                 <tr>
                   <th className="sel"></th>
-                  <th>connector · flow</th>
+                  <th>reported lane</th>
                   <th>what diverges</th>
                   <th className="num">requests</th>
                   <th>status</th>
@@ -187,9 +185,9 @@ export default function AcknowledgePage() {
                       <td className="lane">{g.lane}</td>
                       <td>
                         <span className="what">{g.what}</span>
-                        <span className="sub mono">{g.where}{g.where ? " · " : ""}{g.family === "changed" ? <span className="fam changed">conflicts with main</span> : <span className="fam">new in this PR</span>}</span>
+                        <span className="sub mono">{g.where}{g.where ? " · " : ""}{g.family === "changed" ? <span className="fam changed">differs from baseline</span> : <span className="fam">new relative to baseline</span>}</span>
                       </td>
-                      <td className="num">{g.rows.length}</td>
+                      <td className="num">{requestsOf([g])}</td>
                       <td>
                         {a ? (
                           <span className="ackstate">
@@ -214,7 +212,7 @@ export default function AcknowledgePage() {
               </tbody>
             </table>
           )}
-          {shown && tab !== "history" && <Example g={shown} runId={runId} />}
+          {shown && tab !== "history" && <Example g={shown} runId={runId} against={against} />}
           {tab === "todo" && (confirmable.length > 0 || markable.length > 0) && (
             <div className="ack-actions">
               {selectedProposed.length > 0 && (
@@ -267,7 +265,7 @@ export default function AcknowledgePage() {
           <div className="ack-card">
             <h3>Where it stands</h3>
             <dl>
-              <dt>effective</dt><dd><span className={`chip solid ${effective === "fail" ? "fail" : "pass"}`}>{effective}</span>{effective === "fail" && <span className="hint"> until every shape is acknowledged</span>}</dd>
+              <dt>effective delta</dt><dd><span className={`chip solid ${effective === "fail" ? "fail" : "pass"}`}>{effective}</span>{effective === "fail" && <span className="hint"> until every blocking shape is acknowledged</span>}</dd>
               <dt>acknowledged</dt><dd>{done.length} shapes · {v.acknowledged ?? 0} rows</dd>
               <dt>proposed</dt><dd>{groups.filter((g) => g.ack?.state === "proposed").length} shapes · {v.proposed ?? 0} rows</dd>
               <dt>stale</dt><dd>{groups.filter((g) => g.ack?.state === "stale").length} shapes · {v.stale ?? 0} rows</dd>
@@ -294,17 +292,46 @@ export default function AcknowledgePage() {
   );
 }
 
-/** One request of the group, with its three sides, and the way to the case. */
-function Example({ g, runId }: { g: Group; runId: string }) {
+/** Captured evidence is inspection, not another classification of the delta. */
+function CapturedValue({ call, recorded = false }: { call: CallRecord | null; recorded?: boolean }) {
+  if (!call) return <span className="hint">Exact call evidence unavailable.</span>;
+  const subject = call.comparison?.version === 1 ? call.comparison.subject : null;
+  if (subject !== "arguments" && subject !== "result") return <span className="hint">Comparison subject was not published; inspect the call in the report.</span>;
+  const side = recorded ? call.recorded : call.observed;
+  const key = subject === "arguments" ? "args" : "result";
+  if (!side || !Object.prototype.hasOwnProperty.call(side, key)) return <span className="hint">Captured {subject} not published.</span>;
+  return <><span className="hint">{subject} · captured value</span><JsonView value={side[key]} /></>;
+}
+
+/** One addressed observation, with exact links rather than hash placeholders. */
+function Example({ g, runId, against }: { g: Group; runId: string; against: string }) {
   const debug = useDebug();
   const r: DeltaRow = g.rows[0];
+  const candidate = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId), enabled: r.address.kind === "call" });
+  const baseline = useQuery({ queryKey: ["calls", against], queryFn: () => api.calls(against), enabled: r.address.kind === "call" && !!against });
+  const candidateCall = callAtAddress(r.address, candidate.data ?? []);
+  const baselineCall = callAtAddress(r.address, baseline.data ?? []);
+  const candidateHref = callEvidenceHref(runId, r.address, candidate.data ?? []);
+  const baselineHref = callEvidenceHref(against, r.address, baseline.data ?? []);
   return (
     <div className="ack-example">
-      <div className="t">one of the {g.rows.length} requests · <span className="mono">{r.address.correlation}</span> · {g.lane}</div>
-      <div className="r"><b>recorded</b><span>as recorded</span></div>
-      <div className="r"><b>main</b><span className={r.m === "tape" ? "" : "old"}>{side(r.m)}</span></div>
-      <div className="r"><b>this PR</b><span className="new">{side(r.y)}</span></div>
-      <Link to={withDebug(`/r/${runId}?case=${encodeURIComponent(r.address.correlation)}`, debug)}>open the case in the report →</Link>
+      <div className="t">example of {g.rows.length} blocking observations across {requestsOf([g])} requests · <span className="mono">{r.address.correlation}</span></div>
+      {r.address.kind === "call" ? <>
+        {candidate.isLoading || baseline.isLoading ? <p className="hint">Loading captured call evidence…</p> : <>
+          {(candidate.error || baseline.error) && <p className="hint">Some captured evidence could not be read. The published delta is unchanged.</p>}
+          <details>
+            <summary>Inspect captured values for this observation</summary>
+            <p className="hint">Raw captured values support inspection. The scorer's published comparison determines the delta; these values are not compared again here.</p>
+            <div className="r"><b>recording</b><span><CapturedValue call={candidateCall ?? baselineCall} recorded /></span></div>
+            <div className="r"><b>baseline</b><span>{r.m === "absent" ? "call not reached" : <CapturedValue call={baselineCall} />}</span></div>
+            <div className="r"><b>this PR</b><span>{r.y === "absent" ? "call not reached" : <CapturedValue call={candidateCall} />}</span></div>
+          </details>
+        </>}
+        {baselineHref && <p><Link to={withDebug(baselineHref, debug)}>Inspect exact baseline call →</Link></p>}
+        {candidateHref && <p><Link to={withDebug(candidateHref, debug)}>Inspect exact candidate call →</Link></p>}
+        {(!baselineHref || !candidateHref) && <p className="hint">An exact graph link is unavailable for one or both sides; the request link below opens the full evidence.</p>}
+      </> : <p className="hint">{r.address.kind === "body" ? `Response field ${r.address.json_path}` : "Response status"}. Inspect the published response comparison in the report.</p>}
+      <Link to={withDebug(`/r/${runId}?case=${encodeURIComponent(r.address.correlation)}`, debug)}>Open request evidence →</Link>
     </div>
   );
 }

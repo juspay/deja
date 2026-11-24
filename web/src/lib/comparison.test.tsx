@@ -1,9 +1,12 @@
+import { MemoryRouter } from "react-router-dom";
+import { RecordingFidelity } from "../pages/ReportPage";
+import { ValueDiverged } from "../components/UnifiedView";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import type { CallRecord, Delta, DeltaRow, HttpBodyClassification, HttpComparison, HttpDiff, RunRow, Scorecard } from "./api";
-import { acceptedBodyReasons, callComparisonText, deltaRequestCounts, httpJudgment, joinDeltaResponses, responseFinding, responseMark, SAME_AS_RECORDING } from "./comparison";
+import { acceptedBodyReasons, callComparisonText, deltaRequestCounts, deltaReviewCounts, httpJudgment, joinDeltaResponses, responseFinding, responseMark, SAME_AS_RECORDING } from "./comparison";
 import { CallComparison, CorrelationOutcome, ResponseEvidence } from "../components/Comparison";
-import { FieldTable, Headline, SideCell } from "../components/DeltaSummary";
+import { BoundaryObservations, FieldTable, Headline, SideCell } from "../components/DeltaSummary";
 import { buildSpine } from "./spine";
 import { resultOf } from "./result";
 
@@ -460,5 +463,75 @@ describe("delta joins published comparison addresses", () => {
     const html = renderToStaticMarkup(<table><tbody><tr><SideCell v={null} /></tr></tbody></table>);
     expect(html).toContain("null / absent");
     expect(html).not.toContain(">absent<");
+  });
+});
+
+
+describe("review evidence hierarchy", () => {
+  it("counts three blocking and one informational observations on one request independently of shared drift", () => {
+    const rows = [deltaRow("$.metadata", "introduced"), deltaRow("$.webhook"), deltaRow("$.key"), { ...deltaRow("$.insert"), blocking: false }, ...Array.from({ length: 93 }, (_, i) => deltaRow(`$.shared${i}`, "inherited"))];
+    const d = delta(rows);
+    expect(deltaReviewCounts(d)).toEqual({ blocking: 3, informational: 1, affectedRequests: 1, blockingRequests: 1, shared: 93 });
+    const html = renderToStaticMarkup(<Headline d={d} />);
+    expect(html).toContain("review required");
+    expect(html).toContain("<b>3</b> blocking");
+    expect(html).toContain("<b>1</b> informational");
+    expect(html).not.toContain("decides the check");
+  });
+
+  it.each([0, 1])("does not present an empty or inconclusive comparison as a clean PR impact", (total) => {
+    const d = delta([], { covered_correlations: total, verdict: { pass: true, changed: 0, introduced: 0, inherited: 0, resolved: 0, reason: "no difference" } });
+    if (total) d.sides.m.tape_verdict = { pass: false, inconclusive: true, reason: "insufficient evidence" };
+    const html = renderToStaticMarkup(<Headline d={d} />);
+    expect(html).toContain("comparison inconclusive");
+    expect(html).not.toContain("tone-good");
+    expect(html).not.toContain("no new blocking difference");
+  });
+
+  it("uses generic boundary names and exact event links rather than inventing a connector", () => {
+    const address = { kind: "call" as const, correlation: "request-a", boundary: "Superposition", operation: "get", span_path: "request>config", recorded_event: 12, occurrence: 0 };
+    const c = call({ boundary: "Superposition", method_name: "get", source_event_global_sequence: 12, recorded: { span_path: address.span_path, graph_node_id: 5 }, observed: { span_path: address.span_path, graph_node_id: 10 }, comparison: { version: 1, subject: "arguments", verdict: { kind: "diverged" } } });
+    const d = delta([{ ...deltaRow("unused"), address }]);
+    const html = renderToStaticMarkup(<MemoryRouter><BoundaryObservations d={d} calls={[c]} runId="candidate" /></MemoryRouter>);
+    expect(html).toContain("Superposition");
+    expect(html).toContain("Arguments differ under the scorer");
+    expect(html).toContain("case=request-a&amp;node=10&amp;side=rep");
+    expect(html).not.toContain("Outgoing connector calls");
+  });
+
+  it("keeps ledger-published exact node anchors navigable when the optional execution graph is missing", () => {
+    const c = call({ recorded: { span_path: "request>config", graph_node_id: 7 }, observed: { span_path: "request>config", graph_node_id: 12 } });
+    const request = buildSpine([c], undefined, []).cases.find((entry) => entry.caseId === "request-a")!;
+    expect(request.byNode.rec.get(7)?.calls[0].call).toBe(c);
+    expect(request.byNode.rep.get(12)?.calls[0].call).toBe(c);
+    expect(request.byNode.rec.has(12)).toBe(false);
+  });
+
+  it("explains argument findings without asserting that an origin executed", () => {
+    const c = call({ kind: "value_diverged", origin: true, comparison: { version: 1, subject: "arguments", verdict: { kind: "diverged" } } });
+    const html = renderToStaticMarkup(<ValueDiverged e={{ call: c, sides: ["rec", "rep"] }} />);
+    expect(html).toContain("A recorded response can still be substituted when arguments differ");
+    expect(html).not.toContain("declared <code>Execute");
+    expect(html).not.toContain("so it really ran");
+  });
+
+  it("does not interpret a future call-comparison version as a supported subject", () => {
+    const c = call({ kind: "value_diverged", origin: true, comparison: { version: 2, subject: "arguments", verdict: { kind: "diverged" } } });
+    const html = renderToStaticMarkup(<ValueDiverged e={{ call: c, sides: ["rec", "rep"] }} />);
+    expect(html).toContain("version 2 is not supported");
+    expect(html).toContain("did not publish a supported comparison subject");
+    expect(html).not.toContain("A recorded response can still be substituted");
+  });
+
+  it("keeps failed and zero-request fidelity guards expanded while folding ordinary tape drift", () => {
+    const run = { run_id: "candidate", state: "completed", mode: "replay", params: {}, scorecard: scorecard([], { summary: { total_correlations: 11, matched_correlations: 0, http_status_mismatches: 0, http_body_mismatches: 0, side_effect_divergences: 3, resolved_by_rank: {} }, verdict: { pass: false, inconclusive: false, reason: "recording drift" } }) } as RunRow;
+    const html = renderToStaticMarkup(<RecordingFidelity run={run} result={resultOf(run)} paired />);
+    expect(html).toContain("<details");
+    expect(html).toContain("0 / 11 requests reproduced");
+    for (const guarded of [{ ...run, state: "failed", failure: { message: "candidate crashed" } }, { ...run, scorecard: scorecard([],{ summary: { ...run.scorecard!.summary, total_correlations: 0 } }) }]) {
+      const guardedHtml = renderToStaticMarkup(<RecordingFidelity run={guarded} result={resultOf(guarded)} paired />);
+      expect(guardedHtml).not.toContain("<details");
+      expect(guardedHtml).toContain("Recording fidelity");
+    }
   });
 });

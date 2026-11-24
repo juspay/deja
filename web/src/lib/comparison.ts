@@ -198,6 +198,19 @@ export function deltaRequestCounts(delta: Delta) {
   return { n, recVsMain: n("same") + n("conflict") + n("restored"), recVsPr: n("same") + n("conflict") + n("new"), mainVsPr: n("new") + n("conflict") + n("restored") };
 }
 
+/** Counts observations without treating informational rows as review requirements. */
+export function deltaReviewCounts(delta: Delta) {
+  const specific = delta.rows.filter((row) => ["introduced", "changed"].includes(deltaFamily(row.bucket)));
+  const blocking = specific.filter((row) => row.blocking);
+  return {
+    blocking: blocking.length,
+    informational: specific.length - blocking.length,
+    affectedRequests: new Set(specific.map((row) => row.address.correlation)).size,
+    blockingRequests: new Set(blocking.map((row) => row.address.correlation)).size,
+    shared: delta.rows.filter((row) => deltaFamily(row.bucket) === "inherited").length,
+  };
+}
+
 function responseFields(mode: string, scorecard: Scorecard | null | undefined, diff: HttpDiff | undefined): { fields: JsonFieldDiff[]; note?: string } {
   if (!diff) return { fields: [], note: "This response's captured values are unavailable." };
   if (mode === "legacy") {

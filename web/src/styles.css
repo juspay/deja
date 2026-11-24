@@ -1459,3 +1459,11 @@ h1 .beta { font-size: 11px; }
 .cd-dialogbox { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md, 10px); padding: var(--s5); width: min(640px, 100%); max-height: 90vh; overflow: auto; display: grid; gap: var(--s3); }
 .cd-dialogbox select, .cd-dialogbox input { width: 100%; }
 .cd-checks { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; font-size: var(--fs-13); }
+
+/* PR evidence precedes recording diagnostics; keep dense boundary addresses readable. */
+.recording-fidelity { margin-bottom: var(--s4); }
+.review-counts { font-size: var(--fs-13); color: var(--text); }
+.boundary-observations td { vertical-align: top; }
+.boundary-observations code, .boundary-observations .hint { overflow-wrap: anywhere; }
+.boundary-observations td:nth-child(2) { max-width: 24rem; }
+.boundary-observations td:nth-child(4) { max-width: 22rem; }

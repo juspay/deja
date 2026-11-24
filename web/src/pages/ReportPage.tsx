@@ -1,10 +1,10 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
 import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, Scorecard, StageRow, runParams, ChangeReach } from "../lib/api";
 import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
-import { VerdictBanner } from "../components/Result";
+import { ResultChip, VerdictBanner } from "../components/Result";
 import { ConfidenceBadge, ConfidenceLadder, overallConfidence } from "../components/Confidence";
 import { KillRun } from "../components/KillRun";
 import UnifiedView from "../components/UnifiedView";
@@ -161,8 +161,8 @@ const RANKS: FindingRank[] = [
 
 const RANK_BLURB: Record<FindingRank, string> = {
   origin:
-    "an Execute boundary ran during replay and returned a value that differs from the recording — the cause",
-  consequence: "a call downstream of an origin, carrying the changed value",
+    "a value finding marked as an origin by the comparison ledger; inspect its published subject and evidence",
+  consequence: "a downstream value finding in the comparison ledger; this label does not independently prove causality",
   http: "response findings published by the scorer",
   omitted:
     "the recording made this call and the candidate did not. NOT a claim the span never ran — /calls carries no span-presence evidence",
@@ -287,6 +287,7 @@ function FindingList({
   emptyText: string;
 }) {
   const [show, setShow] = React.useState<FindingRank | "all">("all");
+  const [shown, setShown] = React.useState(100);
   const counts = React.useMemo(() => {
     const m = new Map<FindingRank, number>();
     for (const f of findings) m.set(f.rank, (m.get(f.rank) ?? 0) + 1);
@@ -321,10 +322,12 @@ function FindingList({
       {show !== "all" && <p className="hint">{RANK_BLURB[show]}</p>}
       <p className="hint">Click a finding to open it in the execution view below.</p>
       <ul className="findings">
-        {rows.slice(0, 200).map((f, i) => <FindingRow key={i} f={f} onOpen={onOpen} />)}
+        {rows.slice(0, shown).map((f, i) => <FindingRow key={i} f={f} onOpen={onOpen} />)}
       </ul>
-      {rows.length > 200 && (
-        <p className="hint">showing the first 200 of {rows.length}.</p>
+      {rows.length > shown && (
+        <button type="button" className="btn" onClick={() => setShown((n) => n + 100)}>
+          Show next {Math.min(100, rows.length - shown)} of {rows.length - shown} more findings
+        </button>
       )}
     </>
   );
@@ -373,12 +376,17 @@ function TrustStrip({ run }: { run: RunRow }) {
           <ConfidenceBadge level={conf} title="the weakest address rank this run relied on" />
         </span>
       </div>
-      {(sc.warnings ?? []).map((w, i) => (
-        <div className="trustrow warn" key={i}>
-          <span className="tkey">note</span>
-          <span className="tval">{w}</span>
-        </div>
-      ))}
+      {(sc.warnings ?? []).length > 0 && (
+        <details className="evraw">
+          <summary>{sc.warnings!.length} scorer notes · substitution, matching and comparison allowances</summary>
+          {sc.warnings!.map((w, i) => (
+            <div className="trustrow warn" key={i}>
+              <span className="tkey">note</span>
+              <span className="tval">{w}</span>
+            </div>
+          ))}
+        </details>
+      )}
     </div>
   );
 }
@@ -406,8 +414,9 @@ function ChangeReachPanel({ run }: { run: RunRow }) {
     staleTime: Infinity,
   });
   if (q.isLoading) return <p className="hint">assessing what this candidate changed…</p>;
+  if (q.error) return <p className="err">Changed-code coverage could not be read: {String(q.error)}. Its execution is unproven.</p>;
   const d = q.data;
-  if (!d) return null;
+  if (!d) return <p className="hint">Changed-code coverage is not available; its execution is unproven.</p>;
   if ("unavailable" in d) {
     return (
       <div className="trust">
@@ -418,7 +427,9 @@ function ChangeReachPanel({ run }: { run: RunRow }) {
       </div>
     );
   }
-  const worst = d.never_ran > 0 ? "warn" : d.unproven > 0 ? "warn" : "";
+  const driven = run.scorecard?.summary.total_correlations;
+  const countsDisagree = driven != null && driven !== d.driven_requests;
+  const worst = d.never_ran > 0 || d.unproven > 0 || countsDisagree ? "warn" : "";
   return (
     <div className="trust">
       <div className={`trustrow ${worst}`}>
@@ -427,11 +438,14 @@ function ChangeReachPanel({ run }: { run: RunRow }) {
           <b>{d.items.length}</b> changed item{d.items.length === 1 ? "" : "s"} between{" "}
           <code>{d.base_ref}</code> (<code>{d.merge_base.slice(0, 10)}</code>) and{" "}
           <code>{d.head.slice(0, 10)}</code> · {d.driven_requests} requests driven
-          {d.caveats.length === 0 && d.items.length > 0 && (
-            <> — every changed item was exercised, so the verdict speaks to this change</>
+          {d.caveats.length === 0 && !countsDisagree && d.items.length > 0 && d.items.every((item) => item.reach === "exercised") && (
+            <> — the coverage assessment reports every changed item exercised; inspect its evidence below</>
           )}
         </span>
       </div>
+      {countsDisagree && (
+        <p className="err">Coverage reports {d.driven_requests} driven requests, while this scorecard reports {driven}. These totals disagree; coverage is not proof that the changed behavior was tested.</p>
+      )}
       {d.caveats.map((c, i) => (
         <div className="trustrow warn" key={i}>
           <span className="tkey">caveat</span>
@@ -649,9 +663,30 @@ function DebugSection({ run, result }: { run: RunRow; result: RunResult }) {
  * decide whether to trust the verdict is above the first fold; nothing they need
  * is behind `?debug=1`, which only adds raw sources.
  */
+export function RecordingFidelity({ run, result, paired }: { run: RunRow; result: RunResult; paired: boolean }) {
+  const content = <><VerdictBanner result={result} /><Counters run={run} /></>;
+  if (!paired || result.guard || !["REPRODUCED", "DIVERGED"].includes(result.state)) {
+    return <section><h2>Recording fidelity</h2>{content}</section>;
+  }
+  const summary = run.scorecard?.summary;
+  return (
+    <details className="delta-box recording-fidelity">
+      <summary className="head">
+        <span className="t">Recording fidelity</span>
+        <ResultChip result={result} />
+        <span className="c">{summary?.matched_correlations} / {summary?.total_correlations} requests reproduced · separate from PR impact</span>
+      </summary>
+      <div className="body">{content}</div>
+    </details>
+  );
+}
+
 export default function ReportPage() {
   const { runId = "" } = useParams();
   const debug = useDebug();
+  const location = useLocation();
+  const runsUrl = location.state?.runsUrl;
+  const returnTo = typeof runsUrl === "string" && (runsUrl === "/runs" || runsUrl.startsWith("/runs?")) ? runsUrl : "/runs";
   const [, setParams] = useSearchParams();
 
   const run = useQuery({
@@ -716,16 +751,16 @@ export default function ReportPage() {
   return (
     <>
       <div className="crumb">
-        <Link to={withDebug("/runs", debug)}>Runs</Link> <span>/</span>{" "}
+        <Link to={withDebug(returnTo, debug)}>Runs</Link> <span>/</span>{" "}
         <span className="hint">report</span>
       </div>
 
       <RunHeader run={r} />
       {runParams(r)?.purpose === "baseline" && <BaselineNote run={r.run_id} label={runParams(r)?.label} />}
-      <VerdictBanner result={result} />
       {isReplay && scored && runParams(r)?.delta_against && (
         <DeltaPanel runId={r.run_id} against={runParams(r)?.delta_against ?? ""} />
       )}
+      <RecordingFidelity run={r} result={result} paired={!!runParams(r)?.delta_against} />
       {isReplay && scored && !runParams(r)?.delta_against && (
         <p className="hint delta-link">
           This verdict is against the tape.{" "}
@@ -738,14 +773,15 @@ export default function ReportPage() {
       {isReplay && scored && (
         <>
           <section>
-            <h2>Summary</h2>
+            <h2>Coverage and confidence</h2>
             <TrustStrip run={r} />
             <ChangeReachPanel run={r} />
-            <Counters run={r} />
           </section>
 
-          <section>
-            <h2>What diverged</h2>
+          <details className="delta-box">
+            <summary className="head"><span className="t">Recording comparison diagnostics</span><span className="c">findings, requests and boundaries against the recording</span></summary>
+            <div className="body">
+            <h3>Findings against the recording</h3>
             {evidence.notes.map((note) => (
               <p className="err" key={note}>
                 {note}
@@ -760,15 +796,9 @@ export default function ReportPage() {
                 emptyText={emptyFindingsText(evidence)}
               />
             )}
-          </section>
-
-          <section>
-            <h2>Per request</h2>
+            <h3>Per request</h3>
             <CorrelationTable run={r} />
-          </section>
-
-          <section>
-            <h2>Per boundary</h2>
+            <h3>Per boundary</h3>
             <BoundaryTable run={r} />
             <h3>Resolution confidence</h3>
             <div className="panel">
@@ -778,7 +808,8 @@ export default function ReportPage() {
                 version-independent; UNMATCHED (positional) survived on ordering alone.
               </p>
             </div>
-          </section>
+            </div>
+          </details>
 
           {/* ONE VIEW. The execution graph and the response/side-effect diff
               were two tabs answering halves of the same question — "where did

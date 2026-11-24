@@ -91,8 +91,8 @@ export function AcknowledgeLine({ runId, d }: { runId: string; d: Delta }) {
   const unread = v.unread_acknowledgements ?? 0;
   const text =
     effective === "acknowledged"
-      ? `Every divergence this PR introduces is acknowledged: ${groups.length} shapes in ${requestsOf(groups)} requests. The check reads as passing.`
-      : `${groups.length} shapes of divergence in ${requestsOf(groups)} requests: ${v.acknowledged ?? 0} rows acknowledged, ${v.proposed ?? 0} proposed, ${v.stale ?? 0} stale, ${uncovered} not yet marked. The check reads as failing until every shape is acknowledged.${unread > 0 ? ` ${unread} acknowledgement${unread === 1 ? "" : "s"} could not be read and did not count.` : ""}`;
+      ? `Every blocking PR difference is acknowledged: ${groups.length} shapes in ${requestsOf(groups)} requests. The effective Deja delta is acknowledged.`
+      : `${groups.length} blocking shapes in ${requestsOf(groups)} requests: ${v.acknowledged ?? 0} rows acknowledged, ${v.proposed ?? 0} proposed, ${v.stale ?? 0} stale, ${uncovered} not yet marked. All blocking shapes must be acknowledged to accept this delta.${unread > 0 ? ` ${unread} acknowledgement${unread === 1 ? "" : "s"} could not be read and did not count.` : ""}`;
   return (
     <div className={`delta-ack-verdict tone-${effective === "acknowledged" ? "good" : "bad"}`}>
       <span className={`chip solid ${effective === "acknowledged" ? "pass" : "fail"}`}>{effective}</span>
