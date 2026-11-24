@@ -4,6 +4,8 @@
 use crate::{CandidateSpec, GithubRef};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -129,7 +131,48 @@ pub(crate) fn github_api_base() -> String {
         .unwrap_or_else(|| "https://api.github.com".into())
 }
 
+const MAX_ACTIVE_GITHUB_READS: usize = 4;
+const MAX_GITHUB_JSON_BYTES: usize = 1024 * 1024;
+const GITHUB_CAPACITY_UNAVAILABLE: &str = "GitHub read capacity is busy; retry shortly";
+static ACTIVE_GITHUB_READS: AtomicUsize = AtomicUsize::new(0);
+
+/// A cold cache must not let dashboard traffic queue unbounded outbound work.
+/// Hold the permit through reading and decoding; every return releases it.
+struct GithubReadPermit<'a>(&'a AtomicUsize);
+
+impl<'a> GithubReadPermit<'a> {
+    fn try_acquire(active: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < limit).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(active))
+    }
+}
+
+impl Drop for GithubReadPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn bounded_github_json<T: DeserializeOwned>(reader: impl Read) -> Result<T, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take((MAX_GITHUB_JSON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "GitHub response could not be read".to_owned())?;
+    if bytes.len() > MAX_GITHUB_JSON_BYTES {
+        return Err("GitHub JSON response exceeds the 1 MiB inspection limit".into());
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "GitHub response did not contain the expected JSON".to_owned())
+}
+
 pub(crate) fn github_get<T: DeserializeOwned>(path: &str) -> Result<T, String> {
+    let _permit = GithubReadPermit::try_acquire(&ACTIVE_GITHUB_READS, MAX_ACTIVE_GITHUB_READS)
+        .ok_or_else(|| GITHUB_CAPACITY_UNAVAILABLE.to_owned())?;
     let mut request = crate::codebundle::tarball_agent()
         .get(&format!("{}{path}", github_api_base()))
         .timeout(Duration::from_secs(5))
@@ -141,11 +184,12 @@ pub(crate) fn github_get<T: DeserializeOwned>(path: &str) -> Result<T, String> {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
     }
-    request
-        .call()
-        .map_err(|e| format!("GitHub read failed: {e}"))?
-        .into_json()
-        .map_err(|e| format!("GitHub response could not be read: {e}"))
+    let response = request.call().map_err(|error| match error {
+        ureq::Error::Status(status, _) => format!("GitHub read failed (HTTP {status})"),
+        // Avoid exposing deployment URLs, proxy credentials or response bodies.
+        ureq::Error::Transport(_) => "GitHub read failed (transport error)".to_owned(),
+    })?;
+    bounded_github_json(response.into_reader())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,11 +239,17 @@ pub fn current_pr_head(repo: &str, number: u64) -> CurrentHead {
             }
         })
     };
+    let cacheable = !matches!(&response, Err(reason) if reason == GITHUB_CAPACITY_UNAVAILABLE);
     let checked_at = chrono::Utc::now().to_rfc3339();
     let value = match response {
         Ok(sha) => CurrentHead::Verified { sha, checked_at },
         Err(reason) => CurrentHead::Unavailable { reason, checked_at },
     };
+    if !cacheable {
+        // Another in-flight read may shortly populate a verified result. Do not
+        // overwrite it or pin a transient local-capacity refusal for ten seconds.
+        return value;
+    }
     if let Ok(mut guard) = cache.lock() {
         // Bound process memory even if a reader traverses a large PR history.
         if guard.len() >= 256 {
@@ -216,6 +266,55 @@ pub fn current_pr_head(repo: &str, number: u64) -> CurrentHead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_read_permits_bound_concurrent_work_and_release_after_errors() {
+        let active = AtomicUsize::new(0);
+        let release = std::sync::Barrier::new(MAX_ACTIVE_GITHUB_READS + 1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            for _ in 0..MAX_ACTIVE_GITHUB_READS {
+                let ready = ready_tx.clone();
+                let active = &active;
+                let release = &release;
+                scope.spawn(move || {
+                    let _permit = GithubReadPermit::try_acquire(active, MAX_ACTIVE_GITHUB_READS)
+                        .expect("available test read permit");
+                    ready.send(()).expect("test receiver remains open");
+                    release.wait();
+                });
+            }
+            for _ in 0..MAX_ACTIVE_GITHUB_READS {
+                ready_rx.recv().expect("worker holds its read permit");
+            }
+            assert!(GithubReadPermit::try_acquire(&active, MAX_ACTIVE_GITHUB_READS).is_none());
+            release.wait();
+        });
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        let failed_read = || -> Result<serde_json::Value, String> {
+            let _permit = GithubReadPermit::try_acquire(&active, MAX_ACTIVE_GITHUB_READS)
+                .expect("released read permit");
+            bounded_github_json(b"not JSON".as_slice())
+        };
+        assert!(failed_read().is_err());
+        assert_eq!(active.load(Ordering::Acquire), 0);
+        assert!(GithubReadPermit::try_acquire(&active, MAX_ACTIVE_GITHUB_READS).is_some());
+    }
+
+    #[test]
+    fn github_json_body_is_bounded_before_deserialization() {
+        let valid = format!("\"{}\"", "x".repeat(MAX_GITHUB_JSON_BYTES - 2));
+        let value: String = bounded_github_json(valid.as_bytes()).expect("exact-limit JSON");
+        assert_eq!(value.len(), MAX_GITHUB_JSON_BYTES - 2);
+        let mut source = std::io::Cursor::new(vec![b' '; MAX_GITHUB_JSON_BYTES * 2]);
+        let error = bounded_github_json::<serde_json::Value>(&mut source)
+            .expect_err("oversized JSON must be refused");
+        assert!(error.contains("inspection limit"));
+        assert_eq!(source.position(), (MAX_GITHUB_JSON_BYTES + 1) as u64);
+        let error = bounded_github_json::<serde_json::Value>(b"private-response-text".as_slice())
+            .expect_err("invalid JSON must be refused");
+        assert!(!error.contains("private-response-text"));
+    }
 
     #[test]
     fn source_revision_uses_corroborated_full_head_and_refuses_tags_digests_and_conflicts() {
