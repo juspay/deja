@@ -1,9 +1,10 @@
 import React from "react";
 import { useReviewNavigation } from "../lib/navigation";
 import { ReviewContextPanel } from "../components/ReviewContext";
+import { ChangeCoveragePanel } from "../components/ChangeCoverage";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, Scorecard, StageRow, runParams, ChangeReach } from "../lib/api";
+import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, Scorecard, StageRow, runParams } from "../lib/api";
 import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { ResultChip, VerdictBanner } from "../components/Result";
@@ -393,110 +394,6 @@ function TrustStrip({ run }: { run: RunRow }) {
   );
 }
 
-/* ------------------------------------------------------------- reach ------ */
-
-const REACH_LABEL: Record<ChangeReach, string> = {
-  not_exercised: "not exercised",
-  exercised: "exercised",
-  flow_ran: "flow ran",
-  flow_ran_weak: "flow ran (weak)",
-  module_ran: "module ran",
-  unknown: "unknown",
-};
-
-/**
- * Did the replay reach what this candidate changed? A verdict says whether
- * behaviour changed on the recorded traffic; this says how much of the change
- * that traffic reached. A caveat here never changes the verdict above it.
- */
-function ChangeReachPanel({ run }: { run: RunRow }) {
-  const navigation = useReviewNavigation();
-  const q = useQuery({
-    queryKey: ["change-coverage", run.run_id],
-    queryFn: () => api.changeCoverage(run.run_id),
-    staleTime: Infinity,
-  });
-  if (q.isLoading) return <p className="hint">assessing what this candidate changed…</p>;
-  if (q.error) return <p className="err">Changed-code coverage could not be read: {String(q.error)}. Its execution is unproven.</p>;
-  const d = q.data;
-  if (!d) return <p className="hint">Changed-code coverage is not available; its execution is unproven.</p>;
-  if ("unavailable" in d) {
-    return (
-      <div className="trust">
-        <div className="trustrow">
-          <span className="tkey">change</span>
-          <span className="tval">not assessed — {d.unavailable}</span>
-        </div>
-      </div>
-    );
-  }
-  const driven = run.scorecard?.summary.total_correlations;
-  const countsDisagree = driven != null && driven !== d.driven_requests;
-  const worst = d.never_ran > 0 || d.unproven > 0 || countsDisagree ? "warn" : "";
-  return (
-    <div className="trust">
-      <div className={`trustrow ${worst}`}>
-        <span className="tkey">change</span>
-        <span className="tval">
-          <b>{d.items.length}</b> changed item{d.items.length === 1 ? "" : "s"} from the source comparison's common ancestor{" "}
-          <code>{d.merge_base.slice(0, 10)}</code> to candidate{" "}
-          <code>{d.head.slice(0, 10)}</code> · {d.driven_requests} requests driven
-          {d.caveats.length === 0 && !countsDisagree && d.items.length > 0 && d.items.every((item) => item.reach === "exercised") && (
-            <> — the coverage assessment reports every changed item exercised; inspect its evidence below</>
-          )}
-        </span>
-      </div>
-      {countsDisagree && (
-        <p className="err">Coverage reports {d.driven_requests} driven requests, while this scorecard reports {driven}. These totals disagree; coverage is not proof that the changed behavior was tested.</p>
-      )}
-      {d.base ? <details className="evraw">
-        <summary>Coverage source and request scope</summary>
-        <p className="hint">Repository <code>{d.repo}</code>. Requested base <code>{d.base.declared_ref}</code> resolved to <code>{d.base.resolved_sha}</code> at {d.base.resolved_at}.
-          {d.base.source === "named_baseline" && d.base.baseline_run
-            ? <> Source is pinned to the <Link to={navigation.href(`/r/${d.base.baseline_run}`)}>named baseline run</Link>.</>
-            : <> Source is the configured comparison ref resolved at assessment time.</>}
-          {" "}The common ancestor used by GitHub's comparison is shown above; it may differ from the requested base commit.
-        </p>
-        <p className="hint">Execution evidence is restricted to the admitted request scope. Source identity is declared metadata; candidate image contents are not attested.</p>
-        {d.inputs_digest && <p className="hint">Evidence input digest <code>{d.inputs_digest}</code></p>}
-      </details> : <p className="hint">Historical assessment: immutable base and input provenance were not published.</p>}
-      {d.caveats.map((c, i) => (
-        <div className="trustrow warn" key={i}>
-          <span className="tkey">caveat</span>
-          <span className="tval">{c}</span>
-        </div>
-      ))}
-      {d.items.length > 0 && (
-        <details className="evraw">
-          <summary>changed items</summary>
-          <table className="fieldtbl">
-            <thead>
-              <tr>
-                <th>reach</th>
-                <th>item</th>
-                <th>where</th>
-                <th>why</th>
-              </tr>
-            </thead>
-            <tbody>
-              {d.items.map((it, i) => (
-                <tr key={i} className={it.reach === "exercised" ? undefined : "fdiff"}>
-                  <td className="mono">{REACH_LABEL[it.reach] ?? it.reach}</td>
-                  <td className="mono">{it.item}</td>
-                  <td className="mono">
-                    {it.path}:{it.lines}
-                  </td>
-                  <td>{it.why}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </details>
-      )}
-    </div>
-  );
-}
-
 /* --------------------------------------------------------------- summary --- */
 
 function Counters({ run }: { run: RunRow }) {
@@ -772,8 +669,9 @@ export default function ReportPage() {
       <ReviewContextPanel run={r} />
       {runParams(r)?.purpose === "baseline" && <BaselineNote run={r.run_id} label={runParams(r)?.label} />}
       {isReplay && scored && runParams(r)?.delta_against && (
-        <DeltaPanel runId={r.run_id} against={runParams(r)?.delta_against ?? ""} />
+        <DeltaPanel runId={r.run_id} against={runParams(r)?.delta_against ?? ""} changeCoverage={<ChangeCoveragePanel run={r} />} />
       )}
+      {isReplay && scored && !runParams(r)?.delta_against && <ChangeCoveragePanel run={r} />}
       <RecordingFidelity run={r} result={result} paired={!!runParams(r)?.delta_against} />
       {isReplay && scored && !runParams(r)?.delta_against && (
         <p className="hint delta-link">
@@ -789,7 +687,6 @@ export default function ReportPage() {
           <section>
             <h2>Coverage and confidence</h2>
             <TrustStrip run={r} />
-            <ChangeReachPanel run={r} />
           </section>
 
           <details className="delta-box">
