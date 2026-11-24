@@ -96,18 +96,30 @@ describe("immutable changed-item source links", () => {
 });
 
 describe("changed-code panel", () => {
-  it("puts line/module evidence in a visible item table and preserves source provenance", () => {
+  it("keeps line/module evidence behind one collapsed disclosure and preserves source provenance", () => {
     const html = render(coverage({ items: [item("module_ran")] }));
     expect(html).toContain("Did this replay exercise the changed code?");
     expect(html).toContain("not changed-line or branch coverage");
     expect(html).toContain("may include changes beyond the PR");
-    expect(html).toContain("<details class=\"change-coverage-items\" open=\"\"");
+    expect(html).toContain('<details class="change-coverage-details">');
+    expect(html).not.toContain('<details class="change-coverage-details" open');
     expect(html).toContain("Module ran; item unproven");
     expect(html).toContain("incoming_webhook");
     expect(html).toContain("webhooks.rs:10-20");
     expect(html).toContain("named baseline run");
     expect(html).toContain("Evidence input digest");
     expect(vi.mocked(useQuery).mock.calls.at(-1)![0].queryKey).toEqual(["change-coverage", "candidate"]);
+  });
+  it("keeps uncertainty visible without expanding warning lists or item tables on the default view", () => {
+    const html = render(coverage({ assessment_version: undefined, driven_requests: 18, items: [item("module_ran")] }));
+    const defaultView = html.split('<details class="change-coverage-details">')[0];
+    expect(defaultView).toContain("Provisional assessment");
+    expect(defaultView).toContain("before relying on these counts");
+    expect(defaultView).not.toContain("Historical or incomplete");
+    expect(defaultView).not.toContain("incoming_webhook");
+    expect(defaultView).not.toContain("<table");
+    expect(html).toContain("18 driven requests; this scorecard reports 2");
+    expect(html).toContain("webhooks.rs:10-20");
   });
   it("keeps absent, loading, unavailable and failed reads visibly unproven", () => {
     expect(render()).toContain("no assessment was published");

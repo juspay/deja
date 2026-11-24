@@ -24,9 +24,9 @@ export function ChangeCoveragePanel({ run }: { run: RunRow }) {
   const summary = assessment ? summarizeChangeCoverage(assessment, run) : null;
   const filter = selectedFilter ?? (summary && summary.counts.not_exercised + summary.counts.unproven === 0 ? "all" : "needs_review");
   const items = assessment ? filterCoverageItems(assessment.items, filter) : [];
+  const cautions = summary ? [...summary.warnings, ...summary.caveats] : [];
   return <section className="change-coverage" aria-label="Changed-code execution" id="changed-code-execution">
     <h3>Did this replay exercise the changed code?</h3>
-    <p className="hint">This is reach evidence for enclosing Rust items, not changed-line or branch coverage. A clean behavior comparison alone does not establish that the changed behavior was tested.</p>
     {query.isLoading ? <p className="hint">Assessing changed-code execution…</p>
       : query.error ? <p className="err">Changed-code execution is unproven: the assessment could not be read. {String(query.error)}</p>
       : !coverage ? <p className="hint">Changed-code execution is unproven: no assessment was published.</p>
@@ -37,13 +37,15 @@ export function ChangeCoveragePanel({ run }: { run: RunRow }) {
           <div><strong>{summary.counts.not_exercised}</strong><span>Not exercised</span></div>
           <div><strong>{summary.counts.unproven}</strong><span>Execution unproven</span></div>
         </div>
-        {!assessment.items.length && <p className="change-coverage-warning">No supported changed-code items were assessed. This does not establish coverage of the PR.</p>}
-        <p className="hint">{assessment.items.length} item{assessment.items.length === 1 ? "" : "s"} in the source comparison from common ancestor <code>{assessment.merge_base.slice(0, 10)}</code> to candidate <code>{assessment.head.slice(0, 10)}</code> · {assessment.driven_requests} requests driven. This comparison may include changes beyond the PR.</p>
-        <p className="hint">Execution observed means a span or boundary call site reached the enclosing item. Flow or module activity alone leaves that item’s execution unproven.</p>
-        {summary.warnings.map((warning) => <p className="change-coverage-warning" key={warning}>{warning}</p>)}
-        {summary.caveats.map((caveat, i) => <p className="change-coverage-warning" key={i}>{caveat}</p>)}
-        {assessment.items.length > 0 && <details className="change-coverage-items" open={summary.counts.not_exercised + summary.counts.unproven > 0}>
+        <p className="hint">Rust item reach, not changed-line or branch coverage.</p>
+        {!assessment.items.length ? <p className="change-coverage-warning">No supported changed-code items were assessed. This does not establish coverage of the PR.</p>
+          : cautions.length > 0 && <p className="change-coverage-warning">Provisional assessment · review {cautions.length} caution{cautions.length === 1 ? "" : "s"} before relying on these counts.</p>}
+        <details className="change-coverage-details">
           <summary>Inspect changed items and execution evidence</summary>
+          <p className="hint">{assessment.items.length} item{assessment.items.length === 1 ? "" : "s"} in the source comparison from common ancestor <code>{assessment.merge_base.slice(0, 10)}</code> to candidate <code>{assessment.head.slice(0, 10)}</code> · {assessment.driven_requests} requests driven. This comparison may include changes beyond the PR.</p>
+          <p className="hint">Execution observed means a span or boundary call site reached the enclosing item. Flow or module activity alone leaves that item’s execution unproven. A clean behavior comparison alone does not establish that the changed behavior was tested.</p>
+          {cautions.map((caution, i) => <p className="change-coverage-warning" key={i}>{caution}</p>)}
+          {assessment.items.length > 0 && <div className="change-coverage-items">
           <label>Show <select value={filter} onChange={(event) => setFilter(event.target.value as CoverageFilter)}>
             <option value="needs_review">Not exercised or unproven</option><option value="all">All changed items</option>
             <option value="observed">Execution observed</option><option value="not_exercised">Not exercised</option><option value="unproven">Execution unproven</option>
@@ -55,7 +57,7 @@ export function ChangeCoveragePanel({ run }: { run: RunRow }) {
             </tr>; })}
             {!items.length && <tr><td colSpan={4}>No items in this filter. Choose “All changed items” to inspect the assessment.</td></tr>}
           </tbody></table></div>
-        </details>}
+          </div>}
         <details className="change-coverage-provenance"><summary>Source and request-scope provenance</summary>
           <p className="hint">Repository <code>{assessment.repo}</code>; source comparison head <code>{assessment.head}</code>. Source identity is declared metadata; candidate image contents are not attested.</p>
           {assessment.base ? <p className="hint">Requested base <code>{assessment.base.declared_ref}</code> resolved to <code>{assessment.base.resolved_sha}</code> at {assessment.base.resolved_at}. {assessment.base.source === "named_baseline" && assessment.base.baseline_run ? <>Pinned to the <Link to={navigation.href(`/r/${assessment.base.baseline_run}`)}>named baseline run</Link>.</> : <>Configured comparison ref resolved at assessment time.</>} The common ancestor may differ from this requested base.</p> : <p className="hint">Immutable base provenance was not published.</p>}
@@ -66,6 +68,7 @@ export function ChangeCoveragePanel({ run }: { run: RunRow }) {
             <p className="hint">Original notes may use broader or legacy reach heuristics. Review the individual item evidence above.</p>
             {summary.assessorNotes.map((note, i) => <p className="hint" key={i}>{note}</p>)}
           </div>}
+        </details>
         </details>
       </>}
   </section>;
