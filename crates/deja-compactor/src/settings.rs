@@ -685,12 +685,14 @@ mod review_identity_declaration_tests {
                 FileFormat::Toml,
             ))
             .build()
-            .unwrap();
-        let settings: Settings = config.try_deserialize().unwrap();
+            .expect("valid review identity configuration fixture");
+        let settings: Settings = config
+            .try_deserialize()
+            .expect("valid review identity configuration fixture");
         let declaration = settings.systems["example"]
             .review_identity
             .as_ref()
-            .unwrap();
+            .expect("valid review identity configuration fixture");
         assert!(
             matches!(&declaration.connector[0], ReviewIdentitySelector::Header { name, .. } if name == "x-provider")
         );

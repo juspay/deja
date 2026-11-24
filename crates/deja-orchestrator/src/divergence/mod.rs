@@ -11512,7 +11512,7 @@ mod tests {
         let new = behaviour_tree::build_with_scorecard(
             &artifacts.run_id,
             &[],
-            &[diff.clone()],
+            std::slice::from_ref(&diff),
             Some(&published),
         )
         .unwrap();

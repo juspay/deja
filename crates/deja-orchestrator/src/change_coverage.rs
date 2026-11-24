@@ -114,7 +114,7 @@ pub struct ChangeCoverage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Assessment {
-    Assessed(ChangeCoverage),
+    Assessed(Box<ChangeCoverage>),
     Unavailable { unavailable: String },
 }
 

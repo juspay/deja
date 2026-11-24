@@ -92,7 +92,8 @@ mod tests {
             .encode(r#"{"body":"{\"metadata\":{\"rapyd\":null}}"}"#);
         let args = json!({"request":{"data":encoded}, "opaque":"not a document"});
         let before = args.clone();
-        let inspection = CallInspection::from_values(Some(&args), None).unwrap();
+        let inspection =
+            CallInspection::from_values(Some(&args), None).expect("published inspection fixture");
         assert_eq!(
             inspection.arguments["$.request.data.body"],
             json!({"metadata":{"rapyd":null}})

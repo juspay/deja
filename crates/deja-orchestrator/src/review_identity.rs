@@ -67,7 +67,11 @@ fn dimension(evidence: BTreeSet<IdentityEvidence>) -> Dimension {
             _ => "ambiguous",
         }
         .to_owned(),
-        value: (values.len() == 1).then(|| values.into_iter().next().unwrap()),
+        value: if values.len() == 1 {
+            values.into_iter().next()
+        } else {
+            None
+        },
         evidence: evidence.into_iter().collect(),
     }
 }
@@ -305,7 +309,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "boundary":"transport", "trait_name":"Client", "method_name":"send", "kind":"matched", "blocking":false,
             "correlation_id":"r", "observed":{"args":args}, "recorded":{"args":{"connector":"old"}}
-        })).unwrap()
+        })).expect("valid semantic identity fixture")
     }
 
     #[test]
@@ -335,7 +339,10 @@ mod tests {
         );
         assert_eq!(publication.requests["r"].flow.status, "unknown");
         assert_eq!(
-            publication.declaration.unwrap().source,
+            publication
+                .declaration
+                .expect("valid semantic identity fixture")
+                .source,
             "current_deployment"
         );
     }
@@ -384,12 +391,15 @@ mod tests {
         );
     }
     fn node(id: u64, parent: Option<u64>, correlation: &str, flow: &str) -> ExecutionGraphNode {
-        serde_json::from_value(serde_json::json!({"node_id":id,"parent_id":parent,"sequence":id,"correlation_id":correlation,"span_name":"operation","target":"example","level":"INFO","fields":{"task":flow},"started_ns":0})).unwrap()
+        serde_json::from_value(serde_json::json!({"node_id":id,"parent_id":parent,"sequence":id,"correlation_id":correlation,"span_name":"operation","target":"example","level":"INFO","fields":{"task":flow},"started_ns":0})).expect("valid semantic identity fixture")
     }
     #[test]
     fn graph_identity_uses_exact_node_ancestry_and_refuses_foreign_or_duplicate_nodes() {
         let mut call = call(serde_json::json!({}));
-        call.observed.as_mut().unwrap().graph_node_id = Some(2);
+        call.observed
+            .as_mut()
+            .expect("valid semantic identity fixture")
+            .graph_node_id = Some(2);
         let declaration = ReviewIdentityDeclaration {
             connector: vec![],
             flow: vec![ReviewIdentitySelector::GraphField {

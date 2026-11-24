@@ -12217,11 +12217,14 @@ mod runtime_publication_tests {
     }
     #[test]
     fn historical_defaults_do_not_become_published_runtime_facts_after_round_trip() {
-        let old: ObservedCall = serde_json::from_value(wire()).unwrap();
+        let old: ObservedCall =
+            serde_json::from_value(wire()).expect("historical observation fixture");
         assert!(!old.runtime_metadata_present);
         assert_eq!(old.provenance, crate::Provenance::Recorded);
-        let round_trip: ObservedCall =
-            serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+        let round_trip: ObservedCall = serde_json::from_value(
+            serde_json::to_value(old).expect("serialize historical observation"),
+        )
+        .expect("read historical round trip");
         assert!(!round_trip.runtime_metadata_present);
     }
     #[test]
@@ -12229,18 +12232,20 @@ mod runtime_publication_tests {
         let mut raw = wire();
         raw["provenance"] = "recorded".into();
         raw["outcome"] = "substituted".into();
-        let published: ObservedCall = serde_json::from_value(raw.clone()).unwrap();
+        let published: ObservedCall =
+            serde_json::from_value(raw.clone()).expect("published runtime fixture");
         assert!(published.runtime_metadata_present);
         let mut unsupported_claim = wire();
         unsupported_claim["runtime_metadata_present"] = true.into();
         assert!(
             !serde_json::from_value::<ObservedCall>(unsupported_claim)
-                .unwrap()
+                .expect("incomplete runtime claim fixture")
                 .runtime_metadata_present
         );
         raw["role"] = "ingress".into();
         raw["runtime_metadata_present"] = true.into();
-        let ingress: ObservedCall = serde_json::from_value(raw).unwrap();
+        let ingress: ObservedCall =
+            serde_json::from_value(raw).expect("ingress observation fixture");
         assert!(!ingress.runtime_metadata_present);
     }
 }

@@ -1539,18 +1539,23 @@ mod runtime_evidence_tests {
         if let Some(outcome) = outcome {
             value["outcome"] = outcome.into();
         }
-        serde_json::from_value(value).unwrap()
+        serde_json::from_value(value).expect("published runtime evidence fixture")
     }
     #[test]
     fn ledger_projects_actual_runtime_and_does_not_upgrade_historical_unknown() {
         assert!(observed_side(&observation(None, None)).runtime.is_none());
         let substituted = observed_side(&observation(Some("recorded"), Some("substituted")));
         assert_eq!(
-            substituted.runtime.unwrap().outcome,
+            substituted
+                .runtime
+                .expect("published runtime evidence fixture")
+                .outcome,
             Some(deja::SubstituteOutcome::Substituted)
         );
         let executed = observed_side(&observation(Some("execute_shadow"), None));
-        let runtime = executed.runtime.unwrap();
+        let runtime = executed
+            .runtime
+            .expect("published runtime evidence fixture");
         assert_eq!(runtime.provenance, deja::Provenance::Shadow);
         assert!(runtime.outcome.is_none());
     }
@@ -1563,8 +1568,8 @@ mod runtime_evidence_tests {
         let mut row: CallRecord = serde_json::from_value(serde_json::json!({
             "boundary":"config","trait_name":"Client","method_name":"read","correlation_id":"request","kind":"value_diverged","blocking":true,
             "observed":{"graph_node_id":7,"args":{"key":"same"}}
-        })).unwrap();
-        let original = serde_json::to_value(&row).unwrap();
+        })).expect("published runtime evidence fixture");
+        let original = serde_json::to_value(&row).expect("published runtime evidence fixture");
         assert_eq!(
             enrich_runtime(
                 std::slice::from_mut(&mut row),
@@ -1585,17 +1590,17 @@ mod runtime_evidence_tests {
         assert_eq!(
             row.observed
                 .as_ref()
-                .unwrap()
+                .expect("published runtime evidence fixture")
                 .runtime
                 .as_ref()
-                .unwrap()
+                .expect("published runtime evidence fixture")
                 .outcome,
             Some(deja::SubstituteOutcome::Substituted)
         );
-        let mut enriched = serde_json::to_value(&row).unwrap();
+        let mut enriched = serde_json::to_value(&row).expect("published runtime evidence fixture");
         enriched["observed"]
             .as_object_mut()
-            .unwrap()
+            .expect("published runtime evidence fixture")
             .remove("runtime");
         assert_eq!(
             original, enriched,

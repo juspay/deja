@@ -3445,7 +3445,7 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
                         // Preserve the assessment while publishing this read's
                         // fresh base-ref resolution timestamp/provenance.
                         coverage.base = Some(base);
-                        return Ok(coverage);
+                        return Ok(*coverage);
                     }
                 }
             }
@@ -3460,7 +3460,7 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
         })
         .await;
     let assessment = match computed {
-        Ok(Ok(coverage)) => Assessment::Assessed(coverage),
+        Ok(Ok(coverage)) => Assessment::Assessed(Box::new(coverage)),
         Ok(Err(why)) => Assessment::Unavailable { unavailable: why },
         Err(e) => Assessment::Unavailable {
             unavailable: format!("assessment task failed: {e}"),
@@ -3943,11 +3943,11 @@ mod review_identity_publication_tests {
 
     #[test]
     fn unreadable_graph_preserves_independent_arguments_and_names_the_gap() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().expect("valid display evidence fixture");
         let ledger = directory.path().join("calls.jsonl");
         let graph = directory.path().join("observed.jsonl");
-        std::fs::write(&ledger, ledger_row()).unwrap();
-        std::fs::write(&graph, "{torn graph").unwrap();
+        std::fs::write(&ledger, ledger_row()).expect("valid display evidence fixture");
+        std::fs::write(&graph, "{torn graph").expect("valid display evidence fixture");
         let publication = review_identity_from_files(&ledger, Some(&graph), &declaration());
         assert_eq!(
             publication.requests["request-one"]
@@ -3959,16 +3959,20 @@ mod review_identity_publication_tests {
         assert_eq!(publication.requests["request-one"].flow.status, "unknown");
         assert!(publication.notes.iter().any(|note| note.contains("graph")));
         assert_eq!(
-            publication.declaration.unwrap().source,
+            publication
+                .declaration
+                .expect("valid display evidence fixture")
+                .source,
             "current_deployment"
         );
     }
 
     #[test]
     fn torn_ledger_never_publishes_a_partial_identity() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().expect("valid display evidence fixture");
         let ledger = directory.path().join("calls.jsonl");
-        std::fs::write(&ledger, format!("{}\n{{torn", ledger_row())).unwrap();
+        std::fs::write(&ledger, format!("{}\n{{torn", ledger_row()))
+            .expect("valid display evidence fixture");
         let publication = review_identity_from_files(&ledger, None, &declaration());
         assert!(publication.requests.is_empty());
         assert!(!publication.notes.is_empty());
@@ -3976,11 +3980,13 @@ mod review_identity_publication_tests {
 
     #[test]
     fn call_display_projection_preserves_unknown_fields_and_scoring_operands() {
-        let mut original: serde_json::Value = serde_json::from_str(&ledger_row()).unwrap();
+        let mut original: serde_json::Value =
+            serde_json::from_str(&ledger_row()).expect("valid display evidence fixture");
         original["future_evidence"] = serde_json::json!({"keep": true});
         original["observed"]["args"]["document"] =
             serde_json::json!(r#"{"metadata":{"provider":null}}"#);
-        let views = call_display_views(vec![original.clone()], &[]).unwrap();
+        let views = call_display_views(vec![original.clone()], &[])
+            .expect("valid display evidence fixture");
         let displayed = &views[0];
         assert_eq!(
             displayed["observed"]["inspection"]["arguments"]["$.document"]["metadata"]["provider"],
@@ -3991,19 +3997,21 @@ mod review_identity_publication_tests {
         let mut without_projection = displayed.clone();
         without_projection["observed"]
             .as_object_mut()
-            .unwrap()
+            .expect("valid display evidence fixture")
             .remove("inspection");
         assert_eq!(without_projection, original);
     }
 
     #[test]
     fn call_display_projection_preserves_unknown_inspection_versions() {
-        let mut original: serde_json::Value = serde_json::from_str(&ledger_row()).unwrap();
+        let mut original: serde_json::Value =
+            serde_json::from_str(&ledger_row()).expect("valid display evidence fixture");
         original["observed"]["inspection"] = serde_json::json!({"version": 99, "arguments": "opaque future representation", "future": "keep"});
         original["observed"]["runtime"] = serde_json::json!({"version": 99, "provenance": "future_dispatch", "outcome": {"future": true}});
         original["comparison"] = serde_json::json!({"version": 99, "subject": "future_subject", "verdict": {"kind": "future_verdict"}});
         original["arg_divergence_reach"] = serde_json::json!({"future": "keep"});
-        let views = call_display_views(vec![original.clone()], &[]).unwrap();
+        let views = call_display_views(vec![original.clone()], &[])
+            .expect("valid display evidence fixture");
         assert_eq!(views[0], original);
     }
 }
