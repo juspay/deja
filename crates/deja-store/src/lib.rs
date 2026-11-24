@@ -120,6 +120,26 @@ pub struct RunSummaryRow {
     pub delta_verdict: Option<String>,
 }
 
+/// A stable position in newest-first run history. The run id breaks timestamp ties.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunListCursor {
+    pub created_at: DateTime<Utc>,
+    pub run_id: String,
+}
+
+const RUN_SUMMARY_SELECT: &str =
+    "SELECT run_id, mode, recording_id, candidate, candidate_sha256, params, state,
+                    verdict,
+                    CASE WHEN scorecard IS NULL THEN NULL ELSE jsonb_build_object(
+                        'pass',                 scorecard #> '{verdict,pass}',
+                        'inconclusive',         scorecard #> '{verdict,inconclusive}',
+                        'reason',               scorecard #> '{verdict,reason}',
+                        'total_correlations',   scorecard #> '{summary,total_correlations}',
+                        'matched_correlations', scorecard #> '{summary,matched_correlations}'
+                    ) END AS scorecard_digest,
+                    failure, expectation, created_by, created_at,
+                    started_at, finished_at, delta_verdict";
+
 /// A run that has NOT reached a terminal state — the k8s reconciler's work
 /// list. Minimal by design: the reconciler only needs the id (to correlate
 /// with its Job), the current state (for log context), and how old the run is
@@ -1756,23 +1776,63 @@ impl Store {
     /// would return an object of nulls for a run that was never scored, and the
     /// dashboard would report it as scored-with-nothing instead of unscored.
     pub async fn list_run_summaries(&self, limit: i64) -> Result<Vec<RunSummaryRow>, sqlx::Error> {
-        let rows = sqlx::query(
-            "SELECT run_id, mode, recording_id, candidate, candidate_sha256, params, state,
-                    verdict,
-                    CASE WHEN scorecard IS NULL THEN NULL ELSE jsonb_build_object(
-                        'pass',                 scorecard #> '{verdict,pass}',
-                        'inconclusive',         scorecard #> '{verdict,inconclusive}',
-                        'reason',               scorecard #> '{verdict,reason}',
-                        'total_correlations',   scorecard #> '{summary,total_correlations}',
-                        'matched_correlations', scorecard #> '{summary,matched_correlations}'
-                    ) END AS scorecard_digest,
-                    failure, expectation, created_by, created_at,
-                    started_at, finished_at, delta_verdict
-             FROM replay_runs ORDER BY created_at DESC LIMIT $1",
-        )
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        let query = format!(
+            "{RUN_SUMMARY_SELECT} FROM replay_runs ORDER BY created_at DESC, run_id DESC LIMIT $1"
+        );
+        let rows = sqlx::query(&query)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(run_summary_row).collect())
+    }
+
+    /// Filter the full history before applying a keyset page. Queue baselines
+    /// follow their dependents even when those dependents are on another page;
+    /// a baseline also used by a normal PR remains on its system's list.
+    pub async fn page_run_summaries(
+        &self,
+        default_system: &str,
+        system: Option<&str>,
+        search: Option<&str>,
+        cursor: Option<&RunListCursor>,
+        limit: i64,
+    ) -> Result<Vec<RunSummaryRow>, sqlx::Error> {
+        let query = format!(
+            "WITH dependents AS (
+                SELECT params ->> 'delta_against' AS baseline,
+                    bool_or(starts_with(COALESCE(params ->> 'label', ''), 'MQ · ')) AS has_queue,
+                    bool_or(NOT starts_with(COALESCE(params ->> 'label', ''), 'MQ · ')) AS has_pr
+                FROM replay_runs
+                WHERE params ->> 'delta_against' IS NOT NULL
+                GROUP BY params ->> 'delta_against'
+             ), scoped AS (
+                SELECT r.*,
+                    CASE WHEN starts_with(COALESCE(r.params ->> 'label', ''), 'MQ · ')
+                        OR (COALESCE(d.has_queue, false) AND NOT COALESCE(d.has_pr, false))
+                    THEN 'merge-queue'
+                    ELSE COALESCE(NULLIF(r.params ->> 'system_under_test', ''), $1)
+                    END AS list_scope
+                FROM replay_runs r LEFT JOIN dependents d ON d.baseline = r.run_id
+             )
+             {RUN_SUMMARY_SELECT} FROM scoped
+             WHERE ($2::text IS NULL OR list_scope = $2)
+               AND ($3::text IS NULL OR strpos(lower(concat_ws(' ',
+                    run_id, recording_id, candidate::text, created_by,
+                    failure ->> 'message', scorecard #>> '{{verdict,reason}}',
+                    expectation, params ->> 'label', params #>> '{{github,pr_number}}',
+                    list_scope)), lower($3)) > 0)
+               AND ($4::timestamptz IS NULL OR (created_at, run_id) < ($4, $5))
+             ORDER BY created_at DESC, run_id DESC LIMIT $6"
+        );
+        let rows = sqlx::query(&query)
+            .bind(default_system)
+            .bind(system)
+            .bind(search)
+            .bind(cursor.map(|c| c.created_at))
+            .bind(cursor.map(|c| c.run_id.as_str()))
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows.into_iter().map(run_summary_row).collect())
     }
 
@@ -2572,6 +2632,128 @@ mod tests {
     async fn remove(store: &super::Store, run_id: &str) {
         sqlx::query("DELETE FROM replay_runs WHERE run_id = $1")
             .bind(run_id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_history_filters_before_limit_and_pages_timestamp_ties_without_loss() {
+        let Some(store) = store_under_test().await else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let prefix = unique("history-page");
+        let system = format!("{prefix}-focus");
+        // More unrelated runs than the old dashboard window, all newer.
+        sqlx::query(
+            "INSERT INTO replay_runs (run_id, mode, params)
+            SELECT $1 || '-noise-' || n, 'replay', jsonb_build_object('system_under_test', 'other')
+            FROM generate_series(1, 205) n",
+        )
+        .bind(&prefix)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        for name in ["a", "b", "c"] {
+            sqlx::query("INSERT INTO replay_runs (run_id, mode, params, created_at)
+                VALUES ($1, 'replay', jsonb_build_object('system_under_test', $2::text), '2000-01-01Z')")
+                .bind(format!("{prefix}-{name}")).bind(&system).execute(&store.pool).await.unwrap();
+        }
+        let first = store
+            .page_run_summaries("default", Some(&system), None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            vec![format!("{prefix}-c"), format!("{prefix}-b")]
+        );
+        let cursor = super::RunListCursor {
+            created_at: first[1].created_at,
+            run_id: first[1].run_id.clone(),
+        };
+        let second = store
+            .page_run_summaries("default", Some(&system), None, Some(&cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].run_id, format!("{prefix}-a"));
+        let searched = store
+            .page_run_summaries("default", None, Some(&format!("{prefix}-a")), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].run_id, second[0].run_id);
+
+        let baseline = format!("{prefix}-baseline");
+        let queued = format!("{prefix}-queue");
+        store
+            .insert_run(
+                &baseline,
+                "replay",
+                None,
+                &serde_json::json!({}),
+                &serde_json::json!({ "system_under_test": system }),
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
+        store.insert_run(&queued, "replay", None, &serde_json::json!({}),
+            &serde_json::json!({ "system_under_test": system, "label": "MQ · PR #1", "delta_against": baseline }), None, "test").await.unwrap();
+        // Looking up just the baseline must still see the off-page dependent.
+        let queue_page = store
+            .page_run_summaries("default", Some("merge-queue"), Some(&baseline), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(queue_page.len(), 1);
+        assert_eq!(queue_page[0].run_id, baseline);
+        let plain = format!("{prefix}-plain");
+        store
+            .insert_run(
+                &plain,
+                "replay",
+                None,
+                &serde_json::json!({}),
+                &serde_json::json!({ "system_under_test": system, "delta_against": baseline }),
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
+        let shared = store
+            .page_run_summaries("default", Some(&system), Some(&baseline), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            shared.len(),
+            1,
+            "a baseline shared with a plain PR belongs to the system"
+        );
+        let legacy = format!("{prefix}-legacy");
+        store
+            .insert_run(
+                &legacy,
+                "replay",
+                None,
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+                None,
+                "test",
+            )
+            .await
+            .unwrap();
+        let default_page = store
+            .page_run_summaries(&system, Some(&system), Some(&legacy), None, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            default_page.len(),
+            1,
+            "legacy rows use the deployment default"
+        );
+        sqlx::query("DELETE FROM replay_runs WHERE starts_with(run_id, $1)")
+            .bind(&prefix)
             .execute(&store.pool)
             .await
             .unwrap();

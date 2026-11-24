@@ -128,6 +128,14 @@ export type RunSummaryRow = Omit<RunRow, "scorecard"> & {
   scorecard_digest: ScorecardDigest | null;
 };
 
+/** One bounded page after server-side system/search filtering. */
+export type RunPage = {
+  rows: RunSummaryRow[];
+  next_cursor: string | null;
+};
+
+export type RunPageQuery = { system?: string; q?: string; cursor?: string; limit?: number };
+
 export type SessionManifest = {
   status: string;
   counts: {
@@ -559,6 +567,13 @@ export const api = {
   systems: () => request<{ systems: SystemRow[] }>("/api/v1/systems"),
   recordings: () => request<RecordingRow[]>("/api/v1/recordings"),
   runs: () => request<RunSummaryRow[]>("/api/v1/runs"),
+  runsPage: (query: RunPageQuery) => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== "") params.set(key, String(value));
+    }
+    return request<RunPage>(`/api/v1/runs/page?${params}`);
+  },
   run: (id: string) => request<RunRow>(`/api/v1/runs/${id}`),
   stages: (id: string) => request<StageRow[]>(`/api/v1/runs/${id}/stages`),
   logs: (id: string, afterSeq = -1) =>

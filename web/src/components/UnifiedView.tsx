@@ -164,11 +164,11 @@ function typeNameOf(v: unknown): string | null {
   return o && typeof o.type_name === "string" ? o.type_name : null;
 }
 
-/** VALUE DIVERGENCE — the boundary ran for real and returned something else. */
-function ValueDiverged({ e }: { e: CallEntry }) {
+/** A scorer-published value finding; origin does not identify replay strategy. */
+export function ValueDiverged({ e }: { e: CallEntry }) {
   const c = e.call;
-  const origin = !!c.origin;
   const stopped = !!c.stopped;
+  const subject = c.comparison?.version === 1 ? c.comparison.subject : null;
   const tr = typeNameOf(c.recorded?.result);
   const to = typeNameOf(c.observed?.result);
   return (
@@ -176,31 +176,15 @@ function ValueDiverged({ e }: { e: CallEntry }) {
       <CallHead c={c} />
       <SplitSpans e={e} />
       <p className="evwhat">
-        {stopped && origin ? (
-          <>
-            <b>Origin.</b> The candidate asked this boundary for something the recording does not
-            hold: its arguments match no call recorded at this span, so replay refused the call and
-            the request stopped here. The argument diff below is the finding — the request the
-            candidate would have sent, against the one the recording made.
-          </>
-        ) : stopped ? (
-          <>
-            <b>Consequence.</b> The candidate's arguments here carried a value that had already
-            changed upstream, so they match no recorded call and replay refused this one. The cause
-            is at an origin above it; the argument diff shows what changed by the time it got here.
-          </>
-        ) : origin ? (
-          <>
-            <b>Origin.</b> This boundary was declared <code>Execute</code>, so it really ran during
-            replay instead of serving the recorded value — and what it returned differs. Everything
-            downstream that carries this value is a consequence of it, not an independent finding.
-          </>
-        ) : (
-          <>
-            <b>Consequence.</b> This call carried a value that had already changed upstream. It is
-            reported so the cascade is visible; the cause is at an origin above it.
-          </>
-        )}
+        <b>{c.origin ? "Origin in the comparison ledger." : "Downstream finding in the comparison ledger."}</b>{" "}
+        {stopped
+          ? "Replay refused this call because its arguments could not be served from the recording."
+          : subject === "arguments"
+            ? "The finding concerns the requested arguments. A recorded response can still be substituted when arguments differ."
+            : subject === "result"
+              ? "The finding concerns the compared result."
+              : "The scorer did not publish a supported comparison subject for this call."}{" "}
+        This classification alone does not establish which boundary executed or caused a later change.
       </p>
       {tr && to && tr !== to && (
         <p className="evwarn">
@@ -382,7 +366,7 @@ function HttpCallFacts({ e }: { e: CallEntry }) {
   const missing = (rec?.headerNames ?? []).filter((n) => !(obs?.headerNames ?? []).includes(n));
   return (
     <div className="scoredfields">
-      <div className="hint">connector-call facts — derived from the boundary record, values never shown</div>
+      <div className="hint">network-call facts — derived from the boundary record, values never shown</div>
       <table className="fieldtbl">
         <thead>
           <tr>
@@ -534,7 +518,9 @@ function Matched({ e }: { e: CallEntry }) {
       <CallHead c={c} />
       <SplitSpans e={e} />
       <p className="evwhat">Reconciled by the scorer's call classification.</p>
-      <details className="evraw"><summary>Raw captured connector-call facts</summary><HttpCallFacts e={e} /></details>
+      {(httpFactsOf(c.recorded?.args) || httpFactsOf(c.observed?.args)) && (
+        <details className="evraw"><summary>Captured network-call facts</summary><HttpCallFacts e={e} /></details>
+      )}
       {c.recorded?.args !== undefined && (
         <details className="evraw">
           <summary>Raw captured arguments, recorded and replayed</summary>
@@ -954,8 +940,9 @@ export default function UnifiedView({
   }, [scorecard]);
 
   const caseId = params.get("case");
-  const active: CaseModel | undefined =
-    model.cases.find((c) => c.caseId === caseId) ?? model.cases[0];
+  const addressedCase = model.cases.find((c) => c.caseId === caseId);
+  const caseUnavailable = caseId != null && !addressedCase;
+  const active: CaseModel | undefined = addressedCase ?? model.cases[0];
 
   // Selection is `?case=<correlation>&node=<graph_node_id>&side=<rec|rep>`.
   // NOT span_path: a span path names a SITE, and 36 of 168 sites here hold more
@@ -966,9 +953,15 @@ export default function UnifiedView({
   const wantNode = params.get("node") ? Number(params.get("node")) : null;
   const wantSide: Side = params.get("side") === "rep" ? "rep" : "rec";
   const selectedNode: SpineNode | undefined =
-    (wantNode != null
-      ? (active?.byNode[wantSide].get(wantNode) ?? active?.byNode[wantSide === "rec" ? "rep" : "rec"].get(wantNode))
+    (wantNode != null && !caseUnavailable
+      ? active?.byNode[wantSide].get(wantNode)
       : undefined) ?? active?.root;
+
+  React.useEffect(() => {
+    if (wantNode != null && selectedNode) {
+      document.getElementById("execution")?.scrollIntoView({ block: "start" });
+    }
+  }, [wantNode, wantSide, selectedNode?.key]);
 
   // A deep link must be able to see what it addressed: opening one expands its
   // ancestors rather than leaving the row hidden inside a collapsed branch.
@@ -1012,6 +1005,11 @@ export default function UnifiedView({
   if (calls.isLoading || https.isLoading || graph.isLoading)
     return <p className="hint">loading execution…</p>;
   if (evidence.blocking) return <p className="err">{evidence.blocking}</p>;
+  const selectionUnavailable = caseUnavailable
+    ? <p className="err">The requested case {caseId} is not present in this run's published evidence. Showing another request for browsing; it is not the addressed evidence.</p>
+    : wantNode != null && !active?.byNode[wantSide].has(wantNode)
+      ? <p className="err">The requested {wantSide === "rec" ? "recorded" : "replayed"} node {wantNode} is not present in this request's published evidence. Showing the request root.</p>
+      : null;
   const evidenceBanner = evidence.notes.map((note) => (
     <p className="err" key={note}>
       {note}
@@ -1051,6 +1049,7 @@ export default function UnifiedView({
 
   return (
     <div className="uv">
+      {selectionUnavailable}
       {evidenceBanner}
       {graphBanner}
       <div className="uvtabs">

@@ -354,6 +354,10 @@ export function buildSpine(
       // `k` levels above the anchor belongs to the row at depth len-1-k.
       const gid = cs.graph_node_id;
       if (gid == null) continue;
+      // The ledger anchors this exact site even when the optional graph is
+      // unavailable. Only ancestor ids and durations require the graph.
+      const anchored = side === "rec" ? site.recNodes : site.repNodes;
+      if (!anchored.includes(gid)) anchored.push(gid);
       let cur: number | null = gid;
       let depth = segs.length - 1;
       const guard = new Set<number>();

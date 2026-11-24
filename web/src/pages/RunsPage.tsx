@@ -1,21 +1,19 @@
-import React from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
-import { api, RunSummaryRow } from "../lib/api";
+import { api, runParams } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
 import {
-  attemptOrdinals,
   candidateRef,
   systemUnderTest,
   RESULT_STATES,
-  ResultState,
   resultOf,
   whatHappened,
 } from "../lib/result";
-import { ResultChip } from "../components/Result";
+import { RunListResult } from "../components/Result";
 import { KillRun } from "../components/KillRun";
 import { useSystems } from "../lib/systems";
-import { MERGE_QUEUE, changeOf, reposOf, scopesOf } from "../lib/scope";
+import { MERGE_QUEUE, changeOf } from "../lib/scope";
 
 function when(iso: string): { short: string; full: string } {
   const d = new Date(iso);
@@ -29,75 +27,49 @@ function when(iso: string): { short: string; full: string } {
   return { short, full: d.toLocaleString() };
 }
 
-/** Everything a substring search should reach on one row. */
-function haystack(r: RunSummaryRow): string {
-  return [
-    r.run_id,
-    r.recording_id ?? "",
-    candidateRef(r).full,
-    systemUnderTest(r),
-    r.created_by,
-    r.failure?.message ?? "",
-    r.scorecard_digest?.reason ?? "",
-    r.expectation ?? "",
-    changeOf(r) ?? "",
-  ]
-    .join(" ")
-    .toLowerCase();
-}
-
 export default function RunsPage() {
   const debug = useDebug();
-  const [q, setQ] = React.useState("");
-  const [filter, setFilter] = React.useState<ResultState | "">("");
-  // In the URL, like `?debug=1`: a link to "the merge queue's runs" should
-  // open the merge queue's runs for whoever it is pasted to.
   const [params, setParams] = useSearchParams();
   const scope = params.get("system") ?? "";
-  const pickScope = (s: string) => {
+  const q = params.get("q") ?? "";
+  const cursor = params.get("cursor") ?? "";
+  const [search, setSearch] = useState(q);
+  useEffect(() => {
+    const timer = setTimeout(() => setSearch(q), 250);
+    return () => clearTimeout(timer);
+  }, [q]);
+  const selectedResult = params.get("result") ?? "";
+  const filter = RESULT_STATES.find((state) => state === selectedResult) ?? "";
+  const update = (key: string, value: string, replace = false) => {
     const next = new URLSearchParams(params);
-    if (s) next.set("system", s);
-    else next.delete("system");
-    setParams(next, { replace: true });
+    if (value) next.set(key, value);
+    else next.delete(key);
+    if (key === "system" || key === "q") next.delete("cursor");
+    setParams(next, { replace });
   };
-
-  const runs = useQuery({ queryKey: ["runs"], queryFn: api.runs, refetchInterval: 5000 });
+  const query = { system: scope, q: search, cursor, limit: 50 };
+  const runs = useQuery({
+    queryKey: ["runs", "page", query],
+    queryFn: () => api.runsPage(query),
+    enabled: q === search,
+    placeholderData: keepPreviousData,
+    // Older pages have an immutable position. Keep the newest page live.
+    refetchInterval: cursor ? false : 5000,
+  });
   const systems = useSystems();
-  const defaultName = systems.defaultSystem?.name;
-
-  const all = runs.data ?? [];
-  const scopes = React.useMemo(() => scopesOf(all, defaultName), [all, defaultName]);
-  const repos = React.useMemo(() => reposOf(all, defaultName), [all, defaultName]);
-  // One choice per system the orchestrator declares, then the queue. Counts
-  // are over the whole list, so they do not move as you search.
-  const choices = React.useMemo(() => {
-    const count = (s: string) => all.filter((r) => scopes.get(r.run_id) === s).length;
-    return [
-      ...systems.all.map((s) => ({ key: s.name, label: repos.get(s.name) ?? s.name, n: count(s.name) })),
-      { key: MERGE_QUEUE, label: "merge queue", n: count(MERGE_QUEUE) },
-    ];
-  }, [all, scopes, repos, systems.all]);
-  // Attempt ordinals are derived over the WHOLE list, not the filtered view —
-  // "attempt 3 of 4" must not change because you typed in the search box.
-  const attempts = React.useMemo(() => attemptOrdinals(all), [all]);
-
-  const rows = React.useMemo(() => {
-    const needle = q.trim().toLowerCase();
-    return all.filter((r) => {
-      if (scope && scopes.get(r.run_id) !== scope) return false;
-      if (filter && resultOf(r).state !== filter) return false;
-      if (!needle) return true;
-      return haystack(r).includes(needle);
-    });
-  }, [all, q, filter, scope, scopes]);
-
-  if (runs.isLoading) return <p className="hint">loading…</p>;
-  if (runs.error)
-    return (
-      <p className="err">
-        {String(runs.error)} — is the orchestrator reachable?
-      </p>
-    );
+  const choices = [
+    ...systems.all.map((s) => ({ key: s.name, label: s.name })),
+    { key: MERGE_QUEUE, label: "merge queue" },
+  ];
+  if (scope && !choices.some((choice) => choice.key === scope)) {
+    choices.push({ key: scope, label: scope });
+  }
+  const loading = q !== search || runs.isLoading || runs.isPlaceholderData;
+  const page = loading ? [] : runs.data?.rows ?? [];
+  // Result classification remains shared with the report. This optional
+  // filter is explicitly page-local; system and text search cover history.
+  const rows = filter ? page.filter((r) => resultOf(r).state === filter) : page;
+  const runsUrl = `/runs${params.size ? `?${params}` : ""}`;
 
   return (
     <>
@@ -107,12 +79,12 @@ export default function RunsPage() {
       </div>
 
       <nav className="systempick" aria-label="System">
-        <button className={scope ? "tab" : "tab active"} onClick={() => pickScope("")}>
-          all <span className="n">{all.length}</span>
+        <button className={scope ? "tab" : "tab active"} onClick={() => update("system", "")}>
+          all systems
         </button>
         {choices.map((c) => (
-          <button key={c.key} className={scope === c.key ? "tab active" : "tab"} onClick={() => pickScope(c.key)}>
-            {c.label} <span className="n">{c.n}</span>
+          <button key={c.key} className={scope === c.key ? "tab active" : "tab"} onClick={() => update("system", c.key)}>
+            {c.label}
           </button>
         ))}
       </nav>
@@ -121,49 +93,52 @@ export default function RunsPage() {
         <input
           className="search"
           type="search"
-          placeholder="search run id, recording, candidate, actor, what happened…"
+          placeholder="search all history: run, PR, recording, candidate, actor…"
+          maxLength={512}
           value={q}
-          onChange={(e) => setQ(e.target.value)}
-          aria-label="filter runs"
+          onChange={(e) => update("q", e.target.value, true)}
+          aria-label="search run history"
         />
         <select
           value={filter}
-          onChange={(e) => setFilter(e.target.value as ResultState | "")}
-          aria-label="filter by result"
+          onChange={(e) => update("result", e.target.value)}
+          aria-label="filter this page by recording outcome or run status"
         >
-          <option value="">all results</option>
+          <option value="">all recording outcomes on this page</option>
           {RESULT_STATES.map((s) => (
             <option key={s} value={s}>
-              {s.toLowerCase().replace("_", " ")}
+              {s === "DIVERGED" ? "recording differs" : s === "REPRODUCED" ? "recording reproduced" : s.toLowerCase().replace("_", " ")}
             </option>
           ))}
         </select>
         <span className="hint">
-          {rows.length === all.length
-            ? `${all.length} run${all.length === 1 ? "" : "s"}`
-            : `${rows.length} of ${all.length}`}
+          {loading ? "loading matching history…" : <>
+            {filter ? `${rows.length} of ${page.length}` : page.length} runs on this page
+            {runs.data?.next_cursor ? " · older runs available" : " · end of matching history"}
+          </>}
         </span>
       </div>
 
-      <div className="runlist">
+      <p className="hint">PR impact compares with the named baseline. Recording fidelity compares with the captured traffic.</p>
+      {!loading && runs.error && <p className="err">{String(runs.error)} — could not load run history.</p>}
+      <div className="runlist" aria-busy={loading}>
         <div className="runrow runhead" aria-hidden="true">
           <span>when</span>
-          <span>result</span>
+          <span>PR impact / run status</span>
           <span>pull request · label</span>
           <span>candidate</span>
           <span>recording</span>
-          <span>what happened</span>
-          <span className="num">attempt</span>
+          <span>recording / run details</span>
+          <span className="num">role</span>
           {/* The action column. Reserved on every row, occupied only on the
               ones that are still running, so the columns above never shift. */}
           <span />
         </div>
 
         {rows.map((r) => {
-          const res = resultOf(r);
           const cand = candidateRef(r);
           const said = whatHappened(r);
-          const at = attempts.get(r.run_id);
+          const purpose = runParams(r)?.purpose;
           const change = changeOf(r);
           const t = when(r.created_at);
           // The whole row is the link: middle-click, copy-link-address and
@@ -177,19 +152,12 @@ export default function RunsPage() {
               <Link
                 className="runrow"
                 to={withDebug(`/r/${r.run_id}`, debug)}
+                state={{ runsUrl }}
                 title={`${r.run_id} · ${r.created_by} · ${t.full}`}
               >
                 <span className="rl-when">{t.short}</span>
                 <span className="rl-result">
-                  <ResultChip result={res} />
-                  {/* The second verdict, against main, when the run was created
-                      with a baseline. Its own chip: a pass here beside a fail
-                      there is the case the delta exists for. */}
-                  {r.delta_verdict && (
-                    <span className={`chip delta ${r.delta_verdict}`} title="against main at the merge-base">
-                      main: {r.delta_verdict}
-                    </span>
-                  )}
+                  <RunListResult run={r} />
                 </span>
                 <span className="rl-change" title={change ?? undefined}>{change ?? "—"}</span>
                 <span className="rl-cand mono" title={cand.full}>
@@ -202,15 +170,8 @@ export default function RunsPage() {
                 </span>
                 <span className="rl-rec mono">{r.recording_id ?? "—"}</span>
                 <span className="rl-said" title={said ?? undefined}>{said ?? "—"}</span>
-                <span
-                  className="rl-attempt num"
-                  title={
-                    at
-                      ? `derived client-side: run ${at.attempt} of ${at.of} with this mode + recording + candidate. The server does not persist a subject key.`
-                      : undefined
-                  }
-                >
-                  {at ? (at.of > 1 ? `${at.attempt}/${at.of}` : "1") : "—"}
+                <span className="rl-attempt num" title="Run purpose, as published; attempts are not inferred from a partial history page">
+                  {purpose ?? (runParams(r)?.delta_against ? "candidate" : "—")}
                 </span>
                 <span />
               </Link>
@@ -221,16 +182,23 @@ export default function RunsPage() {
           );
         })}
 
-        {rows.length === 0 && (
+        {!loading && !runs.error && rows.length === 0 && (
           <p className="hint runempty">
-            {all.length === 0 ? (
-              <>no runs yet — <Link to="/">start one</Link></>
+            {page.length === 0 ? (
+              <>no matching runs on this page — <Link to="/">start one</Link></>
             ) : (
-              <>no run matches this search</>
+              <>no run on this page has the selected result; older pages may contain matches</>
             )}
           </p>
         )}
       </div>
+      <nav className="runfilters" aria-label="Run history pages">
+        {cursor && <button className="btn" onClick={() => update("cursor", "")}>Newest matching runs</button>}
+        <button className="btn" disabled={loading || !!runs.error || !runs.data?.next_cursor} onClick={() => update("cursor", runs.data?.next_cursor ?? "")}>
+          Older runs
+        </button>
+        <span className="hint">System and search cover all history. The recording outcome filter applies to this page.</span>
+      </nav>
     </>
   );
 }

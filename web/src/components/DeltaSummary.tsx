@@ -3,6 +3,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
   api,
+  CallRecord,
+  DeltaRow,
   Delta,
   DeltaFamily,
   DeltaSideInfo,
@@ -15,7 +17,8 @@ import { candidateRef } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
 import { comparedDiffs, pollPending, readState, sealLine } from "../lib/deltaPanel";
 import { AcknowledgeLine } from "./Acknowledgements";
-import { deltaRequestCounts, joinDeltaResponses, responseKey, SAME_AS_RECORDING, type DeltaOutcome as Outcome, type DeltaRequest as Req, type FieldSide } from "../lib/comparison";
+import { callAtAddress, callEvidenceHref } from "../lib/acknowledge";
+import { callComparisonText, deltaRequestCounts, deltaReviewCounts, joinDeltaResponses, responseKey, SAME_AS_RECORDING, type DeltaOutcome as Outcome, type DeltaRequest as Req, type FieldSide } from "../lib/comparison";
 
 /**
  * "Compared with main": what a pull request's run changed relative to main
@@ -49,7 +52,7 @@ export const FAMILY_MEANING: Record<DeltaFamily, string> = {
   changed: "Main had already moved this and this PR moved it again, differently. The conflict case: flagged, counted against the PR.",
   introduced: "Main reproduced the recording here; only this PR differs. Counted against the PR.",
   resolved: "Main had moved it; this PR is back on the recording. Not charged.",
-  inherited: "Main and this PR both moved it the same way. Expected on main; not charged.",
+  inherited: "Main and this PR differ from the recording in the same way. Shared evidence; not attributed to this PR.",
   clean: "Both reproduced the recording.",
 };
 
@@ -82,7 +85,7 @@ const GLYPH: Record<Outcome, [Dot, Dot, Dot]> = {
 
 export function SideCell({ v, sameAsMain = false }: { v: FieldSide; sameAsMain?: boolean }) {
   if (v === undefined) return <td className="val faint">not published</td>;
-  if (v === null) return <td className="val gone">null / absent</td>;
+  if (v === null) return <td className="val gone" title="This historical field-diff format does not distinguish explicit JSON null from a missing field.">null / absent (presence unknown)</td>;
   if (v === SAME_AS_RECORDING) return <td className="val rec">= recording</td>;
   const text = typeof v === "string" ? v : JSON.stringify(v);
   const same = sameAsMain;
@@ -144,7 +147,7 @@ function Facts({ d, prRun, mainRun }: { d: Delta; prRun?: RunRow; mainRun?: RunR
         <b>compared</b>
         <span className="v">{d.rows.length + d.clean} points per run</span>
         <span className="s">
-          outgoing connector calls, response statuses and response fields{calls > 0 && ` · ${calls} calls differ on some side`} · time and id seams excluded
+          boundary observations, response statuses and response fields{calls > 0 && ` · ${calls} calls differ on some side`} · time and id seams excluded
         </span>
       </div>
     </div>
@@ -164,22 +167,27 @@ function counts(reqs: Req[]) {
 export function Headline({ d }: { d: Delta }) {
   const v = d.verdict;
   const total = d.covered_correlations;
-  const { n, recVsMain, mainVsPr } = deltaRequestCounts(d);
-  const tone = v.pass ? "good" : "bad";
-  const chip = v.pass ? "no new blocking difference" : `${n("new") + n("conflict")} requests changed by this PR`;
-  const head = v.pass
+  const { recVsMain, mainVsPr } = deltaRequestCounts(d);
+  const review = deltaReviewCounts(d);
+  const inconclusive = total === 0 || d.sides.m.tape_verdict?.inconclusive || d.sides.y.tape_verdict?.inconclusive;
+  const tone = inconclusive ? "neutral" : v.pass ? "good" : "bad";
+  const chip = inconclusive ? "comparison inconclusive" : v.pass ? "no new blocking difference" : "review required";
+  const head = inconclusive
+    ? "The available evidence does not support a PR impact verdict."
+    : v.pass
     ? `The delta attributes no new blocking difference to this PR.${recVsMain > 0 ? ` Main has findings relative to the recording on ${recVsMain} request${recVsMain === 1 ? "" : "s"}.` : ""}`
-    : n("conflict") > 0
-      ? `${n("conflict")} requests differ from both the recording and main.`
-      : `${n("new")} requests differ from the recording on this PR but not on main.`;
+    : `${review.blockingRequests} request${review.blockingRequests === 1 ? " differs" : "s differ"} from baseline with blocking observations.`;
   const sha = (run: string) => run.split("-")[2] ?? "";
   return (
     <div className={`delta-headline tone-${tone}`}>
       <div className="txt">
         <div><span className={`rchip ${tone}`}>{chip}</span></div>
         <span className="h">{head}</span>
-        <span className="sub">{v.reason}</span>
-        <span className="fine">The banner's verdict is against the recording alone and still decides the check.</span>
+        <details className="sub"><summary>Scorer explanation</summary>{v.reason}</details>
+        <span className="review-counts">
+          <b>{review.affectedRequests}</b> affected request{review.affectedRequests === 1 ? "" : "s"} · <b>{review.blocking}</b> blocking · <b>{review.informational}</b> informational · {review.shared} shared observations
+        </span>
+        <span className="fine">PR impact compares these two runs on the same recording. Recording fidelity and changed-code coverage are separate evidence. Repository CI decides which result it requires.</span>
       </div>
       <svg viewBox="0 0 400 120" role="img" aria-label={`recording to main: ${recVsMain} of ${total} differ; main to this PR: ${mainVsPr} of ${total} differ`}>
         <rect x="8" y="30" width="110" height="60" rx="6" className="node rec" />
@@ -244,7 +252,7 @@ function Matrix({ d, mainKnown }: { d: Delta; mainKnown: boolean }) {
       </thead>
       <tbody>
         {row("recording → main", recVsMain, onMain(addresses("body", ["inherited", "changed", "resolved"])), onMain(addresses("status", ["inherited", "changed", "resolved"])), `${word(d.sides.m)} · main's own run against the recording`, true)}
-        {row("recording → this PR", recVsPr, addresses("body", ["inherited", "changed", "introduced"]), addresses("status", ["inherited", "changed", "introduced"]), `${word(d.sides.y)} · the banner above`, true)}
+        {row("recording → this PR", recVsPr, addresses("body", ["inherited", "changed", "introduced"]), addresses("status", ["inherited", "changed", "introduced"]), `${word(d.sides.y)} · this run against the recording`, true)}
         {row("main → this PR", mainVsPr, addresses("body", ["introduced", "changed", "resolved"]), onMain(addresses("status", ["introduced", "changed", "resolved"])),
           <span className={`rchip ${d.verdict.pass ? "good" : "bad"}`}>{d.verdict.pass ? "nothing new" : "changed by this PR"}</span>, !d.verdict.pass)}
       </tbody>
@@ -481,28 +489,41 @@ function CleanList({ reqs }: { reqs: Req[] }) {
   );
 }
 
-function Calls({ d, reqs }: { d: Delta; reqs: Req[] }) {
-  const calls = d.rows.filter((r) => r.address.kind === "call");
-  const laneOf = new Map(reqs.map((r) => [r.correlation, r.lane.split(" · ")[0]]));
-  const byConn = new Map<string, number>();
-  for (const r of calls) {
-    const c = laneOf.get(r.address.correlation) ?? r.lane?.connector ?? "—";
-    byConn.set(c, (byConn.get(c) ?? 0) + 1);
-  }
-  return (
-    <Fold title="Outgoing connector calls" count={calls.length === 0 ? "identical on all three, for every request" : `${calls.length} calls differ on some side`}>
-      {byConn.size === 0 ? (
-        <p className="hint">
-          Every connector request main and this PR sent matches the recording after canonicalisation. The divergence, if any, is only in what the service returned to its caller.
-        </p>
-      ) : (
-        <table>
-          <thead><tr><th>connector</th><th className="num">calls differing</th></tr></thead>
-          <tbody>{[...byConn.entries()].map(([c, k]) => <tr key={c}><td className="mono">{c}</td><td className="num">{k}</td></tr>)}</tbody>
-        </table>
-      )}
-    </Fold>
+/** Every boundary uses the same published address; hosts are not connector identities. */
+export function BoundaryObservations({ d, calls, runId }: { d: Delta; calls: CallRecord[]; runId: string }) {
+  const debug = useDebug();
+  const all = d.rows.filter((row) => row.address.kind === "call");
+  const specific = all.filter((row) => ["changed", "introduced"].includes(deltaFamily(row.bucket)));
+  const shared = all.filter((row) => !specific.includes(row));
+  const table = (rows: DeltaRow[]) => (
+    <table className="boundary-observations">
+      <thead><tr><th>requirement</th><th>boundary · operation</th><th>request</th><th>published comparison</th><th>evidence</th></tr></thead>
+      <tbody>{[...rows].sort((a, b) => Number(b.blocking) - Number(a.blocking)).map((row, index) => {
+        const address = row.address;
+        if (address.kind !== "call") return null;
+        const exact = callEvidenceHref(runId, address, calls);
+        const call = callAtAddress(address, calls);
+        const href = exact ?? `/r/${runId}?case=${encodeURIComponent(address.correlation)}`;
+        return <tr key={index}>
+          <td><span className={`chip ${row.blocking ? "fail" : "muted"}`}>{row.blocking ? "blocking" : "informational"}</span><div className="hint">{deltaFamily(row.bucket)}</div></td>
+          <td><code>{address.boundary} · {address.operation}</code><div className="hint">{address.span_path.split(">").slice(-2).join(" › ")}</div></td>
+          <td className="mono" title={address.correlation}>{short(address.correlation)}</td>
+          <td>{call ? callComparisonText(call) : "Comparison details not published at this exact address."}<div className="hint">candidate against recording</div></td>
+          <td><Link to={withDebug(href, debug)}>{exact ? "Open exact event →" : "Open request →"}</Link></td>
+        </tr>;
+      })}</tbody>
+    </table>
   );
+  return <>
+    <Fold title="Boundary changes introduced by this PR" count={`${specific.filter((row) => row.blocking).length} blocking · ${specific.filter((row) => !row.blocking).length} informational`} open={specific.length > 0}>
+      <p className="hint">Database, configuration, key management and network calls use the same comparison. Multiple observations can reflect one change; their order alone does not prove causality.</p>
+      {specific.length ? table(specific) : <p className="hint">No introduced or changed boundary observations were published.</p>}
+    </Fold>
+    {shared.length > 0 && <Fold title="Other boundary observations" count={`${shared.length} shared with baseline or restored to the recording`}>
+      <p className="hint">Shared differences are not attributed to this PR. They still matter when assessing recording fidelity.</p>
+      {table(shared)}
+    </Fold>}
+  </>;
 }
 
 // ---------------------------------------------------------------------------
@@ -513,8 +534,7 @@ export function BaselineNote({ run, label }: { run: string; label?: string }) {
   return (
     <p className="hint delta-baseline-note">
       This is a <b>baseline</b> run{label ? `: ${label}` : ""}. Main replayed on the recording so that pull requests branched
-      from it can be measured against it. Its own verdict against the recording is expected to fail whenever main
-      has moved since the recording; that is not a finding about main.
+      from it can be measured against it. Its own verdict against the recording measures fidelity separately. A difference can reflect source drift or a replay problem; comparing both runs helps separate shared evidence from PR-specific changes.
       <span className="mono"> {run}</span>
     </p>
   );
@@ -619,6 +639,7 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
   const unavailable = deltaUnavailable(delta.data);
   const prRun = useQuery({ queryKey: ["run", runId], queryFn: () => api.run(runId) });
   const mainRun = useQuery({ queryKey: ["run", against], queryFn: () => api.run(against) });
+  const calls = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId), enabled: !!d });
   const prDiffs = useQuery({ queryKey: ["httpdiffs", runId], queryFn: () => api.httpDiffs(runId), enabled: !!d });
   const mainDiffs = useQuery({ queryKey: ["httpdiffs", against], queryFn: () => api.httpDiffs(against), enabled: !!d });
   const prRead = readState({ data: prDiffs.data, error: prDiffs.error });
@@ -635,7 +656,7 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
   const mainSha = against.split("-")[2] ?? against;
   return (
     <section className="delta-panel">
-      <h2>Compared with main</h2>
+      <h2>PR impact · compared with baseline</h2>
       {delta.isLoading && <p className="hint">comparing…</p>}
       {delta.error && <p className="err">{String(delta.error)}</p>}
       {unavailable &&
@@ -673,24 +694,28 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
             </p>
           )}
           {mainRead.state === "pending" && prRead.state === "ok" && <p className="hint">loading main's responses…</p>}
+          {calls.error && <p className="err">Boundary evidence could not be read: {String(calls.error)}. The published delta remains visible; exact event links are unavailable.</p>}
+          <BoundaryObservations d={d} calls={calls.data ?? []} runId={runId} />
           {prRead.state === "ok" && reqs.length > 0 && (
             <>
-              <Fold title="The three comparisons, in numbers" count="requests, then what differed inside them" open>
+              <p className="hint">{reqs.filter((r) => r.outcome === "same" || r.outcome === "clean").length} of {reqs.length} published responses have no PR-specific status or body delta. Boundary observations are counted separately above.</p>
+              <Fold title="The three comparisons, in numbers" count="requests, then what differed inside them">
                 <Matrix d={d} mainKnown={mainRead.state === "ok"} />
               </Fold>
+              <Fold title="Response overview" count="published outcome groups and lane hints">
               <Tiles d={d} />
-              <p className="hint">The response groups below use published status and body delta addresses. Call changes are listed separately.</p>
-              <Fold title="Responses by connector and flow" count="responses per outcome; judged differences in parentheses" open>
+              <p className="hint">Lanes are inferred hints, not proof of the connector or feature exercised. Use the exact request and coverage evidence to verify behavior.</p>
+              <Fold title="Responses by lane hint" count="responses per outcome; judged differences in parentheses">
                 <ByLane reqs={reqs} />
               </Fold>
-              <Fold title="Every response" count="one square per response, in recording order; hover for the response, click to open its case" open>
+              <Fold title="Every response" count="one square per response, in recording order; hover for the response, click to open its case">
                 <RequestMap reqs={reqs} runId={runId} />
               </Fold>
+              </Fold>
               {OUTCOME_ORDER.filter((o) => o !== "clean").map((o) => (
-                <OutcomeGroup key={o} outcome={o} reqs={reqs.filter((r) => r.outcome === o)} runId={runId} mainSha={mainSha} open={o !== "same" || d.verdict.pass} />
+                <OutcomeGroup key={o} outcome={o} reqs={reqs.filter((r) => r.outcome === o)} runId={runId} mainSha={mainSha} open={o !== "same"} />
               ))}
               <CleanList reqs={reqs.filter((r) => r.outcome === "clean")} />
-              <Calls d={d} reqs={reqs} />
             </>
           )}
           <Coverage d={d} />

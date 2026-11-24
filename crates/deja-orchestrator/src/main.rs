@@ -408,6 +408,7 @@ fn app_router(state: AppState) -> Router {
             get(v1_recording_correlations),
         )
         .route("/runs", create_run.get(v1_list_runs))
+        .route("/runs/page", get(v1_run_page))
         .route("/runs/{run_id}/events", ingest_run_event)
         .route("/runs/{run_id}/kill", kill_run_route)
         .route("/runs/{run_id}/baseline", repoint_baseline)
@@ -2197,19 +2198,9 @@ async fn v1_recording_correlations(
     }
 }
 
-/// How many runs `GET /api/v1/runs` returns.
-///
-/// Unchanged at 200. The 2026-09-17 outage was NOT this number — it was the
-/// bytes PER row: 200 rows weighed 46.5 MB, of which 173,866 bytes were the
-/// rows and the other 97.5% was `scorecard`. Without that column the same 200
-/// rows are ~174 KB, so cutting the count would have bought 10x against the
-/// 267x that dropping the column buys, and would have cost something real —
-/// `RunsPage` derives attempt ordinals ("attempt 3 of 4") over the WHOLE list,
-/// and a page-sized list makes that number silently wrong.
-///
-/// Paginating is still worth doing. It is worth doing with the ordinals moved
-/// server-side first, which is a separate change and not one to make while the
-/// pod is in CrashLoopBackOff.
+/// Compatibility list for existing clients. The dashboard uses the filtered,
+/// cursor-paginated `/runs/page` contract instead of interpreting this window
+/// as complete history.
 const RUN_LIST_LIMIT: i64 = 200;
 
 /// `GET /api/v1/runs` — run list (Postgres-backed; newest first).
@@ -2224,6 +2215,77 @@ async fn v1_list_runs(State(st): State<AppState>) -> Response {
     match store.list_run_summaries(RUN_LIST_LIMIT).await {
         Ok(rows) => json_ok_ser(&rows),
         Err(e) => error_resp(500, &format!("list runs: {e}")),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RunPageQuery {
+    system: Option<String>,
+    q: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+
+fn run_page_cursor(value: Option<&str>) -> Result<Option<deja_store::RunListCursor>, &'static str> {
+    let Some(value) = value else { return Ok(None) };
+    if value.len() > 1024 {
+        return Err("invalid run history cursor");
+    }
+    let cursor: deja_store::RunListCursor =
+        serde_json::from_str(value).map_err(|_| "invalid run history cursor")?;
+    if cursor.run_id.is_empty() || cursor.run_id.len() > 256 {
+        return Err("invalid run history cursor");
+    }
+    Ok(Some(cursor))
+}
+
+/// Full-history filtering, then a bounded keyset page. The legacy array route
+/// stays unchanged for clients that do not know this envelope.
+async fn v1_run_page(
+    State(st): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<RunPageQuery>,
+) -> Response {
+    let cursor = match run_page_cursor(q.cursor.as_deref()) {
+        Ok(c) => c,
+        Err(e) => return error_resp(400, e),
+    };
+    let system = q.system.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let search = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if system.is_some_and(|s| s.len() > 256) || search.is_some_and(|s| s.len() > 512) {
+        return error_resp(400, "run history filter is too long");
+    }
+    let limit = i64::from(q.limit.unwrap_or(50).clamp(1, 100));
+    let store = match require_store(&st) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    match store
+        .page_run_summaries(
+            deja_orchestrator::default_system(),
+            system,
+            search,
+            cursor.as_ref(),
+            limit + 1,
+        )
+        .await
+    {
+        Ok(mut rows) => {
+            let has_more = rows.len() > limit as usize;
+            rows.truncate(limit as usize);
+            let next_cursor = if has_more {
+                rows.last().and_then(|r| {
+                    serde_json::to_string(&deja_store::RunListCursor {
+                        created_at: r.created_at,
+                        run_id: r.run_id.clone(),
+                    })
+                    .ok()
+                })
+            } else {
+                None
+            };
+            json_ok_ser(&serde_json::json!({ "rows": rows, "next_cursor": next_cursor }))
+        }
+        Err(e) => error_resp(500, &format!("page runs: {e}")),
     }
 }
 
@@ -6691,6 +6753,43 @@ mod tests {
     /// The bin's tests share one process environment too. See the lib's
     /// `test_env` for why readers hold this as well as writers.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn run_history_cursor_preserves_timestamp_ties_and_rejects_bad_positions() {
+        let cursor = run_page_cursor(Some(
+            r#"{"created_at":"2026-11-24T08:13:00.123456Z","run_id":"run-b"}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(cursor.run_id, "run-b");
+        assert_eq!(cursor.created_at.timestamp_subsec_micros(), 123456);
+        let encoded = serde_json::to_string(&cursor).unwrap();
+        assert_eq!(
+            run_page_cursor(Some(&encoded)).unwrap().unwrap().created_at,
+            cursor.created_at
+        );
+        assert!(run_page_cursor(None).unwrap().is_none());
+        assert!(run_page_cursor(Some("garbage")).is_err());
+        assert!(
+            run_page_cursor(Some(r#"{"created_at":"2026-11-24T08:13:00Z","run_id":""}"#)).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_history_page_is_an_api_route_and_rejects_invalid_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = test_state(dir.path());
+        let (status, body) =
+            get_json(state.clone(), "/api/v1/runs/page?cursor=invalid".into()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error_of(&body).contains("cursor"));
+        let (status, body) = get_json(state, "/api/v1/runs/page?system=example".into()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            error_of(&body).contains("store unavailable"),
+            "must not fall through to the SPA or single-run route"
+        );
+    }
 
     /// Naming the default system means what omitting it means, and both mean
     /// the bucket the default system DECLARED. There is no fallback to the

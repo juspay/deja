@@ -283,8 +283,9 @@ pre.jsonblock.clamped::after { content: ""; position: absolute; left: 0; right: 
 
 /* ==========================================================================
    RESULT VOCABULARY — five states, one palette, used identically in the list,
-   the report and the launch modal. `tone-good` is reachable only from
-   REPRODUCED (lib/result.ts); nothing else in the app may paint itself green.
+   the report and the launch modal. Recording fidelity uses lib/result.ts;
+   baseline impact uses its separately published verdict. Acknowledged is blue
+   so accepted differences remain distinct from a comparison with no new ones.
    ========================================================================== */
 .rchip {
   display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: var(--r-pill);
@@ -295,6 +296,7 @@ pre.jsonblock.clamped::after { content: ""; position: absolute; left: 0; right: 
 .tone-bad     { background: rgba(248,81,73,0.14);  color: var(--red-fg); }
 .tone-warn    { background: rgba(210,153,34,0.14); color: var(--amber-fg); }
 .tone-neutral { background: var(--surface-overlay); color: var(--text-subtle); }
+.tone-acknowledged { background: var(--accent-muted); color: var(--accent); }
 
 .verdict {
   border: 1px solid var(--border); border-radius: var(--r-md);
@@ -345,10 +347,10 @@ pre.jsonblock.clamped::after { content: ""; position: absolute; left: 0; right: 
   border-radius: var(--r-sm); padding: var(--s2) var(--s3); font: inherit; font-size: var(--fs-13);
 }
 .runlist { border: 1px solid var(--border); border-radius: var(--r-md); overflow-x: auto; overflow-y: hidden; }
-.runlist > .runrow, .runlist > .runrowwrap { min-width: 1142px; }
+.runlist > .runrow, .runlist > .runrowwrap { min-width: 1214px; }
 .runrow {
   display: grid; align-items: center;
-  grid-template-columns: 90px 118px minmax(180px, 1.6fr) minmax(130px, 1fr) minmax(110px, 0.8fr) minmax(200px, 2fr) 74px 132px;
+  grid-template-columns: 90px 190px minmax(180px, 1.6fr) minmax(130px, 1fr) minmax(110px, 0.8fr) minmax(200px, 2fr) 74px 132px;
   gap: var(--s3); padding: var(--s2) var(--s3); font-size: var(--fs-12);
   color: var(--text-muted); text-decoration: none; border-bottom: 1px solid var(--border-muted);
 }
@@ -1038,7 +1040,8 @@ main:has(.recintro) { max-width: 1440px; }
 .delta-baseline-note { border-left: 3px solid var(--purple); padding-left: var(--s3); margin: 0 0 var(--s3); }
 .delta-baseline-note b { color: var(--purple); }
 .delta-baseline-verdict { margin: calc(-1 * var(--s2)) 0 var(--s3); }
-.rl-result { display: inline-flex; gap: var(--s1); align-items: center; flex-wrap: wrap; }
+.runrow > .rl-result { display: flex; flex-direction: column; gap: var(--s1); align-items: flex-start; white-space: normal; }
+.recording-outcome { font-size: var(--fs-11); color: var(--text-muted); }
 .chip.delta { font-size: var(--fs-11); }
 
 /* ==========================================================================
@@ -1159,13 +1162,14 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 .delta-vals td.val.samev { color: var(--text-subtle); }
 
 /* ---- acknowledgements: the rows a PR is charged with, and who accepted them ---- */
-.chip.acknowledged, .chip.delta.acknowledged { background: rgba(63,185,80,0.14); color: var(--green-fg); }
+.chip.acknowledged, .chip.delta.acknowledged { background: var(--accent-muted); color: var(--accent); }
 .chip.delta.unknown { background: var(--surface-overlay); color: var(--text-faint); border: 1px dashed var(--border-strong); }
 .chip.proposed { background: rgba(210,153,34,0.14); color: var(--amber-fg); }
 .chip.stale { background: rgba(248,81,73,0.14); color: var(--red-fg); }
 .delta-ack { display: grid; gap: var(--s3); }
 .delta-ack-verdict { border: 1px solid var(--border); border-left: 3px solid var(--border-strong); border-radius: var(--r-md); background: var(--surface); padding: var(--s3) var(--s4); display: flex; gap: var(--s4); align-items: flex-start; }
 .delta-ack-verdict.tone-good { border-left-color: var(--green); }
+.delta-ack-verdict.tone-acknowledged { border-left-color: var(--accent); }
 .delta-ack-verdict.tone-bad { border-left-color: var(--red); }
 .delta-ack-verdict .txt { display: grid; gap: 2px; }
 .delta-ack-verdict .h { font-weight: 600; }
@@ -1183,7 +1187,7 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 .delta-ack-table .note { color: var(--text-muted); font-style: italic; max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: bottom; }
 .delta-ack-table td.act { white-space: nowrap; text-align: right; }
 .delta-ack-table td.act .btn + .btn { margin-left: var(--s2); }
-.delta-ack-table tr.st-acknowledged td.lane { border-left: 3px solid var(--green); }
+.delta-ack-table tr.st-acknowledged td.lane { border-left: 3px solid var(--accent); }
 .delta-ack-table tr.st-proposed td.lane { border-left: 3px solid var(--amber); }
 .delta-ack-table tr.st-stale td.lane { border-left: 3px solid var(--red); }
 .delta-ack-propose { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
@@ -1195,7 +1199,7 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 .ack-btn { margin-left: auto; display: inline-flex; gap: var(--s2); align-items: center; }
 .ack-btn .count { border-radius: 999px; font-size: var(--fs-11); font-weight: 700; padding: 0 8px; }
 .ack-btn .count.todo { background: var(--amber); color: var(--on-accent); }
-.ack-btn .count.ok { background: var(--green); color: var(--on-accent); }
+.ack-btn .count.ok { background: var(--accent); color: var(--on-accent); }
 .ack-btn .count.wait { background: var(--surface-overlay); color: var(--text-muted); }
 .ack-head { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; margin-bottom: var(--s3); }
 .ack-head h1 { margin: 0; }
@@ -1203,6 +1207,7 @@ th.col-rec { color: var(--green-fg); } th.col-main { color: #9db0c8; } th.col-pr
 .ack-steps { display: flex; gap: var(--s2); flex-wrap: wrap; font-size: var(--fs-12); color: var(--text-subtle); margin-bottom: var(--s4); }
 .ack-steps span { border: 1px solid var(--border); border-radius: 999px; padding: 1px 10px; }
 .ack-steps .done { color: var(--green-fg); border-color: var(--green); }
+.ack-steps .acknowledged { color: var(--accent); border-color: var(--accent); }
 .ack-steps .now { color: var(--amber-fg); border-color: var(--amber); }
 .ack-grid { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: var(--s4); align-items: start; }
 @media (max-width: 1400px) { .ack-grid { grid-template-columns: 1fr; } .ack-rail { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); } }
@@ -1459,3 +1464,11 @@ h1 .beta { font-size: 11px; }
 .cd-dialogbox { background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-md, 10px); padding: var(--s5); width: min(640px, 100%); max-height: 90vh; overflow: auto; display: grid; gap: var(--s3); }
 .cd-dialogbox select, .cd-dialogbox input { width: 100%; }
 .cd-checks { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; font-size: var(--fs-13); }
+
+/* PR evidence precedes recording diagnostics; keep dense boundary addresses readable. */
+.recording-fidelity { margin-bottom: var(--s4); }
+.review-counts { font-size: var(--fs-13); color: var(--text); }
+.boundary-observations td { vertical-align: top; }
+.boundary-observations code, .boundary-observations .hint { overflow-wrap: anywhere; }
+.boundary-observations td:nth-child(2) { max-width: 24rem; }
+.boundary-observations td:nth-child(4) { max-width: 22rem; }
