@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { useQuery } from "@tanstack/react-query";
 import { api, type RunSummaryRow } from "../lib/api";
 import RunsPage from "./RunsPage";
+import { RunListResult } from "../components/Result";
 
 vi.mock("@tanstack/react-query", () => ({ useQuery: vi.fn(), keepPreviousData: vi.fn() }));
 vi.mock("../lib/systems", () => ({ useSystems: () => ({ all: [{ name: "example-system" }] }) }));
@@ -32,7 +33,10 @@ describe("run history navigation", () => {
     expect(html).toContain("older-candidate");
     expect(html).toContain("1 of 1");
     expect(html).toContain("runs on this page");
-    expect(html).toContain("vs baseline: pass");
+    expect(html).toContain("PR: no new blocking diff");
+    expect(html).toContain("Recording: differs");
+    expect(html.indexOf("PR: no new blocking diff")).toBeLessThan(html.indexOf("Recording: differs"));
+    expect(html).not.toContain(">diverged</span>");
     expect(html).toContain("exact-baseline");
     expect(html).toContain("shared drift");
     expect(html).not.toContain("main: pass");
@@ -63,5 +67,44 @@ describe("run history navigation", () => {
     expect(url.searchParams.get("system")).toBe("example-system");
     expect(url.searchParams.get("q")).toBe("PR #42 & 100%");
     expect(url.searchParams.get("cursor")).toBe(cursor);
+  });
+});
+
+
+describe("separate PR impact and recording fidelity", () => {
+  const chip = (over: Partial<RunSummaryRow> = {}) => renderToStaticMarkup(<RunListResult run={{ ...row, ...over }} />);
+
+  it.each([
+    ["pass", "no new blocking diff"], ["acknowledged", "changes acknowledged"], ["fail", "differences to review"],
+    ["pending", "pending"], ["refused", "not comparable"], ["unknown", "unavailable"], [null, "unavailable"],
+  ] as const)("names a %s baseline result separately from recording drift", (delta_verdict, label) => {
+    const html = chip({ delta_verdict });
+    expect(html).toContain(`PR: ${label}`);
+    expect(html).toContain("Recording: differs");
+    expect(html).not.toContain(">diverged</span>");
+    if (!["pass", "acknowledged"].includes(delta_verdict ?? "")) expect(html).not.toContain("tone-good");
+  });
+
+  it("does not turn a failed, unscored, zero-request or inconclusive run green from a stale delta", () => {
+    for (const over of [
+      { state: "failed", failure: { message: "candidate startup failed" } },
+      { state: "running" }, { scorecard_digest: null },
+      { scorecard_digest: { ...row.scorecard_digest!, pass: true, total_correlations: 0 } },
+      { scorecard_digest: { ...row.scorecard_digest!, inconclusive: true } },
+    ]) {
+      const html = chip(over);
+      expect(html).not.toContain("tone-good");
+      expect(html).not.toContain("no new blocking diff");
+    }
+  });
+
+  it("does not assign a PR outcome to reference or unpaired runs", () => {
+    const baseline = chip({ params: { ...row.params, purpose: "baseline", delta_against: undefined } });
+    expect(baseline).toContain("baseline reference");
+    expect(baseline).toContain("Recording: differs");
+    expect(baseline).not.toContain("PR:");
+    const unpaired = chip({ params: { ...row.params, delta_against: undefined } });
+    expect(unpaired).toContain("recording differs");
+    expect(unpaired).not.toContain("no new blocking diff");
   });
 });

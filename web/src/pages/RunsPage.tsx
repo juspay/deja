@@ -10,7 +10,7 @@ import {
   resultOf,
   whatHappened,
 } from "../lib/result";
-import { ResultChip } from "../components/Result";
+import { RunListResult } from "../components/Result";
 import { KillRun } from "../components/KillRun";
 import { useSystems } from "../lib/systems";
 import { MERGE_QUEUE, changeOf } from "../lib/scope";
@@ -102,12 +102,12 @@ export default function RunsPage() {
         <select
           value={filter}
           onChange={(e) => update("result", e.target.value)}
-          aria-label="filter this page by result"
+          aria-label="filter this page by recording outcome or run status"
         >
-          <option value="">all results on this page</option>
+          <option value="">all recording outcomes on this page</option>
           {RESULT_STATES.map((s) => (
             <option key={s} value={s}>
-              {s.toLowerCase().replace("_", " ")}
+              {s === "DIVERGED" ? "recording differs" : s === "REPRODUCED" ? "recording reproduced" : s.toLowerCase().replace("_", " ")}
             </option>
           ))}
         </select>
@@ -119,15 +119,16 @@ export default function RunsPage() {
         </span>
       </div>
 
+      <p className="hint">PR impact compares with the named baseline. Recording fidelity compares with the captured traffic.</p>
       {!loading && runs.error && <p className="err">{String(runs.error)} — could not load run history.</p>}
       <div className="runlist" aria-busy={loading}>
         <div className="runrow runhead" aria-hidden="true">
           <span>when</span>
-          <span>result</span>
+          <span>PR impact / run status</span>
           <span>pull request · label</span>
           <span>candidate</span>
           <span>recording</span>
-          <span>what happened</span>
+          <span>recording / run details</span>
           <span className="num">role</span>
           {/* The action column. Reserved on every row, occupied only on the
               ones that are still running, so the columns above never shift. */}
@@ -135,7 +136,6 @@ export default function RunsPage() {
         </div>
 
         {rows.map((r) => {
-          const res = resultOf(r);
           const cand = candidateRef(r);
           const said = whatHappened(r);
           const purpose = runParams(r)?.purpose;
@@ -157,14 +157,7 @@ export default function RunsPage() {
               >
                 <span className="rl-when">{t.short}</span>
                 <span className="rl-result">
-                  <ResultChip result={res} />
-                  {/* A baseline-relative result is separate from fidelity to
-                      the recording. Its baseline is the exact named run. */}
-                  {r.delta_verdict && (
-                    <span className={`chip delta ${r.delta_verdict}`} title={`Compared with baseline ${runParams(r)?.delta_against ?? "not published"}; separate from reproduction of the recording`}>
-                      vs baseline: {r.delta_verdict}
-                    </span>
-                  )}
+                  <RunListResult run={r} />
                 </span>
                 <span className="rl-change" title={change ?? undefined}>{change ?? "—"}</span>
                 <span className="rl-cand mono" title={cand.full}>
@@ -204,7 +197,7 @@ export default function RunsPage() {
         <button className="btn" disabled={loading || !!runs.error || !runs.data?.next_cursor} onClick={() => update("cursor", runs.data?.next_cursor ?? "")}>
           Older runs
         </button>
-        <span className="hint">System and search cover all history. The result filter applies to this page.</span>
+        <span className="hint">System and search cover all history. The recording outcome filter applies to this page.</span>
       </nav>
     </>
   );

@@ -345,10 +345,10 @@ pre.jsonblock.clamped::after { content: ""; position: absolute; left: 0; right: 
   border-radius: var(--r-sm); padding: var(--s2) var(--s3); font: inherit; font-size: var(--fs-13);
 }
 .runlist { border: 1px solid var(--border); border-radius: var(--r-md); overflow-x: auto; overflow-y: hidden; }
-.runlist > .runrow, .runlist > .runrowwrap { min-width: 1142px; }
+.runlist > .runrow, .runlist > .runrowwrap { min-width: 1214px; }
 .runrow {
   display: grid; align-items: center;
-  grid-template-columns: 90px 118px minmax(180px, 1.6fr) minmax(130px, 1fr) minmax(110px, 0.8fr) minmax(200px, 2fr) 74px 132px;
+  grid-template-columns: 90px 190px minmax(180px, 1.6fr) minmax(130px, 1fr) minmax(110px, 0.8fr) minmax(200px, 2fr) 74px 132px;
   gap: var(--s3); padding: var(--s2) var(--s3); font-size: var(--fs-12);
   color: var(--text-muted); text-decoration: none; border-bottom: 1px solid var(--border-muted);
 }
@@ -1038,7 +1038,8 @@ main:has(.recintro) { max-width: 1440px; }
 .delta-baseline-note { border-left: 3px solid var(--purple); padding-left: var(--s3); margin: 0 0 var(--s3); }
 .delta-baseline-note b { color: var(--purple); }
 .delta-baseline-verdict { margin: calc(-1 * var(--s2)) 0 var(--s3); }
-.rl-result { display: inline-flex; gap: var(--s1); align-items: center; flex-wrap: wrap; }
+.runrow > .rl-result { display: flex; flex-direction: column; gap: var(--s1); align-items: flex-start; white-space: normal; }
+.recording-outcome { font-size: var(--fs-11); color: var(--text-muted); }
 .chip.delta { font-size: var(--fs-11); }
 
 /* ==========================================================================
