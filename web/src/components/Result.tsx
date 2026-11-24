@@ -26,9 +26,9 @@ export function RunListResult({ run }: { run: ScoredRun }) {
       : <ResultChip result={{ ...result, label: `recording ${fidelity}` }} />;
   }
   const impact = run.delta_verdict === "pass" ? { label: "no new blocking diff", tone: "good" }
-    : run.delta_verdict === "acknowledged" ? { label: "changes acknowledged", tone: "good" }
+    : run.delta_verdict === "acknowledged" ? { label: "changes acknowledged", tone: "acknowledged" }
     : run.delta_verdict === "fail" ? { label: "differences to review", tone: "bad" }
-    : run.delta_verdict === "pending" ? { label: "pending", tone: "neutral" }
+    : run.delta_verdict === "pending" ? { label: "pending", tone: "warn" }
     : run.delta_verdict === "refused" ? { label: "not comparable", tone: "warn" }
     : { label: "unavailable", tone: "warn" };
   return <>

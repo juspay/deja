@@ -75,14 +75,15 @@ describe("separate PR impact and recording fidelity", () => {
   const chip = (over: Partial<RunSummaryRow> = {}) => renderToStaticMarkup(<RunListResult run={{ ...row, ...over }} />);
 
   it.each([
-    ["pass", "no new blocking diff"], ["acknowledged", "changes acknowledged"], ["fail", "differences to review"],
-    ["pending", "pending"], ["refused", "not comparable"], ["unknown", "unavailable"], [null, "unavailable"],
-  ] as const)("names a %s baseline result separately from recording drift", (delta_verdict, label) => {
+    ["pass", "no new blocking diff", "good"], ["acknowledged", "changes acknowledged", "acknowledged"], ["fail", "differences to review", "bad"],
+    ["pending", "pending", "warn"], ["refused", "not comparable", "warn"], ["unknown", "unavailable", "warn"], [null, "unavailable", "warn"],
+  ] as const)("names a %s baseline result separately from recording drift", (delta_verdict, label, tone) => {
     const html = chip({ delta_verdict });
     expect(html).toContain(`PR: ${label}`);
     expect(html).toContain("Recording: differs");
     expect(html).not.toContain(">diverged</span>");
-    if (!["pass", "acknowledged"].includes(delta_verdict ?? "")) expect(html).not.toContain("tone-good");
+    expect(html).toContain(`tone-${tone}`);
+    if (delta_verdict !== "pass") expect(html).not.toContain("tone-good");
   });
 
   it("does not turn a failed, unscored, zero-request or inconclusive run green from a stale delta", () => {

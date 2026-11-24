@@ -134,7 +134,7 @@ export default function AcknowledgePage() {
         <span className="done">1 · {groups.length} blocking shapes in {requestsOf(groups)} requests</span>
         <span className={step > 2 ? "done" : step === 2 ? "now" : ""}>2 · the author marks what is intended</span>
         <span className={step > 3 ? "done" : step === 3 ? "now" : ""}>3 · a second person acknowledges</span>
-        <span className={step === 4 ? "done" : ""}>4 · the Deja delta is accepted</span>
+        <span className={step === 4 ? effective === "acknowledged" ? "acknowledged" : "done" : ""}>4 · the Deja delta is accepted</span>
       </div>
       {informational > 0 && <p className="hint">{informational} informational PR observation{informational === 1 ? "" : "s"} remain in the report and require no acknowledgment.</p>}
       <p className="hint">This decision changes Deja's effective delta. GitHub check requirements are configured separately.</p>
@@ -265,7 +265,7 @@ export default function AcknowledgePage() {
           <div className="ack-card">
             <h3>Where it stands</h3>
             <dl>
-              <dt>effective delta</dt><dd><span className={`chip solid ${effective === "fail" ? "fail" : "pass"}`}>{effective}</span>{effective === "fail" && <span className="hint"> until every blocking shape is acknowledged</span>}</dd>
+              <dt>effective delta</dt><dd><span className={`chip solid ${effective === "acknowledged" ? "acknowledged" : effective === "pass" ? "pass" : "fail"}`}>{effective}</span>{effective === "fail" && <span className="hint"> until every blocking shape is acknowledged</span>}</dd>
               <dt>acknowledged</dt><dd>{done.length} shapes · {v.acknowledged ?? 0} rows</dd>
               <dt>proposed</dt><dd>{groups.filter((g) => g.ack?.state === "proposed").length} shapes · {v.proposed ?? 0} rows</dd>
               <dt>stale</dt><dd>{groups.filter((g) => g.ack?.state === "stale").length} shapes · {v.stale ?? 0} rows</dd>
