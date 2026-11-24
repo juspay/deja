@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 
 use config::{Config, Environment, File, FileFormat};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// The declared configuration: which system is default, and one declaration
 /// per system.
@@ -233,6 +233,35 @@ pub struct SystemDeclaration {
     /// `http_incoming = "bag:$.payment_methods_enabled[],$.payment_methods_enabled[].card_networks[]"`
     #[serde(default)]
     pub reply_canons: Option<std::collections::BTreeMap<String, String>>,
+    /// Review-only semantic dimensions. Selectors name evidence, never host-to-
+    /// provider mappings, and do not alter comparison or acknowledgment scope.
+    #[serde(default)]
+    pub review_identity: Option<ReviewIdentityDeclaration>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewIdentityDeclaration {
+    #[serde(default)]
+    pub connector: Vec<ReviewIdentitySelector>,
+    #[serde(default)]
+    pub flow: Vec<ReviewIdentitySelector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReviewIdentitySelector {
+    Argument {
+        boundary: String,
+        pointer: String,
+    },
+    Header {
+        boundary: String,
+        pointer: String,
+        name: String,
+    },
+    GraphField {
+        field: String,
+    },
 }
 
 /// A list, from either a TOML array or a comma-separated string.
@@ -638,5 +667,35 @@ s3_bucket = "ucs-deja"
         // Borrowing one system's recordings under another's name would not fail;
         // it would answer confidently and wrongly.
         assert_eq!(bucket("nope"), None);
+    }
+}
+
+#[cfg(test)]
+mod review_identity_declaration_tests {
+    use super::*;
+    #[test]
+    fn review_selectors_are_declared_data_without_system_or_provider_mapping() {
+        let config = Config::builder()
+            .add_source(File::from_str(
+                r#"
+            [systems.example.review_identity]
+            connector = [{kind="header", boundary="rpc", pointer="/headers", name="x-provider"}]
+            flow = [{kind="graph_field", field="operation_kind"}]
+        "#,
+                FileFormat::Toml,
+            ))
+            .build()
+            .unwrap();
+        let settings: Settings = config.try_deserialize().unwrap();
+        let declaration = settings.systems["example"]
+            .review_identity
+            .as_ref()
+            .unwrap();
+        assert!(
+            matches!(&declaration.connector[0], ReviewIdentitySelector::Header { name, .. } if name == "x-provider")
+        );
+        assert!(
+            matches!(&declaration.flow[0], ReviewIdentitySelector::GraphField { field } if field == "operation_kind")
+        );
     }
 }

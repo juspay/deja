@@ -421,6 +421,7 @@ fn app_router(state: AppState) -> Router {
         .route("/runs/{run_id}/http-diffs", get(v1_http_diffs))
         .route("/runs/{run_id}/graph", get(v1_graph))
         .route("/runs/{run_id}/change-coverage", get(v1_change_coverage))
+        .route("/runs/{run_id}/review-context", get(v1_review_context))
         .route("/runs/{run_id}/tree", get(v1_tree))
         .route("/runs/{run_id}/delta", get(v1_delta))
         .route(
@@ -2220,6 +2221,9 @@ async fn v1_list_runs(State(st): State<AppState>) -> Response {
 
 #[derive(serde::Deserialize, Default)]
 struct RunPageQuery {
+    repo: Option<String>,
+    pr: Option<u64>,
+    head: Option<String>,
     system: Option<String>,
     q: Option<String>,
     cursor: Option<String>,
@@ -2254,16 +2258,32 @@ async fn v1_run_page(
     if system.is_some_and(|s| s.len() > 256) || search.is_some_and(|s| s.len() > 512) {
         return error_resp(400, "run history filter is too long");
     }
+    if q.repo
+        .as_deref()
+        .is_some_and(|repo| !deja_orchestrator::source_control::valid_repo(repo))
+        || q.pr == Some(0)
+        || q.head.as_deref().is_some_and(|head| {
+            !(7..=40).contains(&head.len()) || !head.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+    {
+        return error_resp(400, "invalid repository, PR number or captured head filter");
+    }
+    let filter = deja_store::RunHistoryFilter {
+        system: system.map(str::to_owned),
+        search: search.map(str::to_owned),
+        repo: q.repo,
+        pr_number: q.pr,
+        head_sha: q.head,
+    };
     let limit = i64::from(q.limit.unwrap_or(50).clamp(1, 100));
     let store = match require_store(&st) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
     match store
-        .page_run_summaries(
+        .filtered_run_summaries(
             deja_orchestrator::default_system(),
-            system,
-            search,
+            &filter,
             cursor.as_ref(),
             limit + 1,
         )
@@ -2287,6 +2307,55 @@ async fn v1_run_page(
         }
         Err(e) => error_resp(500, &format!("page runs: {e}")),
     }
+}
+
+/// Captured identity and a separate, timestamped source-host read. An older
+/// run is never upgraded to "current" using its own immutable metadata.
+async fn v1_review_context(State(st): State<AppState>, id: RunId) -> Response {
+    use deja_orchestrator::source_control;
+    let params = match run_params_read(&st, &id).await {
+        Ok(Some(params)) => params,
+        Ok(None) => return error_resp(404, "run not found"),
+        Err(e) => return error_resp(503, &e),
+    };
+    let source =
+        source_control::candidate_source_revision(&params.candidate_spec, params.github.as_ref())
+            .and_then(|revision| {
+                if let Some(repo) = params.candidate_repo.as_deref() {
+                    source_control::validate_source_repository(
+                        repo.trim(),
+                        &params.candidate_spec,
+                        params.github.as_ref(),
+                    )?;
+                }
+                Ok(revision)
+            });
+    let Some(gh) = params.github else {
+        return json_ok(
+            serde_json::json!({ "github": null, "source_revision": source.as_ref().ok(), "source_unavailable": source.err(), "current_head": null, "heads": [] }),
+        );
+    };
+    if !source_control::valid_repo(&gh.repo) || gh.pr_number == 0 {
+        return error_resp(400, "stored pull request identity is invalid");
+    }
+    let (heads, heads_unavailable) = match &st.store {
+        Some(store) => match store.pr_run_heads(&gh.repo, gh.pr_number).await {
+            Ok(heads) => (heads, None),
+            Err(_) => (Vec::new(), Some("Stored replay history could not be read")),
+        },
+        None => (Vec::new(), Some("Stored replay history is unavailable")),
+    };
+    let repo = gh.repo.clone();
+    let number = gh.pr_number;
+    let current =
+        tokio::task::spawn_blocking(move || source_control::current_pr_head(&repo, number)).await;
+    let current = current.unwrap_or_else(|_| source_control::CurrentHead::Unavailable {
+        reason: "The source-host verification task did not complete".into(),
+        checked_at: chrono::Utc::now().to_rfc3339(),
+    });
+    json_ok(
+        serde_json::json!({ "github": gh, "source_revision": source.as_ref().ok(), "source_unavailable": source.err(), "current_head": current, "heads": heads, "heads_unavailable": heads_unavailable }),
+    )
 }
 
 /// The worker's live file-store snapshot as the `live` sub-object.
@@ -2963,25 +3032,129 @@ fn read_jsonl_artifact(
     Ok(Some(rows))
 }
 
-/// Serve a JSON-lines artifact the run published, or name why it is not here.
-async fn serve_jsonl_artifact(
-    st: &AppState,
-    id: &str,
-    kind: &artifact_kinds::RunArtifactKind,
-) -> Response {
-    hydrate_run_artifacts(st, id).await;
-    match read_jsonl_artifact(&kind.path(&st.root, id), kind.name) {
-        Ok(Some(rows)) => json_ok(serde_json::Value::Array(rows)),
-        Ok(None) => absent_artifact(st, id, kind.name).await,
-        Err(e) => error_resp(500, &e),
+/// Add inspection metadata without reserializing away unknown artifact fields,
+/// changing captured values, or recomputing any scoring decision.
+fn call_display_views(
+    mut rows: Vec<serde_json::Value>,
+    observations: &[deja::ObservedCall],
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut calls = rows
+        .iter()
+        .map(|row| {
+            // Runtime joins need only captured operands and exact addresses.
+            // Decode that stable subset rather than today's interpretation of
+            // opaque future scoring/runtime/inspection publications.
+            let mut view = serde_json::Map::new();
+            for key in [
+                "boundary",
+                "trait_name",
+                "method_name",
+                "kind",
+                "blocking",
+                "correlation_id",
+                "source_event_global_sequence",
+                "served_event_global_sequence",
+            ] {
+                if let Some(value) = row.get(key) {
+                    view.insert(key.to_owned(), value.clone());
+                }
+            }
+            for key in ["recorded", "observed"] {
+                if let Some(side) = row.get(key).and_then(serde_json::Value::as_object) {
+                    let mut captured = serde_json::Map::new();
+                    for field in [
+                        "args",
+                        "result",
+                        "graph_node_id",
+                        "span_path",
+                        "call_file",
+                        "call_line",
+                        "call_column",
+                    ] {
+                        if let Some(value) = side.get(field) {
+                            captured.insert(field.to_owned(), value.clone());
+                        }
+                    }
+                    view.insert(key.to_owned(), serde_json::Value::Object(captured));
+                }
+            }
+            serde_json::from_value(serde_json::Value::Object(view))
+        })
+        .collect::<Result<Vec<divergence::ledger::CallRecord>, _>>()
+        .map_err(|_| "published call ledger has an invalid shape".to_owned())?;
+    divergence::ledger::enrich_runtime(&mut calls, observations);
+    for (row, call) in rows.iter_mut().zip(calls) {
+        for (key, captured) in [("recorded", call.recorded), ("observed", call.observed)] {
+            let Some(captured) = captured else {
+                continue;
+            };
+            let Some(side) = row.get_mut(key).and_then(serde_json::Value::as_object_mut) else {
+                continue;
+            };
+            if !side.contains_key("inspection") {
+                let inspection = divergence::inspection::CallInspection::from_values(
+                    captured.args.as_ref(),
+                    captured.result.as_ref(),
+                );
+                if let Some(inspection) = inspection {
+                    side.insert(
+                        "inspection".to_owned(),
+                        serde_json::to_value(inspection).map_err(|_| {
+                            "call inspection evidence could not be serialized".to_owned()
+                        })?,
+                    );
+                }
+            }
+            if !side.contains_key("runtime") {
+                if let Some(runtime) = captured.runtime {
+                    side.insert(
+                        "runtime".to_owned(),
+                        serde_json::to_value(runtime).map_err(|_| {
+                            "call runtime evidence could not be serialized".to_owned()
+                        })?,
+                    );
+                }
+            }
+        }
     }
+    Ok(rows)
 }
 
 /// `GET /api/v1/runs/{id}/calls` — the per-call divergence ledger (recorded vs
 /// observed, classified + located) that backs the interactive diff view, as the
-/// run published it. A published empty ledger is a run that made no calls.
+/// run published it, with additive display metadata. Runtime enrichment requires
+/// one exact observation; decoded inspection documents use the shared parser.
+/// Neither changes the artifact, captured operands, or its published verdict.
 async fn v1_calls(State(st): State<AppState>, id: RunId) -> Response {
-    serve_jsonl_artifact(&st, &id, &artifact_kinds::CALL_LEDGER).await
+    hydrate_run_artifacts(&st, &id).await;
+    let ledger = artifact_kinds::CALL_LEDGER.path(&st.root, &id);
+    let observed = confined(st.root.observed_path(&id), &st.root.root.join("observed"));
+    let result = tokio::task::spawn_blocking(move || {
+        let rows = read_jsonl_artifact(&ledger, artifact_kinds::CALL_LEDGER.name)?;
+        rows.map(|rows| {
+            // An unavailable or torn observation stream cannot establish any
+            // runtime fact. The immutable ledger remains inspectable.
+            let observations = observed
+                .as_deref()
+                .and_then(|path| read_jsonl_strict::<deja::DejaRecord>(path).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|record| match record {
+                    deja::DejaRecord::Observed(observation) => Some(*observation),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            call_display_views(rows, &observations)
+        })
+        .transpose()
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(rows))) => json_ok(serde_json::Value::Array(rows)),
+        Ok(Ok(None)) => absent_artifact(&st, &id, artifact_kinds::CALL_LEDGER.name).await,
+        Ok(Err(why)) => error_resp(500, &why),
+        Err(_) => error_resp(500, "call display evidence could not be read"),
+    }
 }
 
 /// `GET /api/v1/runs/{id}/http-diffs` — the kernel's per-request HTTP diffs
@@ -3109,34 +3282,20 @@ async fn v1_graph(State(st): State<AppState>, id: RunId) -> Response {
 }
 
 /// `GET /api/v1/runs/{id}/change-coverage` — did the replay reach what the
-/// candidate changed? Computed on first request from the git host's compare of
-/// the candidate against its base branch and the run's own replay graph and
-/// call ledger, then cached beside the run. Never an error for a run that
-/// cannot be assessed: the body says why, so the report can say "not assessed"
+/// candidate changed? Compare against the named replay baseline's immutable
+/// source, or resolve the configured base ref when no baseline is named. Cache
+/// only against that source SHA and the exact graph/ledger/scope bytes. A run that
+/// cannot be assessed receives a body saying why, so the report says "not assessed"
 /// instead of a reader receiving a 500 from a successful run.
 async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
     use deja_orchestrator::change_coverage::{self, Assessment};
 
     let unavailable = |why: String| json_ok_ser(&Assessment::Unavailable { unavailable: why });
 
-    // The run's own parameters — the live record on compose, the stored row's
-    // params on k8s — name the system and the candidate. The live record is
-    // read through the same containment check as every other file this
-    // handler opens: resolved, and confirmed to lie under the runs directory.
-    let live: Option<Run> = confined(st.root.run_path(&id), &st.root.root.join("runs"))
-        .and_then(|path| deja_orchestrator::read_json::<Run>(&path).ok());
-    let params: Option<deja_orchestrator::RunParams> = match live {
-        Some(run) => Some(deja_orchestrator::RunParams::resolved(&run.spec, None)),
-        None => match &st.store {
-            Some(store) => match store.get_run(&id).await {
-                Ok(Some(row)) => serde_json::from_value(row.params).ok(),
-                _ => None,
-            },
-            None => None,
-        },
-    };
-    let Some(params) = params else {
-        return error_resp(404, "run not found");
+    let params = match run_params_read(&st, &id).await {
+        Ok(Some(params)) => params,
+        Ok(None) => return error_resp(404, "run not found"),
+        Err(e) => return unavailable(e),
     };
 
     // The evidence files, and the cache beside them. Each path is resolved and
@@ -3155,12 +3314,6 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
     };
     let ledger_path = confined(st.root.call_ledger_path(&id), &runs_dir);
     let cache = deja_orchestrator::change_coverage_cache_of(&observed_path);
-    if let Ok(cached) = std::fs::read_to_string(&cache) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&cached) {
-            return json_ok(value);
-        }
-    }
-
     let system = params
         .system_under_test
         .clone()
@@ -3178,6 +3331,13 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
             "no source repository is declared for system '{system}': set systems.{system}.source_repo (owner/name) in the deja configuration, or send candidate_repo on the run"
         ));
     };
+    if let Err(why) = deja_orchestrator::source_control::validate_source_repository(
+        &repo,
+        &params.candidate_spec,
+        params.github.as_ref(),
+    ) {
+        return unavailable(why);
+    }
     let Some(template) = std::env::var("DEJA_CANDIDATE_TARBALL_URL")
         .ok()
         .and_then(nonempty)
@@ -3187,49 +3347,118 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
                 .to_owned(),
         );
     };
-    let sha = match deja_orchestrator::executor::resolve_candidate_image_for(
+    let revision = match deja_orchestrator::source_control::candidate_source_revision(
         &params.candidate_spec,
-        &system,
+        params.github.as_ref(),
     ) {
-        Ok((_, sha)) => sha,
-        Err(e) => return unavailable(format!("the candidate does not name a build sha: {e}")),
+        Ok(revision) => revision,
+        Err(e) => return unavailable(e),
     };
-    let base_ref = config.change_base_ref.clone();
-
-    let computed = tokio::task::spawn_blocking(
-        move || -> Result<change_coverage::ChangeCoverage, String> {
-            let replay: Vec<deja_core::ExecutionGraphNode> = std::fs::File::open(&observed_path)
-                .map(|file| {
-                    std::io::BufRead::lines(std::io::BufReader::new(file))
-                        .map_while(Result::ok)
-                        .filter_map(
-                            |line| match serde_json::from_str::<deja::DejaRecord>(&line) {
-                                Ok(deja::DejaRecord::GraphNode(node)) => Some(*node),
-                                _ => None,
-                            },
-                        )
-                        .collect()
-                })
-                .map_err(|e| format!("the run's replay graph could not be read: {e}"))?;
-            if replay.is_empty() {
-                return Err("the run published no replay execution graph, so there is no evidence of what ran".to_owned());
+    let sha = revision.sha;
+    let configured_base_ref = config.change_base_ref.clone();
+    let named_base = if let Some(baseline_run) = params.delta_against.as_deref() {
+        if baseline_run == id.as_str() {
+            return unavailable("The run names itself as its coverage baseline".into());
+        }
+        let baseline = match run_params_read(&st, baseline_run).await {
+            Ok(Some(params)) => params,
+            Ok(None) => return unavailable("The named baseline run is unavailable; coverage cannot substitute the current base branch".into()),
+            Err(e) => return unavailable(format!("The named baseline source could not be read: {e}")),
+        };
+        // A current deployment default cannot retroactively establish the
+        // source repository of a historical baseline lacking captured binding.
+        let baseline_repo =
+            baseline
+                .candidate_repo
+                .clone()
+                .or_else(|| match &baseline.candidate_spec {
+                    deja_orchestrator::CandidateSpec::RepoSha { repo, .. } => Some(repo.clone()),
+                    _ => baseline.github.as_ref().map(|gh| gh.repo.clone()),
+                });
+        let Some(baseline_repo) = baseline_repo else {
+            return unavailable(
+                "The named baseline has no captured source repository binding".into(),
+            );
+        };
+        if let Err(e) = deja_orchestrator::source_control::validate_source_repository(
+            &baseline_repo,
+            &baseline.candidate_spec,
+            baseline.github.as_ref(),
+        ) {
+            return unavailable(format!("The named baseline source is inconsistent: {e}"));
+        }
+        let baseline_revision = match deja_orchestrator::source_control::candidate_source_revision(
+            &baseline.candidate_spec,
+            baseline.github.as_ref(),
+        ) {
+            Ok(revision) => revision,
+            Err(e) => return unavailable(format!("The named baseline source is unavailable: {e}")),
+        };
+        Some(change_coverage::NamedCoverageBase {
+            run_id: baseline_run.to_owned(),
+            repo: baseline_repo,
+            source_ref: baseline_revision.sha,
+        })
+    } else {
+        None
+    };
+    let scorecard_path = confined(st.root.scorecard_path(&id), &runs_dir);
+    let mut scorecard: Option<serde_json::Value> =
+        scorecard_path.and_then(|path| deja_orchestrator::read_json(&path).ok());
+    if scorecard.is_none() {
+        if let Some(store) = &st.store {
+            scorecard = store
+                .get_run(&id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.scorecard);
+        }
+    }
+    let scope = match scorecard
+        .as_ref()
+        .ok_or_else(|| "The run published no scorecard request scope".to_owned())
+        .and_then(change_coverage_request_scope)
+    {
+        Ok(scope) => scope,
+        Err(e) => return unavailable(e),
+    };
+    let cache_for_read = cache.clone();
+    let computed =
+        tokio::task::spawn_blocking(move || -> Result<change_coverage::ChangeCoverage, String> {
+            let base = change_coverage::resolve_coverage_base(
+                &repo,
+                &configured_base_ref,
+                named_base.as_ref(),
+            )?;
+            let ledger_path = ledger_path.ok_or_else(|| {
+                "The run published no call ledger; changed-feature evidence is unavailable"
+                    .to_owned()
+            })?;
+            let inputs =
+                change_coverage::CoverageInputs::read(&observed_path, &ledger_path, &scope)?;
+            if let Ok(cached) = std::fs::read_to_string(&cache_for_read) {
+                if let Ok(Assessment::Assessed(mut coverage)) =
+                    serde_json::from_str::<Assessment>(&cached)
+                {
+                    if inputs.cache_matches(&coverage, &repo, &sha, &base) {
+                        // Preserve the assessment while publishing this read's
+                        // fresh base-ref resolution timestamp/provenance.
+                        coverage.base = Some(base);
+                        return Ok(coverage);
+                    }
+                }
             }
-            let calls: Vec<serde_json::Value> = ledger_path
-                .and_then(|path| std::fs::read_to_string(path).ok())
-                .map(|content| {
-                    content
-                        .lines()
-                        .filter(|l| !l.trim().is_empty())
-                        .filter_map(|l| serde_json::from_str(l).ok())
-                        .collect()
-                })
-                .unwrap_or_default();
-            let evidence = change_coverage::Evidence::from_graph_and_calls(&replay, &calls);
-            let change = change_coverage::fetch_change_set(&repo, &base_ref, &sha, &template)?;
-            Ok(change_coverage::assess(&system, &repo, &base_ref, change, &evidence))
-        },
-    )
-    .await;
+            let evidence = inputs.evidence()?;
+            let change =
+                change_coverage::fetch_change_set(&repo, &base.resolved_sha, &sha, &template)?;
+            let mut coverage =
+                change_coverage::assess(&system, &repo, &base.declared_ref, change, &evidence);
+            coverage.base = Some(base);
+            coverage.inputs_digest = inputs.digest;
+            Ok(coverage)
+        })
+        .await;
     let assessment = match computed {
         Ok(Ok(coverage)) => Assessment::Assessed(coverage),
         Ok(Err(why)) => Assessment::Unavailable { unavailable: why },
@@ -3245,6 +3474,32 @@ async fn v1_change_coverage(State(st): State<AppState>, id: RunId) -> Response {
         }
     }
     json_ok_ser(&assessment)
+}
+
+fn change_coverage_request_scope(scorecard: &serde_json::Value) -> Result<Vec<String>, String> {
+    let values = scorecard.get("correlation_scope").and_then(|scope| scope.as_array())
+        .ok_or_else(|| "The scorecard does not publish an admitted request scope; observed background correlations cannot be counted as driven requests".to_owned())?;
+    let mut scope = std::collections::BTreeSet::new();
+    for value in values {
+        let id = value
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "The published request scope is malformed".to_owned())?;
+        if !scope.insert(id.to_owned()) {
+            return Err("The published request scope contains duplicate request IDs".into());
+        }
+    }
+    if scope.is_empty() {
+        return Err("No requests were admitted; changed-feature execution is unproven".into());
+    }
+    if scorecard
+        .pointer("/summary/total_correlations")
+        .and_then(|v| v.as_u64())
+        != Some(scope.len() as u64)
+    {
+        return Err("The published request scope and scorecard request denominator disagree; changed-feature coverage is unavailable".into());
+    }
+    Ok(scope.into_iter().collect())
 }
 
 /// Why a run has no behaviour tree, or a pair of runs no delta. The two kinds
@@ -3558,6 +3813,201 @@ struct DeltaQuery {
     against: Option<String>,
 }
 
+/// Review identities are a display projection of captured facts under the
+/// deployment's explicit selectors. They are not part of the cached delta,
+/// comparison identities, or acknowledgment scope.
+fn review_identity_from_files(
+    ledger: &std::path::Path,
+    observed: Option<&std::path::Path>,
+    declaration: &deja_compactor::settings::ReviewIdentityDeclaration,
+) -> deja_orchestrator::review_identity::IdentityPublication {
+    use deja_orchestrator::review_identity::{self, EvidenceSide};
+
+    let mut notes = Vec::new();
+    let calls = match read_jsonl_strict::<divergence::ledger::CallRecord>(ledger) {
+        Ok(calls) => calls,
+        Err(_) => {
+            let mut publication =
+                review_identity::project(&[], &[], Some(declaration), EvidenceSide::Observed);
+            publication.notes.push(
+                "The call ledger could not be read completely; semantic identity is unavailable."
+                    .to_owned(),
+            );
+            return publication;
+        }
+    };
+    let needs_graph = declaration
+        .connector
+        .iter()
+        .chain(&declaration.flow)
+        .any(|selector| {
+            matches!(
+                selector,
+                deja_compactor::settings::ReviewIdentitySelector::GraphField { .. }
+            )
+        });
+    let graph = if needs_graph {
+        match observed.map(read_jsonl_strict::<deja::DejaRecord>) {
+            Some(Ok(records)) => records
+                .into_iter()
+                .filter_map(|record| match record {
+                    deja::DejaRecord::GraphNode(node) => Some(*node),
+                    _ => None,
+                })
+                .collect(),
+            _ => {
+                notes.push("The replay graph could not be read completely; graph-field identity selectors have no evidence.".to_owned());
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut publication =
+        review_identity::project(&calls, &graph, Some(declaration), EvidenceSide::Observed);
+    publication.notes.extend(notes);
+    publication
+}
+
+async fn review_identity_for(
+    st: &AppState,
+    id: &str,
+) -> deja_orchestrator::review_identity::IdentityPublication {
+    use deja_orchestrator::review_identity::{self, EvidenceSide};
+
+    let unknown = |reason: &str| {
+        let mut publication = review_identity::project(&[], &[], None, EvidenceSide::Observed);
+        publication.notes.push(reason.to_owned());
+        publication
+    };
+    let params =
+        match run_params_read(st, id).await {
+            Ok(Some(params)) => params,
+            _ => return unknown(
+                "Stored run metadata is unavailable; no system identity declaration was selected.",
+            ),
+        };
+    let system = deja_orchestrator::system::system_config(
+        params
+            .system_under_test
+            .as_deref()
+            .unwrap_or(deja_orchestrator::default_system()),
+    );
+    if system.error.is_some() {
+        return unknown("The system declaration is invalid; semantic identity is unavailable.");
+    }
+    let Some(declaration) = system.review_identity else {
+        // Undeclared systems do not scan their potentially large artifacts.
+        return review_identity::project(&[], &[], None, EvidenceSide::Observed);
+    };
+    hydrate_run_artifacts(st, id).await;
+    let runs_dir = st.root.root.join("runs");
+    let Some(ledger) = confined(st.root.call_ledger_path(id), &runs_dir) else {
+        return unknown(
+            "The published call ledger is unavailable; semantic identity was not inferred.",
+        );
+    };
+    let observed = confined(st.root.observed_path(id), &st.root.root.join("observed"));
+    tokio::task::spawn_blocking(move || {
+        review_identity_from_files(&ledger, observed.as_deref(), &declaration)
+    })
+    .await
+    .unwrap_or_else(|_| unknown("Semantic identity evidence could not be read."))
+}
+
+#[cfg(test)]
+mod review_identity_publication_tests {
+    use super::*;
+    use deja_compactor::settings::{ReviewIdentityDeclaration, ReviewIdentitySelector};
+
+    fn declaration() -> ReviewIdentityDeclaration {
+        ReviewIdentityDeclaration {
+            connector: vec![ReviewIdentitySelector::Argument {
+                boundary: "transport".into(),
+                pointer: "/connector".into(),
+            }],
+            flow: vec![ReviewIdentitySelector::GraphField {
+                field: "flow".into(),
+            }],
+        }
+    }
+
+    fn ledger_row() -> String {
+        serde_json::json!({
+            "boundary":"transport", "trait_name":"Client", "method_name":"send",
+            "kind":"matched", "blocking":false, "correlation_id":"request-one",
+            "observed":{"args":{"connector":"declared-provider"}, "graph_node_id":7}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn unreadable_graph_preserves_independent_arguments_and_names_the_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = directory.path().join("calls.jsonl");
+        let graph = directory.path().join("observed.jsonl");
+        std::fs::write(&ledger, ledger_row()).unwrap();
+        std::fs::write(&graph, "{torn graph").unwrap();
+        let publication = review_identity_from_files(&ledger, Some(&graph), &declaration());
+        assert_eq!(
+            publication.requests["request-one"]
+                .connector
+                .value
+                .as_deref(),
+            Some("declared-provider")
+        );
+        assert_eq!(publication.requests["request-one"].flow.status, "unknown");
+        assert!(publication.notes.iter().any(|note| note.contains("graph")));
+        assert_eq!(
+            publication.declaration.unwrap().source,
+            "current_deployment"
+        );
+    }
+
+    #[test]
+    fn torn_ledger_never_publishes_a_partial_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let ledger = directory.path().join("calls.jsonl");
+        std::fs::write(&ledger, format!("{}\n{{torn", ledger_row())).unwrap();
+        let publication = review_identity_from_files(&ledger, None, &declaration());
+        assert!(publication.requests.is_empty());
+        assert!(!publication.notes.is_empty());
+    }
+
+    #[test]
+    fn call_display_projection_preserves_unknown_fields_and_scoring_operands() {
+        let mut original: serde_json::Value = serde_json::from_str(&ledger_row()).unwrap();
+        original["future_evidence"] = serde_json::json!({"keep": true});
+        original["observed"]["args"]["document"] =
+            serde_json::json!(r#"{"metadata":{"provider":null}}"#);
+        let views = call_display_views(vec![original.clone()], &[]).unwrap();
+        let displayed = &views[0];
+        assert_eq!(
+            displayed["observed"]["inspection"]["arguments"]["$.document"]["metadata"]["provider"],
+            serde_json::Value::Null
+        );
+        assert_eq!(displayed["future_evidence"], original["future_evidence"]);
+        assert!(displayed["observed"].get("runtime").is_none());
+        let mut without_projection = displayed.clone();
+        without_projection["observed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("inspection");
+        assert_eq!(without_projection, original);
+    }
+
+    #[test]
+    fn call_display_projection_preserves_unknown_inspection_versions() {
+        let mut original: serde_json::Value = serde_json::from_str(&ledger_row()).unwrap();
+        original["observed"]["inspection"] = serde_json::json!({"version": 99, "arguments": "opaque future representation", "future": "keep"});
+        original["observed"]["runtime"] = serde_json::json!({"version": 99, "provenance": "future_dispatch", "outcome": {"future": true}});
+        original["comparison"] = serde_json::json!({"version": 99, "subject": "future_subject", "verdict": {"kind": "future_verdict"}});
+        original["arg_divergence_reach"] = serde_json::json!({"future": "keep"});
+        let views = call_display_views(vec![original.clone()], &[]).unwrap();
+        assert_eq!(views[0], original);
+    }
+}
+
 /// `GET /api/v1/runs/{id}/delta?against={run}` — what this run changed
 /// relative to another run of the same tape, three-way against the tape.
 /// Both runs' tape-relative verdicts ride along so a reader sees the two
@@ -3611,6 +4061,14 @@ async fn v1_delta(
             if declared.as_deref() != Some(&*against) {
                 overlay_acknowledgements(&st, &id, &mut body).await;
             }
+            let (candidate_identity, baseline_identity) = tokio::join!(
+                review_identity_for(&st, &id),
+                review_identity_for(&st, &against),
+            );
+            body["review_identities"] = serde_json::json!({
+                "candidate": candidate_identity,
+                "baseline": baseline_identity,
+            });
             json_ok(body)
         }
         Err(why) => json_ok(why.to_json()),
@@ -6755,6 +7213,23 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    fn changed_feature_coverage_uses_the_published_admitted_denominator() {
+        let published = serde_json::json!({ "correlation_scope": ["request-b", "request-a"], "summary": { "total_correlations": 2 } });
+        assert_eq!(
+            change_coverage_request_scope(&published).unwrap(),
+            vec!["request-a", "request-b"]
+        );
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!({ "correlation_scope": [], "summary": {"total_correlations": 0} }),
+            serde_json::json!({ "correlation_scope": ["a", "a"], "summary": {"total_correlations": 2} }),
+            serde_json::json!({ "correlation_scope": ["a"], "summary": {"total_correlations": 2} }),
+        ] {
+            assert!(change_coverage_request_scope(&invalid).is_err());
+        }
+    }
+
+    #[test]
     fn run_history_cursor_preserves_timestamp_ties_and_rejects_bad_positions() {
         let cursor = run_page_cursor(Some(
             r#"{"created_at":"2026-11-24T08:13:00.123456Z","run_id":"run-b"}"#,
@@ -7260,6 +7735,44 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn calls_api_reads_runtime_from_the_observed_artifact_without_changing_the_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = serde_json::json!({
+            "boundary":"config", "trait_name":"Client", "method_name":"read",
+            "correlation_id":"request", "kind":"value_diverged", "blocking":true,
+            "observed":{"graph_node_id":7, "args":{"key":"same"}}
+        })
+        .to_string();
+        let st = run_with_ledger(
+            dir.path(),
+            "run-provenance",
+            RunStatus::Completed,
+            Some(&row),
+        );
+        let observed = serde_json::json!({
+            "record_kind":"observed", "boundary":"config", "trait_name":"Client",
+            "method_name":"read", "correlation_id":"request", "args":{"key":"same"},
+            "graph_node_id":7, "resolved":true, "provenance":"recorded", "outcome":"substituted"
+        });
+        std::fs::write(
+            st.root.observed_path("run-provenance"),
+            observed.to_string(),
+        )
+        .unwrap();
+        let ledger_path = st.root.call_ledger_path("run-provenance");
+        let response = rt().block_on(async {
+            let response = v1_calls(State(st), "run-provenance".parse().unwrap()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+        });
+        assert_eq!(response[0]["observed"]["runtime"]["outcome"], "substituted");
+        assert_eq!(std::fs::read_to_string(ledger_path).unwrap(), row);
     }
 
     /// A missing ledger is pending while the run can still publish one, and

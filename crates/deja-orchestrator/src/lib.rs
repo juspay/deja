@@ -24,6 +24,7 @@ pub mod lookup;
 pub mod policy;
 pub mod s3;
 pub mod scope;
+pub mod source_control;
 /// The declared configuration, defined in `deja-compactor` and re-exported here
 /// so `crate::settings` keeps meaning what it meant.
 ///
@@ -35,6 +36,7 @@ pub mod scope;
 /// sealer re-deriving the convention from environment variables and drifting the
 /// moment the document changed shape, which is what it was doing.
 pub use deja_compactor::settings;
+pub mod review_identity;
 pub mod store;
 pub mod system;
 

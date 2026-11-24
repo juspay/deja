@@ -6767,6 +6767,7 @@ mod tests {
     /// without a lookup table behind it.
     fn pending_observation(resolved: bool) -> crate::replay::ObservedCall {
         crate::replay::ObservedCall {
+            runtime_metadata_present: false,
             correlation_id: None,
             boundary: "imc".to_string(),
             role: None,
@@ -7135,6 +7136,7 @@ mod tests {
             }
             // Minimal observation; `execute_shadow_observe` fills the result.
             Some(ExecuteShadowToken::new(crate::replay::ObservedCall {
+                runtime_metadata_present: true,
                 outcome: crate::SubstituteOutcome::default(),
                 arg_divergent: false,
                 served_event_global_sequence: None,
@@ -8358,6 +8360,7 @@ mod serve_or_run_tests {
 
     fn token_at(recorded: Option<serde_json::Value>, rank: Option<u8>) -> ExecuteShadowToken {
         ExecuteShadowToken::new(crate::replay::ObservedCall {
+            runtime_metadata_present: true,
             outcome: crate::SubstituteOutcome::default(),
             arg_divergent: false,
             served_event_global_sequence: None,

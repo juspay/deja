@@ -90,6 +90,14 @@ pub struct ChangedItem {
 /// `change_coverage.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChangeCoverage {
+    #[serde(default)]
+    pub assessment_version: u32,
+    #[serde(default)]
+    pub request_scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<CoverageBase>,
+    #[serde(default)]
+    pub inputs_digest: String,
     pub system: String,
     pub repo: String,
     pub base_ref: String,
@@ -108,6 +116,211 @@ pub struct ChangeCoverage {
 pub enum Assessment {
     Assessed(ChangeCoverage),
     Unavailable { unavailable: String },
+}
+
+/// The immutable source base actually used by the Git compare. The declared
+/// ref remains visible, but a moving branch name is never a cache identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageBase {
+    pub source: String,
+    pub declared_ref: String,
+    pub resolved_sha: String,
+    pub resolved_at: String,
+    pub resolution: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_run: Option<String>,
+}
+
+pub struct NamedCoverageBase {
+    pub run_id: String,
+    pub repo: String,
+    pub source_ref: String,
+}
+
+pub fn resolve_coverage_base(
+    repo: &str,
+    configured_ref: &str,
+    named: Option<&NamedCoverageBase>,
+) -> Result<CoverageBase, String> {
+    resolve_coverage_base_with(repo, configured_ref, named, resolve_git_ref)
+}
+
+fn resolve_coverage_base_with(
+    repo: &str,
+    configured_ref: &str,
+    named: Option<&NamedCoverageBase>,
+    mut resolve: impl FnMut(&str, &str) -> Result<String, String>,
+) -> Result<CoverageBase, String> {
+    if !crate::source_control::valid_repo(repo) {
+        return Err("The coverage source repository is invalid".into());
+    }
+    let (source, declared_ref, baseline_run) = match named {
+        Some(named) => {
+            if !named.repo.eq_ignore_ascii_case(repo) {
+                return Err("The named baseline source repository differs from the candidate; changed-feature coverage cannot compare them".into());
+            }
+            (
+                "named_baseline",
+                named.source_ref.as_str(),
+                Some(named.run_id.clone()),
+            )
+        }
+        None => ("configured_ref", configured_ref, None),
+    };
+    if declared_ref.trim().is_empty() || declared_ref.len() > 256 {
+        return Err("The coverage base ref is empty or invalid".into());
+    }
+    let full_commit =
+        declared_ref.len() == 40 && declared_ref.bytes().all(|b| b.is_ascii_hexdigit());
+    let resolved_sha = if full_commit {
+        declared_ref.to_owned()
+    } else {
+        resolve(repo, declared_ref)?
+    };
+    if resolved_sha.len() != 40 || !resolved_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(
+            "The source host did not resolve the coverage base to a full immutable commit".into(),
+        );
+    }
+    if (7..=40).contains(&declared_ref.len())
+        && declared_ref.bytes().all(|b| b.is_ascii_hexdigit())
+        && !resolved_sha
+            .to_ascii_lowercase()
+            .starts_with(&declared_ref.to_ascii_lowercase())
+    {
+        return Err("The resolved coverage base does not match its declared commit prefix".into());
+    }
+    Ok(CoverageBase {
+        source: source.into(),
+        declared_ref: declared_ref.into(),
+        resolved_sha,
+        resolved_at: chrono::Utc::now().to_rfc3339(),
+        resolution: if full_commit {
+            "declared_immutable_commit"
+        } else {
+            "github_commit_lookup"
+        }
+        .into(),
+        baseline_run,
+    })
+}
+
+fn resolve_git_ref(repo: &str, reference: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Commit {
+        sha: String,
+    }
+    // Encode the ref as one path segment, including slashes in branch names.
+    // The origin comes only from trusted deployment configuration.
+    let encoded: String = reference
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    crate::source_control::github_get::<Commit>(&format!("/repos/{repo}/commits/{encoded}"))
+        .map(|commit| commit.sha)
+}
+
+/// A single read of each input. The digest and assessment use these same bytes,
+/// so replacing an artifact between a hash pass and a parse pass cannot bind a
+/// stale assessment to a new artifact's fingerprint.
+pub struct CoverageInputs {
+    graph: Vec<u8>,
+    ledger: Vec<u8>,
+    scope: Vec<String>,
+    pub digest: String,
+}
+
+impl CoverageInputs {
+    pub fn read(
+        graph: &std::path::Path,
+        ledger: &std::path::Path,
+        scope: &[String],
+    ) -> Result<Self, String> {
+        let graph = std::fs::read(graph)
+            .map_err(|_| "The replay graph could not be read completely".to_owned())?;
+        let ledger = std::fs::read(ledger)
+            .map_err(|_| "The call ledger could not be read completely".to_owned())?;
+        Ok(Self::from_bytes(graph, ledger, scope))
+    }
+
+    fn from_bytes(graph: Vec<u8>, ledger: Vec<u8>, scope: &[String]) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut scope = scope.to_vec();
+        scope.sort();
+        scope.dedup();
+        let mut hash = Sha256::new();
+        for (kind, bytes) in [
+            (b"graph".as_slice(), graph.as_slice()),
+            (b"ledger".as_slice(), ledger.as_slice()),
+        ] {
+            hash.update(kind);
+            hash.update((bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        hash.update(b"scope");
+        for id in &scope {
+            hash.update((id.len() as u64).to_be_bytes());
+            hash.update(id.as_bytes());
+        }
+        Self {
+            graph,
+            ledger,
+            scope,
+            digest: hex::encode(hash.finalize()),
+        }
+    }
+
+    pub fn cache_matches(
+        &self,
+        cached: &ChangeCoverage,
+        repo: &str,
+        head: &str,
+        base: &CoverageBase,
+    ) -> bool {
+        cached.assessment_version == 3
+            && cached.repo == repo
+            && cached.head == head
+            && cached.inputs_digest == self.digest
+            && cached.request_scope == self.scope
+            && cached.base.as_ref().is_some_and(|previous| {
+                previous.resolved_sha == base.resolved_sha
+                    && previous.source == base.source
+                    && previous.declared_ref == base.declared_ref
+                    && previous.baseline_run == base.baseline_run
+            })
+    }
+
+    pub fn evidence(&self) -> Result<Evidence, String> {
+        fn jsonl<T: serde::de::DeserializeOwned>(
+            bytes: &[u8],
+            name: &str,
+        ) -> Result<Vec<T>, String> {
+            bytes.split(|b| *b == b'\n').enumerate().filter(|(_, line)| line.iter().any(|b| !b.is_ascii_whitespace()))
+                .map(|(index, line)| serde_json::from_slice(line).map_err(|_| format!("The {name} has an unreadable row at line {}; changed-feature evidence is unavailable", index + 1))).collect()
+        }
+        let replay: Vec<_> = jsonl::<deja::DejaRecord>(&self.graph, "replay graph")?
+            .into_iter()
+            .filter_map(|record| match record {
+                deja::DejaRecord::GraphNode(node) => Some(*node),
+                _ => None,
+            })
+            .collect();
+        if replay.is_empty() {
+            return Err("The run published no replay execution graph".into());
+        }
+        let calls = jsonl::<crate::divergence::ledger::CallRecord>(&self.ledger, "call ledger")?
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "Call-site evidence could not be decoded".to_owned())?;
+        Ok(Evidence::for_request_scope(&replay, &calls, &self.scope))
+    }
 }
 
 // ── which repository ────────────────────────────────────────────────────────
@@ -220,37 +433,12 @@ struct CompareFile {
     patch: Option<String>,
 }
 
-fn github_api_base() -> String {
-    std::env::var("DEJA_GITHUB_API_URL")
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_owned())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "https://api.github.com".to_owned())
-}
-
-/// The compare endpoint: merge-base and the changed files with their patches.
-/// Renamed and deleted files are kept only if they still exist at the head.
+/// The compare endpoint: merge-base and changed files at the declared source.
 fn fetch_compare(repo: &str, base_ref: &str, head: &str) -> Result<CompareResponse, String> {
-    let url = format!(
-        "{}/repos/{repo}/compare/{base_ref}...{head}",
-        github_api_base()
-    );
-    let mut req = crate::codebundle::tarball_agent()
-        .get(&url)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "deja-orchestrator");
-    if let Some(token) = std::env::var("DEJA_GITHUB_TOKEN")
-        .ok()
-        .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty())
-    {
-        req = req.set("Authorization", &format!("Bearer {token}"));
+    if !crate::source_control::valid_repo(repo) {
+        return Err("invalid source repository; expected owner/name".into());
     }
-    let resp = req
-        .call()
-        .map_err(|e| format!("compare {base_ref}...{} on {repo}: {e}", short(head)))?;
-    resp.into_json::<CompareResponse>()
-        .map_err(|e| format!("compare response from {repo}: {e}"))
+    crate::source_control::github_get(&format!("/repos/{repo}/compare/{base_ref}...{head}"))
 }
 
 /// Every `.rs` file and `Cargo.toml` in a codeload-style tarball (paths with
@@ -845,6 +1033,7 @@ fn short(sha: &str) -> &str {
 #[derive(Debug, Default)]
 pub struct Evidence {
     pub driven: usize,
+    request_scope: Vec<String>,
     modules: HashSet<String>,
     spans: HashSet<(String, String)>,
     connectors: HashMap<String, BTreeSet<String>>,
@@ -897,7 +1086,42 @@ impl Evidence {
             }
         }
         ev.driven = correlations.len();
+        ev.request_scope = correlations.into_iter().collect();
+        ev.request_scope.sort();
         ev
+    }
+
+    /// Only the admitted request scope can establish feature reach. Startup
+    /// and background correlations in the same artifact are not driven cases.
+    pub fn for_request_scope(
+        replay: &[deja_core::ExecutionGraphNode],
+        calls: &[serde_json::Value],
+        scope: &[String],
+    ) -> Self {
+        let admitted: HashSet<_> = scope.iter().map(String::as_str).collect();
+        let replay: Vec<_> = replay
+            .iter()
+            .filter(|n| {
+                n.correlation_id
+                    .as_deref()
+                    .is_some_and(|id| admitted.contains(id))
+            })
+            .cloned()
+            .collect();
+        let calls: Vec<_> = calls
+            .iter()
+            .filter(|c| {
+                c.get("correlation_id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|id| admitted.contains(id))
+            })
+            .cloned()
+            .collect();
+        let mut evidence = Self::from_graph_and_calls(&replay, &calls);
+        evidence.driven = admitted.len();
+        evidence.request_scope = admitted.into_iter().map(str::to_owned).collect();
+        evidence.request_scope.sort();
+        evidence
     }
 
     fn module_ran(&self, module: &str) -> bool {
@@ -1158,6 +1382,10 @@ fn finish(
         ));
     }
     ChangeCoverage {
+        assessment_version: 3,
+        request_scope: ev.request_scope.clone(),
+        base: None,
+        inputs_digest: String::new(),
         system: system.to_owned(),
         repo: repo.to_owned(),
         base_ref: base_ref.to_owned(),
@@ -1288,6 +1516,137 @@ impl Payments {
             started_ns: 0,
             closed_ns: None,
         }
+    }
+
+    #[test]
+    fn coverage_base_prefers_the_named_baseline_and_never_falls_back_on_invalid_binding() {
+        let named = NamedCoverageBase {
+            run_id: "baseline-run".into(),
+            repo: "example/repo".into(),
+            source_ref: "a".repeat(10),
+        };
+        let mut reads = Vec::new();
+        let base =
+            resolve_coverage_base_with("example/repo", "main", Some(&named), |repo, reference| {
+                reads.push((repo.to_owned(), reference.to_owned()));
+                Ok("a".repeat(40))
+            })
+            .unwrap();
+        assert_eq!(reads, vec![("example/repo".into(), "a".repeat(10))]);
+        assert_eq!(base.source, "named_baseline");
+        assert_eq!(base.baseline_run.as_deref(), Some("baseline-run"));
+        assert_eq!(base.resolved_sha, "a".repeat(40));
+        assert_eq!(base.resolution, "github_commit_lookup");
+        assert!(!base.resolved_at.is_empty());
+        assert!(
+            resolve_coverage_base_with("other/repo", "main", Some(&named), |_, _| panic!(
+                "must not read the wrong repository"
+            ))
+            .is_err()
+        );
+        assert!(
+            resolve_coverage_base_with("example/repo", "main", Some(&named), |_, _| Ok(
+                "b".repeat(40)
+            ))
+            .is_err()
+        );
+        assert!(
+            resolve_coverage_base_with("example/repo", "main", None, |_, _| Err(
+                "GitHub unavailable".into()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn coverage_cache_is_bound_to_resolved_base_and_every_input_not_a_branch_name() {
+        let scope = vec!["request".to_owned()];
+        let original = CoverageInputs::from_bytes(b"graph".to_vec(), b"ledger".to_vec(), &scope);
+        let first_base =
+            resolve_coverage_base_with("example/repo", "main", None, |_, _| Ok("a".repeat(40)))
+                .unwrap();
+        let changed_main =
+            resolve_coverage_base_with("example/repo", "main", None, |_, _| Ok("b".repeat(40)))
+                .unwrap();
+        let cached = ChangeCoverage {
+            assessment_version: 3,
+            request_scope: scope.clone(),
+            base: Some(first_base.clone()),
+            inputs_digest: original.digest.clone(),
+            system: "generic".into(),
+            repo: "example/repo".into(),
+            base_ref: "main".into(),
+            merge_base: "a".repeat(40),
+            head: "c".repeat(40),
+            driven_requests: 1,
+            items: Vec::new(),
+            never_ran: 0,
+            unproven: 0,
+            caveats: Vec::new(),
+        };
+        assert!(original.cache_matches(&cached, "example/repo", &"c".repeat(40), &first_base));
+        assert!(!original.cache_matches(&cached, "example/repo", &"c".repeat(40), &changed_main));
+        for changed in [
+            CoverageInputs::from_bytes(b"grAph".to_vec(), b"ledger".to_vec(), &scope),
+            CoverageInputs::from_bytes(b"graph".to_vec(), b"ledgEr".to_vec(), &scope),
+            CoverageInputs::from_bytes(
+                b"graph".to_vec(),
+                b"ledger".to_vec(),
+                &["another-request".into()],
+            ),
+        ] {
+            assert!(!changed.cache_matches(&cached, "example/repo", &"c".repeat(40), &first_base));
+        }
+        let mut legacy = cached.clone();
+        legacy.assessment_version = 2;
+        assert!(!original.cache_matches(&legacy, "example/repo", &"c".repeat(40), &first_base));
+    }
+
+    #[test]
+    fn coverage_assesses_the_same_artifact_bytes_it_fingerprints() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.jsonl");
+        let ledger = dir.path().join("calls.jsonl");
+        let observed =
+            deja::DejaRecord::GraphNode(Box::new(node("request", "generic::service", "run", &[])));
+        std::fs::write(&graph, serde_json::to_vec(&observed).unwrap()).unwrap();
+        std::fs::write(&ledger, "").unwrap();
+        let snapshot = CoverageInputs::read(&graph, &ledger, &["request".into()]).unwrap();
+        std::fs::write(&graph, "replacement with a torn graph row").unwrap();
+        assert_eq!(
+            snapshot.evidence().unwrap().driven,
+            1,
+            "assessment must use the captured bytes, not reread a replaced artifact"
+        );
+        let replaced = CoverageInputs::read(&graph, &ledger, &["request".into()]).unwrap();
+        assert_ne!(snapshot.digest, replaced.digest);
+        assert!(replaced.evidence().is_err());
+        let torn_ledger = CoverageInputs::from_bytes(
+            serde_json::to_vec(&observed).unwrap(),
+            b"{}".to_vec(),
+            &["request".into()],
+        );
+        assert!(torn_ledger.evidence().is_err());
+    }
+
+    #[test]
+    fn feature_evidence_excludes_ambient_correlations_and_keeps_the_admitted_denominator() {
+        let graph = vec![
+            node("request", "service::request", "run", &[]),
+            node("startup", "service::setup", "initialize", &[]),
+        ];
+        let calls = vec![
+            serde_json::json!({ "correlation_id": "startup", "observed": { "call_file": "setup.rs", "call_line": 7 } }),
+        ];
+        let evidence = Evidence::for_request_scope(
+            &graph,
+            &calls,
+            &["request".into(), "request-without-graph".into()],
+        );
+        assert_eq!(evidence.driven, 2);
+        assert!(evidence.module_ran("service::request"));
+        assert!(!evidence.module_ran("service::setup"));
+        assert_eq!(evidence.sites_in("setup.rs", 1, 10), 0);
     }
 
     /// A tape on which paypal ran Authorize once and PSync twice, adyen ran

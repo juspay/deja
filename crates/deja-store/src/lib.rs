@@ -127,6 +127,23 @@ pub struct RunListCursor {
     pub run_id: String,
 }
 
+/// Optional history selectors are applied before limiting a page.
+#[derive(Debug, Clone, Default)]
+pub struct RunHistoryFilter {
+    pub system: Option<String>,
+    pub search: Option<String>,
+    pub repo: Option<String>,
+    pub pr_number: Option<u64>,
+    pub head_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunHeadSummary {
+    pub head_sha: String,
+    pub runs: i64,
+    pub latest_at: DateTime<Utc>,
+}
+
 const RUN_SUMMARY_SELECT: &str =
     "SELECT run_id, mode, recording_id, candidate, candidate_sha256, params, state,
                     verdict,
@@ -1797,6 +1814,26 @@ impl Store {
         cursor: Option<&RunListCursor>,
         limit: i64,
     ) -> Result<Vec<RunSummaryRow>, sqlx::Error> {
+        self.filtered_run_summaries(
+            default_system,
+            &RunHistoryFilter {
+                system: system.map(str::to_owned),
+                search: search.map(str::to_owned),
+                ..RunHistoryFilter::default()
+            },
+            cursor,
+            limit,
+        )
+        .await
+    }
+
+    pub async fn filtered_run_summaries(
+        &self,
+        default_system: &str,
+        filter: &RunHistoryFilter,
+        cursor: Option<&RunListCursor>,
+        limit: i64,
+    ) -> Result<Vec<RunSummaryRow>, sqlx::Error> {
         let query = format!(
             "WITH dependents AS (
                 SELECT params ->> 'delta_against' AS baseline,
@@ -1822,18 +1859,53 @@ impl Store {
                     expectation, params ->> 'label', params #>> '{{github,pr_number}}',
                     list_scope)), lower($3)) > 0)
                AND ($4::timestamptz IS NULL OR (created_at, run_id) < ($4, $5))
+               AND ($7::text IS NULL OR params #>> '{{github,repo}}' = $7)
+               AND ($8::text IS NULL OR params #>> '{{github,pr_number}}' = $8)
+               AND ($9::text IS NULL OR params #>> '{{github,head_sha}}' = $9)
              ORDER BY created_at DESC, run_id DESC LIMIT $6"
         );
         let rows = sqlx::query(&query)
             .bind(default_system)
-            .bind(system)
-            .bind(search)
+            .bind(filter.system.as_deref())
+            .bind(filter.search.as_deref())
             .bind(cursor.map(|c| c.created_at))
             .bind(cursor.map(|c| c.run_id.as_str()))
             .bind(limit)
+            .bind(filter.repo.as_deref())
+            .bind(filter.pr_number.map(|n| n.to_string()))
+            .bind(filter.head_sha.as_deref())
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(run_summary_row).collect())
+    }
+
+    /// Lightweight head groups over the PR's complete stored history. Counts
+    /// are stored runs, not a claim that scopes, policies or deployments match.
+    pub async fn pr_run_heads(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<Vec<RunHeadSummary>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT params #>> '{github,head_sha}' AS head_sha,
+                count(*) AS runs, max(created_at) AS latest_at
+            FROM replay_runs
+            WHERE params #>> '{github,repo}' = $1 AND params #>> '{github,pr_number}' = $2
+                AND params #>> '{github,head_sha}' IS NOT NULL
+            GROUP BY params #>> '{github,head_sha}' ORDER BY max(created_at) DESC, head_sha",
+        )
+        .bind(repo)
+        .bind(number.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| RunHeadSummary {
+                head_sha: r.get(0),
+                runs: r.get(1),
+                latest_at: r.get(2),
+            })
+            .collect())
     }
 
     /// Every run that is NOT terminal (state not in 'completed'/'failed'), with
@@ -2751,6 +2823,64 @@ mod tests {
             default_page.len(),
             1,
             "legacy rows use the deployment default"
+        );
+        sqlx::query("DELETE FROM replay_runs WHERE starts_with(run_id, $1)")
+            .bind(&prefix)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_head_history_filters_before_paging_and_groups_the_full_pr() {
+        let Some(store) = store_under_test().await else {
+            eprintln!("skipped: DEJA_TEST_DB_URL is not set");
+            return;
+        };
+        let prefix = unique("pr-head-history");
+        let repo = format!("{prefix}/repo");
+        let first = "a".repeat(40);
+        let second = "b".repeat(40);
+        for (name, head, pr) in [
+            ("one", &first, 42),
+            ("two", &first, 42),
+            ("three", &second, 42),
+            ("other-pr", &first, 43),
+        ] {
+            store.insert_run(&format!("{prefix}-{name}"), "replay", Some("tape"), &serde_json::json!({}),
+                &serde_json::json!({ "system_under_test": "generic", "github": { "repo": repo, "pr_number": pr, "head_sha": head }, "delta_against": "exact-baseline" }), None, "test").await.unwrap();
+        }
+        let filter = super::RunHistoryFilter {
+            repo: Some(repo.clone()),
+            pr_number: Some(42),
+            head_sha: Some(first.clone()),
+            ..Default::default()
+        };
+        let page = store
+            .filtered_run_summaries("default", &filter, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 1);
+        let cursor = super::RunListCursor {
+            created_at: page[0].created_at,
+            run_id: page[0].run_id.clone(),
+        };
+        let next = store
+            .filtered_run_summaries("default", &filter, Some(&cursor), 1)
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_ne!(page[0].run_id, next[0].run_id);
+        assert_eq!(next[0].params["delta_against"], "exact-baseline");
+        let heads = store.pr_run_heads(&repo, 42).await.unwrap();
+        assert_eq!(heads.len(), 2);
+        assert_eq!(
+            heads.iter().find(|h| h.head_sha == first).map(|h| h.runs),
+            Some(2)
+        );
+        assert_eq!(
+            heads.iter().find(|h| h.head_sha == second).map(|h| h.runs),
+            Some(1)
         );
         sqlx::query("DELETE FROM replay_runs WHERE starts_with(run_id, $1)")
             .bind(&prefix)

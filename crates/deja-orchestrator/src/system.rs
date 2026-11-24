@@ -130,6 +130,9 @@ pub struct SystemConfig {
     /// Reply canons declared per boundary, in the recorder's own grammar. See
     /// `SystemDeclaration::reply_canons`.
     pub reply_canons: std::collections::BTreeMap<String, String>,
+    /// Current deployment's review selectors; not a run-pinned scoring policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_identity: Option<deja_compactor::settings::ReviewIdentityDeclaration>,
     /// Repo-relative config files its CodeBundle carries besides migrations.
     /// `None` on a system with no bundle, or the default system with nothing
     /// declared (the executor's base list applies).
@@ -328,6 +331,7 @@ pub fn system_config(name: &str) -> SystemConfig {
         source_repo: clean(d.source_repo),
         change_base_ref: clean(d.change_base_ref).unwrap_or_else(|| "main".to_owned()),
         reply_canons: reply_canons_resolved.clone(),
+        review_identity: d.review_identity,
         candidate_config_files: d.candidate_config_files,
         code_bundle_uri_env: clean(d.code_bundle_uri_env),
         config_source_deployment: clean(d.config_source_deployment),

@@ -71,6 +71,22 @@ pub struct CallSide {
     /// `span_path`, …), so the tiers can be counted from the ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_locus: Option<String>,
+    /// Runtime facts are independent of what the scorer compared. Historical
+    /// rows and ingress markers do not acquire these from serde defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<CallRuntime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspection: Option<super::inspection::CallInspection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallRuntime {
+    pub version: u8,
+    pub cancelled: bool,
+    pub provenance: deja::Provenance,
+    /// Execute-shadow dispatches do not perform a Substitute decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<deja::SubstituteOutcome>,
 }
 
 impl CallSide {
@@ -198,9 +214,12 @@ fn schema_default_row_kind(_scorecard_kind: &str) -> String {
 }
 
 fn recorded_side(ev: &BoundaryEvent) -> CallSide {
+    let args = ev.args.to_value();
+    let result = ev.result.to_value();
+    let inspection = super::inspection::CallInspection::from_values(Some(&args), Some(&result));
     CallSide {
-        args: Some(ev.args.to_value()),
-        result: Some(ev.result.to_value()),
+        args: Some(args),
+        result: Some(result),
         is_error: Some(ev.is_error),
         call_file: Some(ev.call_file.clone()),
         call_line: Some(ev.call_line),
@@ -210,6 +229,8 @@ fn recorded_side(ev: &BoundaryEvent) -> CallSide {
         span_path: None,
         graph_node_id: ev.graph_node_id,
         resolved_locus: None,
+        runtime: None,
+        inspection,
     }
 }
 
@@ -228,6 +249,8 @@ fn observed_side(obs: &ObservedCall) -> CallSide {
     } else {
         None
     };
+    let inspection =
+        super::inspection::CallInspection::from_values(Some(&obs.args), result.as_ref());
     CallSide {
         args: Some(obs.args.clone()),
         result,
@@ -238,7 +261,110 @@ fn observed_side(obs: &ObservedCall) -> CallSide {
         span_path: obs.span_path.clone(),
         graph_node_id: obs.graph_node_id,
         resolved_locus: obs.resolved_locus.clone(),
+        runtime: runtime_of(obs),
+        inspection,
     }
+}
+
+fn runtime_of(obs: &ObservedCall) -> Option<CallRuntime> {
+    (obs.runtime_metadata_present && obs.role.as_deref() != Some("ingress")).then(|| CallRuntime {
+        version: 1,
+        cancelled: obs.cancelled,
+        provenance: obs.provenance,
+        outcome: (obs.provenance != deja::Provenance::Shadow).then_some(obs.outcome),
+    })
+}
+
+/// Read-only publication enrichment. Exact captured identities join the raw
+/// runtime stream; ambiguous/missing observations never supply runtime facts.
+/// This neither rebuilds ledger classifications nor changes any scored value.
+pub fn enrich_runtime(rows: &mut [CallRecord], observations: &[ObservedCall]) -> usize {
+    type Key = (Option<String>, String, String, String, Option<u64>, String);
+    let key = |correlation: &Option<String>,
+               boundary: &str,
+               trait_name: &str,
+               method: &str,
+               node: Option<u64>,
+               args: &serde_json::Value|
+     -> Option<Key> {
+        Some((
+            correlation.clone(),
+            boundary.to_owned(),
+            trait_name.to_owned(),
+            method.to_owned(),
+            node,
+            serde_json::to_string(args).ok()?,
+        ))
+    };
+    let mut index: HashMap<Key, Vec<&ObservedCall>> = HashMap::new();
+    for observation in observations {
+        if let Some(key) = key(
+            &observation.correlation_id,
+            &observation.boundary,
+            &observation.trait_name,
+            &observation.method_name,
+            observation.graph_node_id,
+            &observation.args,
+        ) {
+            index.entry(key).or_default().push(observation);
+        }
+    }
+    let mut enriched = 0;
+    for row in rows {
+        let Some(side) = row.observed.as_mut() else {
+            continue;
+        };
+        if side.runtime.is_some() || row.correlation_id.is_none() {
+            continue;
+        }
+        let Some(args) = side.args.as_ref() else {
+            continue;
+        };
+        // Without either graph or event anchors, repeated background operations
+        // could look unique merely because the runtime artifact was truncated.
+        if side.graph_node_id.is_none()
+            && row.source_event_global_sequence.is_none()
+            && row.served_event_global_sequence.is_none()
+        {
+            continue;
+        }
+        let Some(key) = key(
+            &row.correlation_id,
+            &row.boundary,
+            &row.trait_name,
+            &row.method_name,
+            side.graph_node_id,
+            args,
+        ) else {
+            continue;
+        };
+        let candidates: Vec<_> = index
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|observation| {
+                side.span_path == observation.span_path
+                    && row
+                        .served_event_global_sequence
+                        .is_none_or(|event| observation.served_event_global_sequence == Some(event))
+                    && !(row.source_event_global_sequence.is_some()
+                        && observation.source_event_global_sequence.is_some()
+                        && row.source_event_global_sequence
+                            != observation.source_event_global_sequence)
+            })
+            .collect();
+        if candidates.len() != 1 {
+            continue;
+        }
+        let observation = candidates[0];
+        let Some(runtime) = runtime_of(observation) else {
+            continue;
+        };
+        side.runtime = Some(runtime);
+        enriched += 1;
+    }
+    enriched
 }
 
 fn stopped_at(obs: &ObservedCall) -> bool {
@@ -1026,6 +1152,7 @@ mod tests {
         src: Option<u64>,
     ) -> ObservedCall {
         ObservedCall {
+            runtime_metadata_present: false,
             correlation_id: corr.map(str::to_owned),
             boundary: boundary.to_owned(),
             role: None,
@@ -1398,5 +1525,86 @@ mod tests {
         assert_eq!(find(&rows, "environmental").len(), 1);
         assert_eq!(find(&rows, "deterministic").len(), 1);
         assert!(rows.iter().all(|r| !r.blocking));
+    }
+}
+
+#[cfg(test)]
+mod runtime_evidence_tests {
+    use super::*;
+    fn observation(provenance: Option<&str>, outcome: Option<&str>) -> ObservedCall {
+        let mut value = serde_json::json!({"boundary":"config", "trait_name":"Client", "method_name":"read", "args":{}, "resolved":true});
+        if let Some(provenance) = provenance {
+            value["provenance"] = provenance.into();
+        }
+        if let Some(outcome) = outcome {
+            value["outcome"] = outcome.into();
+        }
+        serde_json::from_value(value).unwrap()
+    }
+    #[test]
+    fn ledger_projects_actual_runtime_and_does_not_upgrade_historical_unknown() {
+        assert!(observed_side(&observation(None, None)).runtime.is_none());
+        let substituted = observed_side(&observation(Some("recorded"), Some("substituted")));
+        assert_eq!(
+            substituted.runtime.unwrap().outcome,
+            Some(deja::SubstituteOutcome::Substituted)
+        );
+        let executed = observed_side(&observation(Some("execute_shadow"), None));
+        let runtime = executed.runtime.unwrap();
+        assert_eq!(runtime.provenance, deja::Provenance::Shadow);
+        assert!(runtime.outcome.is_none());
+    }
+    #[test]
+    fn read_only_enrichment_requires_a_unique_exact_observation() {
+        let mut observation = observation(Some("recorded"), Some("substituted"));
+        observation.correlation_id = Some("request".into());
+        observation.graph_node_id = Some(7);
+        observation.args = serde_json::json!({"key":"same"});
+        let mut row: CallRecord = serde_json::from_value(serde_json::json!({
+            "boundary":"config","trait_name":"Client","method_name":"read","correlation_id":"request","kind":"value_diverged","blocking":true,
+            "observed":{"graph_node_id":7,"args":{"key":"same"}}
+        })).unwrap();
+        let original = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            enrich_runtime(
+                std::slice::from_mut(&mut row),
+                &[observation.clone(), observation.clone()]
+            ),
+            0
+        );
+        let mut different = observation.clone();
+        different.args = serde_json::json!({"key":"other"});
+        assert_eq!(
+            enrich_runtime(std::slice::from_mut(&mut row), &[different]),
+            0
+        );
+        assert_eq!(
+            enrich_runtime(std::slice::from_mut(&mut row), &[observation.clone()]),
+            1
+        );
+        assert_eq!(
+            row.observed
+                .as_ref()
+                .unwrap()
+                .runtime
+                .as_ref()
+                .unwrap()
+                .outcome,
+            Some(deja::SubstituteOutcome::Substituted)
+        );
+        let mut enriched = serde_json::to_value(&row).unwrap();
+        enriched["observed"]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime");
+        assert_eq!(
+            original, enriched,
+            "runtime enrichment must preserve every scoring field"
+        );
+        assert_eq!(
+            enrich_runtime(std::slice::from_mut(&mut row), &[observation]),
+            0,
+            "published metadata is never replaced"
+        );
     }
 }
