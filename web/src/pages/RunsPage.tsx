@@ -13,6 +13,7 @@ import {
 import { RunListResult } from "../components/Result";
 import { KillRun } from "../components/KillRun";
 import { useSystems } from "../lib/systems";
+import { reviewHref, useRunListScroll } from "../lib/navigation";
 import { MERGE_QUEUE, changeOf } from "../lib/scope";
 
 function when(iso: string): { short: string; full: string } {
@@ -44,10 +45,15 @@ export default function RunsPage() {
     const next = new URLSearchParams(params);
     if (value) next.set(key, value);
     else next.delete(key);
-    if (key === "system" || key === "q") next.delete("cursor");
+    if (["system", "q", "repo", "pr", "head"].includes(key)) next.delete("cursor");
     setParams(next, { replace });
   };
-  const query = { system: scope, q: search, cursor, limit: 50 };
+  const repo = params.get("repo") ?? "";
+  const pr = params.get("pr") ?? "";
+  const head = params.get("head") ?? "";
+  const query = { system: scope, q: search, cursor, limit: 50,
+    ...(repo ? { repo } : {}), ...(pr ? { pr: Number(pr) } : {}), ...(head ? { head } : {}),
+  };
   const runs = useQuery({
     queryKey: ["runs", "page", query],
     queryFn: () => api.runsPage(query),
@@ -70,6 +76,15 @@ export default function RunsPage() {
   // filter is explicitly page-local; system and text search cover history.
   const rows = filter ? page.filter((r) => resultOf(r).state === filter) : page;
   const runsUrl = `/runs${params.size ? `?${params}` : ""}`;
+  useRunListScroll(!loading && !runs.error);
+  const prHistory = (repo: string, pr: number, head?: string) => {
+    const next = new URLSearchParams();
+    if (scope) next.set("system", scope);
+    if (debug) next.set("debug", "1");
+    next.set("repo", repo); next.set("pr", String(pr));
+    if (head) next.set("head", head);
+    return `/runs?${next}`;
+  };
 
   return (
     <>
@@ -119,6 +134,11 @@ export default function RunsPage() {
         </span>
       </div>
 
+      {(repo || pr || head) && <div className="runfilters">
+        <span>PR history: {repo || "any repository"}{pr && ` #${pr}`}{head && <> · captured head <code>{head}</code></>}</span>
+        <button className="btn quiet" onClick={() => setParams((previous) => { const next = new URLSearchParams(previous); for (const key of ["repo", "pr", "head", "cursor"]) next.delete(key); return next; })}>Clear PR scope</button>
+        {head && <Link to={prHistory(repo, Number(pr))}>All captured heads →</Link>}
+      </div>}
       <p className="hint">PR impact compares with the named baseline. Recording fidelity compares with the captured traffic.</p>
       {!loading && runs.error && <p className="err">{String(runs.error)} — could not load run history.</p>}
       <div className="runlist" aria-busy={loading}>
@@ -138,7 +158,9 @@ export default function RunsPage() {
         {rows.map((r) => {
           const cand = candidateRef(r);
           const said = whatHappened(r);
-          const purpose = runParams(r)?.purpose;
+          const p = runParams(r);
+          const purpose = p?.purpose;
+          const github = p?.github;
           const change = changeOf(r);
           const t = when(r.created_at);
           // The whole row is the link: middle-click, copy-link-address and
@@ -148,10 +170,10 @@ export default function RunsPage() {
           // is invalid and the click would be the link's. It sits over the
           // reserved last column instead, so the row stays one anchor.
           return (
-            <div className="runrowwrap" key={r.run_id}>
+            <div className="runrowwrap" key={r.run_id} id={r.run_id}>
               <Link
                 className="runrow"
-                to={withDebug(`/r/${r.run_id}`, debug)}
+                to={reviewHref(withDebug(`/r/${r.run_id}`, debug), runsUrl, { runs: `${runsUrl}#${encodeURIComponent(r.run_id)}`, trail: [] })}
                 state={{ runsUrl }}
                 title={`${r.run_id} · ${r.created_by} · ${t.full}`}
               >
@@ -175,6 +197,10 @@ export default function RunsPage() {
                 </span>
                 <span />
               </Link>
+              {(github || p?.delta_against) && <div className="run-pair-links">
+                {github && <><Link to={prHistory(github.repo, github.pr_number)}>PR #{github.pr_number} history</Link><span> · </span><Link to={prHistory(github.repo, github.pr_number, github.head_sha)}>captured head {github.head_sha.slice(0, 10)}</Link></>}
+                {p?.delta_against && <><span> · </span><Link to={reviewHref(`/r/${p.delta_against}`, runsUrl, { runs: `${runsUrl}#${encodeURIComponent(r.run_id)}`, trail: [] })}>baseline {p.delta_against}</Link></>}
+              </div>}
               <div className="rl-kill">
                 <KillRun run={r} compact />
               </div>

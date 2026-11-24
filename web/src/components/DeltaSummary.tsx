@@ -18,6 +18,10 @@ import { useDebug, withDebug } from "../lib/debug";
 import { comparedDiffs, pollPending, readState, sealLine } from "../lib/deltaPanel";
 import { AcknowledgeLine } from "./Acknowledgements";
 import { callAtAddress, callEvidenceHref } from "../lib/acknowledge";
+import { callFieldEvidence, matchingFieldObservations, type EvidenceValue } from "../lib/fieldEvidence";
+import { EvidenceValueView, FieldInspector } from "./FieldInspector";
+import { useReviewNavigation } from "../lib/navigation";
+import { ReviewIdentityEvidence } from "./ReviewIdentity";
 import { callComparisonText, deltaRequestCounts, deltaReviewCounts, joinDeltaResponses, responseKey, SAME_AS_RECORDING, type DeltaOutcome as Outcome, type DeltaRequest as Req, type FieldSide } from "../lib/comparison";
 
 /**
@@ -83,7 +87,8 @@ const GLYPH: Record<Outcome, [Dot, Dot, Dot]> = {
 // ---------------------------------------------------------------------------
 // per-request view of the delta, joined with both runs' http diffs
 
-export function SideCell({ v, sameAsMain = false }: { v: FieldSide; sameAsMain?: boolean }) {
+export function SideCell({ v, sameAsMain = false, evidence }: { v: FieldSide; sameAsMain?: boolean; evidence?: EvidenceValue }) {
+  if (evidence) return <td className="val"><EvidenceValueView evidence={evidence} />{sameAsMain && evidence.state !== "unavailable" && <span className="cmp"> scorer: equivalent to baseline</span>}</td>;
   if (v === undefined) return <td className="val faint">not published</td>;
   if (v === null) return <td className="val gone" title="This historical field-diff format does not distinguish explicit JSON null from a missing field.">null / absent (presence unknown)</td>;
   if (v === SAME_AS_RECORDING) return <td className="val rec">= recording</td>;
@@ -113,6 +118,7 @@ function groupByLane(reqs: Req[]): [string, Req[]][] {
 
 function Facts({ d, prRun, mainRun }: { d: Delta; prRun?: RunRow; mainRun?: RunRow }) {
   const debug = useDebug();
+  const nav = useReviewNavigation();
   const pr = prRun ? runParams(prRun) : null;
   const mp = mainRun ? runParams(mainRun) : null;
   const prCand = prRun ? candidateRef(prRun) : { label: "—", full: "" };
@@ -131,7 +137,7 @@ function Facts({ d, prRun, mainRun }: { d: Delta; prRun?: RunRow; mainRun?: RunR
         <span className="v mono" title={mainCand.full}>{mainCand.label}</span>
         <span className="s">
           {mp?.label ?? "this branch's merge-base"} ·{" "}
-          <Link to={withDebug(`/r/${d.m_run}`, debug)} className="mono">main's run {short(d.m_run)}</Link>
+          <Link to={withDebug(nav.href(`/r/${d.m_run}`), debug)} className="mono">main's run {short(d.m_run)}</Link>
         </span>
       </div>
       <div className="fact">
@@ -290,7 +296,7 @@ function ByLane({ reqs }: { reqs: Req[] }) {
   return (
     <table className="delta-lanes">
       <thead>
-        <tr><th>connector · flow</th><th>methods</th><th className="num">responses</th><th className="num">only this PR</th><th className="num">differ differently</th><th className="num">back on recording</th><th className="num">same as main</th><th className="num">all agree</th></tr>
+        <tr><th>legacy grouping hint</th><th>methods</th><th className="num">responses</th><th className="num">only this PR</th><th className="num">differ differently</th><th className="num">back on recording</th><th className="num">same as main</th><th className="num">all agree</th></tr>
       </thead>
       <tbody>
         {groupByLane(reqs).map(([lane, rs]) => {
@@ -316,6 +322,7 @@ function ByLane({ reqs }: { reqs: Req[] }) {
 
 function RequestMap({ reqs, runId }: { reqs: Req[]; runId: string }) {
   const debug = useDebug();
+  const nav = useReviewNavigation();
   const { n } = counts(reqs);
   return (
     <div className="delta-map">
@@ -328,7 +335,7 @@ function RequestMap({ reqs, runId }: { reqs: Req[]; runId: string }) {
                 key={responseKey(r.correlation, r.sequence)}
                 className={`cell ${r.outcome}`}
                 title={`${r.correlation} · ${r.method} · ${r.fields.length} fields differ`}
-                to={withDebug(`/r/${runId}?case=${encodeURIComponent(r.correlation)}`, debug)}
+                to={withDebug(nav.href(`/r/${runId}?case=${encodeURIComponent(r.correlation)}`), debug)}
               />
             ))}
           </div>
@@ -347,26 +354,25 @@ function RequestMap({ reqs, runId }: { reqs: Req[]; runId: string }) {
 
 /** The response fields a group of requests differ on, as presence per side. */
 export function FieldTable({ reqs, mainSha }: { reqs: Req[]; mainSha: string }) {
-  const byPath = new Map<string, { recording: number; main: number; pr: number; recordingUnknown: number; mainUnknown: number; prUnknown: number; total: number; sameAsMain: number }>();
+  const byPath = new Map<string, { recording: Map<string, number>; main: Map<string, number>; pr: Map<string, number>; total: number; sameAsMain: number }>();
   for (const r of reqs) {
     for (const f of r.fields) {
-      const e = byPath.get(f.path) ?? { recording: 0, main: 0, pr: 0, recordingUnknown: 0, mainUnknown: 0, prUnknown: 0, total: 0, sameAsMain: 0 };
+      const e = byPath.get(f.path) ?? { recording: new Map(), main: new Map(), pr: new Map(), total: 0, sameAsMain: 0 };
       e.total += 1;
       for (const side of ["recording", "main", "pr"] as const) {
         const value = f[side] === SAME_AS_RECORDING ? f.recording : f[side];
-        if (value === undefined) e[`${side}Unknown`] += 1;
-        else if (value !== null) e[side] += 1;
+        const evidence = f.evidence?.[side];
+        const state = evidence?.state === "missing" ? "missing field"
+          : evidence?.state === "unavailable" ? "not published / presence unavailable"
+          : evidence?.state === "present" ? evidence.value === null ? "explicit null" : "value published"
+          : value === undefined ? "not published" : value === null ? "null / absent (presence unknown)" : "value published";
+        e[side].set(state, (e[side].get(state) ?? 0) + 1);
       }
       if (f.sameAsMain) e.sameAsMain += 1;
       byPath.set(f.path, e);
     }
   }
-  const state = (values: number, unknown: number, total: number) =>
-    unknown === total ? <td className="faint">not published</td>
-      : unknown > 0 ? <td className="mixed">not published on {unknown} of {total}</td>
-      : values === 0 ? <td className="absent">null / absent</td>
-      : values === total ? <td className="present">value published</td>
-      : <td className="mixed">value on {values} of {total}; rest null / absent</td>;
+  const state = (states: Map<string, number>, total: number) => <td>{[...states].map(([label, count]) => <div key={label}>{label}{count !== total ? ` on ${count} of ${total}` : ""}</div>)}</td>;
   return (
     <table className="delta-fields">
       <thead>
@@ -376,9 +382,9 @@ export function FieldTable({ reqs, mainSha }: { reqs: Req[]; mainSha: string }) 
         {[...byPath.entries()].sort((a, b) => b[1].total - a[1].total).map(([path, e]) => (
           <tr key={path}>
             <td className="f">{path}</td>
-            {state(e.recording, e.recordingUnknown, e.total)}
-            {state(e.main, e.mainUnknown, e.total)}
-            {state(e.pr, e.prUnknown, e.total)}
+            {state(e.recording, e.total)}
+            {state(e.main, e.total)}
+            {state(e.pr, e.total)}
             <td className="cnt">
               {e.total} of {reqs.length}
               {e.sameAsMain !== e.total && <span className="cmp"> · {e.sameAsMain} same as main</span>}
@@ -392,6 +398,7 @@ export function FieldTable({ reqs, mainSha }: { reqs: Req[]; mainSha: string }) 
 
 function RequestList({ reqs, runId, mainSha }: { reqs: Req[]; runId: string; mainSha: string }) {
   const debug = useDebug();
+  const nav = useReviewNavigation();
   const [shown, setShown] = React.useState(40);
   const opened = new Set<string>();
   return (
@@ -401,7 +408,7 @@ function RequestList({ reqs, runId, mainSha }: { reqs: Req[]; runId: string; mai
         <span className="c">expand a row for its field values on all three sides</span>
       </summary>
       <div className="reqhead">
-        <span>request</span><span>method</span><span>connector · flow</span><span>status rec / main / PR</span><span>fields differing</span><span></span>
+        <span>request</span><span>method</span><span>legacy grouping hint</span><span>status rec / main / PR</span><span>fields differing</span><span></span>
       </div>
       {reqs.slice(0, shown).map((r) => {
         const key = r.fields.map((f) => f.path).join("|");
@@ -413,16 +420,18 @@ function RequestList({ reqs, runId, mainSha }: { reqs: Req[]; runId: string; mai
               <span className="id">{short(r.correlation)}</span>
               <span>{r.method}</span>
               <span className="mono">{r.lane}</span>
-              <span className="st">{r.status[0]} / {r.status[1] ?? "—"} / {r.status[2]}</span>
+              <span className="st">{r.statusEvidence ? [r.statusEvidence.recording, r.statusEvidence.main, r.statusEvidence.pr].map((side) => side.state === "present" ? String(side.value) : "—").join(" / ") : `${r.status[0]} / ${r.status[1] ?? "—"} / ${r.status[2]}`}</span>
               <span className="fl">
                 <b>{r.fields.length} field{r.fields.length === 1 ? "" : "s"}</b>
                 {r.fields.length > 0 && ` · ${r.fields.map((f) => f.path.replace(/^\$\./, "")).join(", ")}`}
               </span>
               <span className="lk">
-                <Link to={withDebug(`/r/${runId}?case=${encodeURIComponent(r.correlation)}`, debug)}>open case →</Link>
+                <Link to={withDebug(nav.href(`/r/${runId}?case=${encodeURIComponent(r.correlation)}`), debug)}>open case →</Link>
               </span>
             </summary>
             {r.notes.map((note) => <p className="hint" key={note}>{note}</p>)}
+            <FieldInspector title="Published response evidence" note="These are the scorer's published response addresses. Presence is shown only when the producer or complete captured parent proves it; canonical residue indices are never treated as captured positions."
+              fields={[...(r.statusEvidence ? [r.statusEvidence] : []), ...r.fields.flatMap((field) => field.evidence ? [field.evidence] : [])]} />
             {r.fields.length > 0 && (
               <table className="delta-vals">
                 <thead>
@@ -432,9 +441,9 @@ function RequestList({ reqs, runId, mainSha }: { reqs: Req[]; runId: string; mai
                   {r.fields.map((f) => (
                     <tr key={f.path}>
                       <td className="p">{f.path}</td>
-                      <SideCell v={f.recording} />
-                      <SideCell v={f.main} />
-                      <SideCell v={f.pr} sameAsMain={f.sameAsMain} />
+                      <SideCell v={f.recording} evidence={f.evidence?.recording} />
+                      <SideCell v={f.main} evidence={f.evidence?.main} />
+                      <SideCell v={f.pr} evidence={f.evidence?.pr} sameAsMain={f.sameAsMain} />
                     </tr>
                   ))}
                 </tbody>
@@ -478,7 +487,7 @@ function CleanList({ reqs }: { reqs: Req[] }) {
   return (
     <Fold title={GROUP_TITLE.clean} count={`${reqs.length} responses have no published delta differences`}>
       <table>
-        <thead><tr><th>request</th><th>method</th><th>connector · flow</th><th>status</th></tr></thead>
+        <thead><tr><th>request</th><th>method</th><th>legacy grouping hint</th><th>status</th></tr></thead>
         <tbody>
           {reqs.map((r) => (
             <tr key={responseKey(r.correlation, r.sequence)}><td className="mono">{short(r.correlation)}</td><td>{r.method}</td><td className="mono">{r.lane}</td><td className="mono">{r.status[0]}</td></tr>
@@ -490,8 +499,9 @@ function CleanList({ reqs }: { reqs: Req[] }) {
 }
 
 /** Every boundary uses the same published address; hosts are not connector identities. */
-export function BoundaryObservations({ d, calls, runId }: { d: Delta; calls: CallRecord[]; runId: string }) {
+export function BoundaryObservations({ d, calls, baselineCalls = [], runId }: { d: Delta; calls: CallRecord[]; baselineCalls?: CallRecord[]; runId: string }) {
   const debug = useDebug();
+  const nav = useReviewNavigation();
   const all = d.rows.filter((row) => row.address.kind === "call");
   const specific = all.filter((row) => ["changed", "introduced"].includes(deltaFamily(row.bucket)));
   const shared = all.filter((row) => !specific.includes(row));
@@ -509,12 +519,16 @@ export function BoundaryObservations({ d, calls, runId }: { d: Delta; calls: Cal
           <td><code>{address.boundary} · {address.operation}</code><div className="hint">{address.span_path.split(">").slice(-2).join(" › ")}</div></td>
           <td className="mono" title={address.correlation}>{short(address.correlation)}</td>
           <td>{call ? callComparisonText(call) : "Comparison details not published at this exact address."}<div className="hint">candidate against recording</div></td>
-          <td><Link to={withDebug(href, debug)}>{exact ? "Open exact event →" : "Open request →"}</Link></td>
+          <td><Link to={withDebug(nav.href(href), debug)}>{exact ? "Open exact event →" : "Open request →"}</Link>
+            <details><summary>Compare captured fields</summary><FieldInspector {...callFieldEvidence(row, calls, baselineCalls)} title="Captured boundary field evidence" /></details>
+          </td>
         </tr>;
       })}</tbody>
     </table>
   );
   return <>
+    <ReviewIdentityEvidence identities={d.review_identities} correlations={specific.map((row) => row.address.correlation)} candidateRun={d.y_run} baselineRun={d.m_run} />
+    <MatchingObservations rows={specific} calls={calls} baselineCalls={baselineCalls} runId={runId} />
     <Fold title="Boundary changes introduced by this PR" count={`${specific.filter((row) => row.blocking).length} blocking · ${specific.filter((row) => !row.blocking).length} informational`} open={specific.length > 0}>
       <p className="hint">Database, configuration, key management and network calls use the same comparison. Multiple observations can reflect one change; their order alone does not prove causality.</p>
       {specific.length ? table(specific) : <p className="hint">No introduced or changed boundary observations were published.</p>}
@@ -524,6 +538,22 @@ export function BoundaryObservations({ d, calls, runId }: { d: Delta; calls: Cal
       {table(shared)}
     </Fold>}
   </>;
+}
+
+function MatchingObservations({ rows, calls, baselineCalls, runId }: { rows: DeltaRow[]; calls: CallRecord[]; baselineCalls: CallRecord[]; runId: string }) {
+  const debug = useDebug();
+  const nav = useReviewNavigation();
+  const groups = React.useMemo(() => matchingFieldObservations(rows, calls, baselineCalls), [rows, calls, baselineCalls]);
+  if (!groups.length) return null;
+  return <Fold title="Matching named field changes across boundary observations" count={`${groups.length} field name/value matches`}>
+    <p className="hint">Each group has the same captured leaf name and three-way presence/value change in one request. Full locations below may differ. This does not establish logical identity or causality; all scorer observations remain separate below.</p>
+    {groups.map((group, index) => <div key={index}>
+      <FieldInspector fields={[group.field]} title={`${group.rows.length} observations · ${group.field.path}`} note="Matching leaf name and presence/value change; no observations are suppressed or acknowledged together." />
+      <ul>{group.locations.map(({ row, path }, i) => <li key={i}><Link to={withDebug(nav.href(callEvidenceHref(runId, row.address, calls) ?? `/r/${runId}?case=${encodeURIComponent(row.address.correlation)}`), debug)}>
+        {row.address.kind === "call" ? `${row.address.boundary} · ${row.address.operation}` : row.address.kind} · {row.blocking ? "blocking" : "informational"}
+      </Link><code> · {path}</code></li>)}</ul>
+    </div>)}
+  </Fold>;
 }
 
 // ---------------------------------------------------------------------------
@@ -598,11 +628,11 @@ export function Coverage({ d }: { d: Delta }) {
   );
 }
 export function Lanes({ d }: { d: Delta }) {
-  if (d.lanes.length === 0) return <p className="hint">No connector call placed a request in a lane.</p>;
+  if (d.lanes.length === 0) return <p className="hint">No legacy grouping hints were published.</p>;
   return (
     <table className="delta-lanes">
       <thead>
-        <tr><th>connector · flow</th><th className="num">requests</th><th className="num">differ differently</th><th className="num">only this run</th><th className="num">back on recording</th><th className="num">same as the other</th><th className="num">all agree</th></tr>
+        <tr><th>legacy grouping hint</th><th className="num">requests</th><th className="num">differ differently</th><th className="num">only this run</th><th className="num">back on recording</th><th className="num">same as the other</th><th className="num">all agree</th></tr>
       </thead>
       <tbody>
         {d.lanes.map((l) => {
@@ -640,6 +670,7 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
   const prRun = useQuery({ queryKey: ["run", runId], queryFn: () => api.run(runId) });
   const mainRun = useQuery({ queryKey: ["run", against], queryFn: () => api.run(against) });
   const calls = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId), enabled: !!d });
+  const baselineCalls = useQuery({ queryKey: ["calls", against], queryFn: () => api.calls(against), enabled: !!d });
   const prDiffs = useQuery({ queryKey: ["httpdiffs", runId], queryFn: () => api.httpDiffs(runId), enabled: !!d });
   const mainDiffs = useQuery({ queryKey: ["httpdiffs", against], queryFn: () => api.httpDiffs(against), enabled: !!d });
   const prRead = readState({ data: prDiffs.data, error: prDiffs.error });
@@ -695,7 +726,8 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
           )}
           {mainRead.state === "pending" && prRead.state === "ok" && <p className="hint">loading main's responses…</p>}
           {calls.error && <p className="err">Boundary evidence could not be read: {String(calls.error)}. The published delta remains visible; exact event links are unavailable.</p>}
-          <BoundaryObservations d={d} calls={calls.data ?? []} runId={runId} />
+          {baselineCalls.error && <p className="err">Baseline boundary evidence could not be read. The published delta is unchanged.</p>}
+          <BoundaryObservations d={d} calls={calls.data ?? []} baselineCalls={baselineCalls.data ?? []} runId={runId} />
           {prRead.state === "ok" && reqs.length > 0 && (
             <>
               <p className="hint">{reqs.filter((r) => r.outcome === "same" || r.outcome === "clean").length} of {reqs.length} published responses have no PR-specific status or body delta. Boundary observations are counted separately above.</p>

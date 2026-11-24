@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { Delta, RunRow, api, runParams } from "../lib/api";
 import { useActor } from "../lib/me";
 import { useDebug, withDebug } from "../lib/debug";
+import { useReviewNavigation } from "../lib/navigation";
 import { badgeOf, effectiveOf, groupCharged, requestsOf, useAcknowledgements } from "../lib/acknowledge";
 
 /**
@@ -16,6 +17,7 @@ import { badgeOf, effectiveOf, groupCharged, requestsOf, useAcknowledgements } f
  *  has no baseline, or introduced nothing. */
 export function AcknowledgeButton({ run }: { run: RunRow }) {
   const debug = useDebug();
+  const nav = useReviewNavigation();
   const against = runParams(run)?.delta_against ?? "";
   const delta = useQuery({
     queryKey: ["delta", run.run_id, against],
@@ -30,7 +32,7 @@ export function AcknowledgeButton({ run }: { run: RunRow }) {
   // read, still get the button: the page says what went wrong.
   if (d.verdict.overlay_failure || acks.error) {
     return (
-      <Link className="btn ack-btn todo" to={withDebug(`/r/${run.run_id}/acknowledge`, debug)}>
+      <Link className="btn ack-btn todo" to={withDebug(nav.href(`/r/${run.run_id}/acknowledge`), debug)}>
         Acknowledge <span className="count todo">unknown</span>
       </Link>
     );
@@ -39,7 +41,7 @@ export function AcknowledgeButton({ run }: { run: RunRow }) {
   const badge = badgeOf(groupCharged(d), d, me);
   if (!badge) return null;
   return (
-    <Link className={`btn ack-btn ${badge.tone}`} to={withDebug(`/r/${run.run_id}/acknowledge`, debug)}>
+    <Link className={`btn ack-btn ${badge.tone}`} to={withDebug(nav.href(`/r/${run.run_id}/acknowledge`), debug)}>
       Acknowledge <span className={`count ${badge.tone}`}>{badge.label}</span>
     </Link>
   );
@@ -49,11 +51,12 @@ export function AcknowledgeButton({ run }: { run: RunRow }) {
  *  the way to the page. */
 export function AcknowledgeLine({ runId, d }: { runId: string; d: Delta }) {
   const debug = useDebug();
+  const nav = useReviewNavigation();
   const acks = useAcknowledgements(runId);
   const v = d.verdict;
   const page = (
     <span className="sub">
-      <Link to={withDebug(`/r/${runId}/acknowledge`, debug)}>open the acknowledge page →</Link>
+      <Link to={withDebug(nav.href(`/r/${runId}/acknowledge`), debug)}>open the acknowledge page →</Link>
     </span>
   );
   // The failures come first, before any read of the acknowledgements: the
@@ -100,7 +103,7 @@ export function AcknowledgeLine({ runId, d }: { runId: string; d: Delta }) {
         <span className="h">{text}</span>
         <span className="sub">
           PR {gh.repo}#{gh.pr_number} ·{" "}
-          <Link to={withDebug(`/r/${runId}/acknowledge`, debug)}>open the acknowledge page →</Link>
+          <Link to={withDebug(nav.href(`/r/${runId}/acknowledge`), debug)}>open the acknowledge page →</Link>
         </span>
       </div>
     </div>

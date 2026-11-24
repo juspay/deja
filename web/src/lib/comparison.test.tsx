@@ -2,9 +2,10 @@ import { MemoryRouter } from "react-router-dom";
 import { RecordingFidelity } from "../pages/ReportPage";
 import { ValueDiverged } from "../components/UnifiedView";
 import { renderToStaticMarkup } from "react-dom/server";
+import { ReviewIdentityEvidence } from "../components/ReviewIdentity";
 import { describe, expect, it, vi } from "vitest";
-import type { CallRecord, Delta, DeltaRow, HttpBodyClassification, HttpComparison, HttpDiff, RunRow, Scorecard } from "./api";
-import { acceptedBodyReasons, callComparisonText, deltaRequestCounts, deltaReviewCounts, httpJudgment, joinDeltaResponses, responseFinding, responseMark, SAME_AS_RECORDING } from "./comparison";
+import type { CallRecord, Delta, DeltaRow, HttpBodyClassification, HttpComparison, HttpDiff, IdentityPublication, RunRow, Scorecard } from "./api";
+import { acceptedBodyReasons, callComparisonText, callRuntimeText, callTransportHost, deltaRequestCounts, deltaReviewCounts, httpJudgment, joinDeltaResponses, responseFinding, responseMark, SAME_AS_RECORDING } from "./comparison";
 import { CallComparison, CorrelationOutcome, ResponseEvidence } from "../components/Comparison";
 import { BoundaryObservations, FieldTable, Headline, SideCell } from "../components/DeltaSummary";
 import { buildSpine } from "./spine";
@@ -303,7 +304,7 @@ describe("delta joins published comparison addresses", () => {
     const main = scorecard([{ diff: mainRaw, body: body() }]);
     const rows = [literal, nested].map((path) => ({ ...deltaRow(path, "introduced"), m: "tape" as const }));
     const joined = joinDeltaResponses(delta(rows), [raw], [mainRaw], pr, main);
-    expect(joined[0].fields).toEqual([literal, nested].map((path) => ({ path, recording: 1, main: SAME_AS_RECORDING, pr: 2, sameAsMain: false, bucket: "introduced" })));
+    expect(joined[0].fields).toMatchObject([literal, nested].map((path) => ({ path, recording: 1, main: SAME_AS_RECORDING, pr: 2, sameAsMain: false, bucket: "introduced" })));
     expect(responseFinding(pr, raw)?.label).toBe("2 blocking response differences");
     const response = renderToStaticMarkup(<ResponseEvidence diff={raw} scorecard={pr} />).split("<details")[0];
     const table = renderToStaticMarkup(<FieldTable reqs={joined} mainSha="main" />);
@@ -337,7 +338,7 @@ describe("delta joins published comparison addresses", () => {
     const pr = scorecard([{ diff: raw, body: body({ blocking: [field("$.items[0].total", 10, 20)] }) }]);
     const main = scorecard([{ diff: raw, body: body({ blocking: [field("$.items[0].total", 10, 15)] }) }]);
     const joined = joinDeltaResponses(delta([row]), [raw], [raw], pr, main);
-    expect(joined[0].fields).toEqual([{ path: "$.items[0].total", recording: 10, main: 15, pr: 20, sameAsMain: false, bucket: "changed" }]);
+    expect(joined[0].fields).toMatchObject([{ path: "$.items[0].total", recording: 10, main: 15, pr: 20, sameAsMain: false, bucket: "changed" }]);
   });
 
   it("does not add raw accepted paths to the backend's field list", () => {
@@ -401,7 +402,7 @@ describe("delta joins published comparison addresses", () => {
     const raw = diff({ body_diff_address_version: 1, body_diff: paths.map((path) => field(path, 1, 2)) });
     const main = diff({ body_diff_address_version: 1, body_diff: paths.map((path) => field(path, 1, 3)) });
     const joined = joinDeltaResponses(delta(paths.map((path) => deltaRow(path)), { http_comparison_mode: "legacy" }), [raw], [main]);
-    expect(joined[0].fields).toEqual(paths.map((path) => ({ path, recording: 1, main: 3, pr: 2, sameAsMain: false, bucket: "changed" })));
+    expect(joined[0].fields).toMatchObject(paths.map((path) => ({ path, recording: 1, main: 3, pr: 2, sameAsMain: false, bucket: "changed" })));
     const html = renderToStaticMarkup(<FieldTable reqs={joined} mainSha="main" />);
     expect(html).toContain("$[&quot;a.b&quot;]");
     expect(html).toContain("$.a.b");
@@ -410,7 +411,7 @@ describe("delta joins published comparison addresses", () => {
   it("keeps a legacy delta's bucket but refuses values from duplicate raw paths without address metadata", () => {
     const raw = diff({ body_diff: [field("$.a.b", 1, 2), field("$.a.b", 3, 4)] });
     const joined = joinDeltaResponses(delta([deltaRow("$.a.b")], { http_comparison_mode: "legacy" }), [raw], [raw]);
-    expect(joined[0].fields).toEqual([{ path: "$.a.b", recording: undefined, main: undefined, pr: undefined, sameAsMain: false, bucket: "changed" }]);
+    expect(joined[0].fields).toMatchObject([{ path: "$.a.b", recording: undefined, main: undefined, pr: undefined, sameAsMain: false, bucket: "changed" }]);
     expect(joined[0].outcome).toBe("conflict");
     expect(joined[0].notes.join(" ")).toContain("duplicated and ambiguous");
     expect(renderToStaticMarkup(<FieldTable reqs={joined} mainSha="main" />)).toContain("not published");
@@ -533,5 +534,99 @@ describe("review evidence hierarchy", () => {
       expect(guardedHtml).not.toContain("<details");
       expect(guardedHtml).toContain("Recording fidelity");
     }
+  });
+});
+
+describe("authoritative runtime evidence", () => {
+  it("separates substituted values from argument divergence and does not infer execution from origin", () => {
+    const changed = call({ kind: "value_diverged", origin: true, observed: { args: { url: "https://user:secret@hooks.example/send?token=private" }, runtime: { version: 1, provenance: "recorded", outcome: "substituted" } }, comparison: { version: 1, subject: "arguments", verdict: { kind: "diverged" } } });
+    expect(callRuntimeText(changed)).toContain("Recorded response substituted");
+    expect(callRuntimeText(changed)).not.toContain("real boundary executed");
+    expect(callTransportHost(changed)).toBe("hooks.example");
+    expect(callRuntimeText(call({ origin: true }))).toContain("unavailable");
+    expect(callRuntimeText(call({ observed: { runtime: { version: 2, provenance: "recorded", outcome: "substituted" } } }))).toContain("not supported");
+  });
+  it("distinguishes execute-shadow, recorded error, synthesized and stopped outcomes", () => {
+    const text = (provenance: string, outcome?: string) => callRuntimeText(call({ observed: { runtime: { version: 1, provenance, outcome } } }));
+    expect(text("execute_shadow")).toContain("real boundary executed");
+    expect(text("served_recorded_error", "substituted")).toContain("recorded error");
+    expect(text("recorded", "synthesized")).toContain("synthesized a response");
+    expect(text("recorded", "stopped")).toContain("stopped at this call");
+    expect(text("future", "substituted")).toContain("unsupported");
+    expect(callRuntimeText(call({ observed: { runtime: { version: 1, provenance: "execute_shadow", cancelled: true } } }))).toContain("cancelled");
+  });
+});
+
+describe("declared semantic identity evidence", () => {
+  const publication = () => ({ version: 1, declaration: { digest: "declaration-fixture", source: "current_deployment" as const }, requests: { request: { connector: { status: "known" as const, value: "provider-from-header", evidence: [{ selector: 0, value: "provider-from-header", boundary: "rpc", operation: "send", graph_node_id: 7, location: "args/headers/0/1" }] }, flow: { status: "unknown" as const, evidence: [] } } } });
+  const renderIdentity = (candidate: IdentityPublication, baseline = candidate, correlations = ["request"]) => renderToStaticMarkup(<MemoryRouter><ReviewIdentityEvidence identities={{ candidate, baseline }} correlations={correlations} candidateRun="candidate" baselineRun="baseline" /></MemoryRouter>);
+  it("shows declared semantic values independently of transport and retains source navigation context", () => {
+    const nav = JSON.stringify({ runs: "/runs?system=service&cursor=older", trail: [] });
+    const html = renderToStaticMarkup(<MemoryRouter initialEntries={[`/r/candidate?nav=${encodeURIComponent(nav)}`]}><ReviewIdentityEvidence identities={{ candidate: publication(), baseline: publication() }} correlations={["request"]} candidateRun="candidate" baselineRun="baseline" /></MemoryRouter>);
+    expect(html).toContain("provider-from-header");
+    expect(html).toContain("current deployment declaration");
+    expect(html).toContain("not a run-pinned scoring policy");
+    expect(html).toContain("args/headers/0/1");
+    expect(html).toContain("node=7");
+    expect(html).toContain("nav=");
+    expect(html).toContain("selected evidence unavailable");
+    expect(html).toContain("Historical version 1 publication");
+    expect(html).toContain("Legacy connector");
+  });
+  it("keeps unknown or unsupported identities honest and surfaces evidence access notes", () => {
+    const unsupported = { ...publication(), version: 99, notes: ["Graph evidence could not be read."] };
+    const unknown = { version: 2, declaration: null, requests: {}, notes: ["Identity configuration could not be resolved."] };
+    const html = renderIdentity(unsupported, unknown);
+    expect(html).not.toContain("provider-from-header");
+    expect(html).toContain("version 99 is unsupported");
+    expect(html).toContain("Graph evidence could not be read");
+    expect(html).toContain("Identity configuration could not be resolved");
+    expect(html).toContain("no review dimension selectors are declared");
+    expect(html).not.toContain("Legacy connector");
+  });
+  it("renders any declared dimensions, their labels and conflicting source evidence without changing judgments", () => {
+    const candidate: IdentityPublication = { version: 2, declaration: publication().declaration, dimensions: { region: { label: "Deployment region" }, operation: {}, category: { label: "Work category" } }, requests: { request: { dimensions: {
+      region: { status: "known", value: "eu-west", evidence: [{ selector: 0, value: "eu-west", boundary: "rpc", operation: "dispatch", location: "args/region", recorded_event: 0, graph_node_id: 19 }] },
+      operation: { status: "unknown", evidence: [] },
+      category: { status: "ambiguous", evidence: [{ selector: 0, value: "batch", boundary: "rpc", operation: "dispatch", location: "args/category" }, { selector: 1, value: "interactive", boundary: "database", operation: "lookup", location: "result/category" }] },
+    } } } };
+    const before = JSON.stringify(candidate);
+    const html = renderIdentity(candidate);
+    expect(html).toContain("Deployment region");
+    expect(html).toContain("Work category");
+    expect(html).toContain('title="operation">operation');
+    expect(html).toContain("eu-west");
+    expect(html).toContain("ambiguous · declared sources disagree");
+    expect(html).toContain("selected evidence unavailable");
+    expect(html).toContain("batch");
+    expect(html).toContain("interactive");
+    expect(html).toContain("args/region");
+    expect(html).toContain("recorded event 0");
+    expect(html).toContain("node=19");
+    expect(html).toContain("side=rep");
+    expect(html).not.toContain("Legacy connector");
+    expect(html).not.toContain("semantic flow");
+    expect(html).not.toContain("accepted by the scorer");
+    expect(JSON.stringify(candidate)).toBe(before);
+  });
+  it("escapes dimension labels and values and treats prototype-named IDs as ordinary declared data", () => {
+    const candidate: IdentityPublication = JSON.parse('{"version":2,"declaration":{"digest":"fixture","source":"current_deployment"},"dimensions":{"__proto__":{"label":"<img src=x>"},"constructor":{}},"requests":{"__proto__":{"dimensions":{"__proto__":{"status":"known","value":"<script>alert(1)</script>","evidence":[]}}}}}');
+    const html = renderIdentity(candidate, candidate, ["__proto__", "constructor"]);
+    expect(html).toContain("&lt;img src=x&gt;");
+    expect(html).toContain("&lt;script&gt;alert(1)&lt;/script&gt;");
+    expect(html).toContain('title="constructor">constructor');
+    expect(html).toContain("selected evidence unavailable");
+    expect(html).not.toContain("<script>");
+    expect(html).not.toContain("[object Object]");
+  });
+  it("does not invent fixed dimensions for an absent or empty current declaration", () => {
+    const absent = { ...publication(), version: 2, declaration: null };
+    const empty = { ...publication(), version: 2, dimensions: {} };
+    const html = renderIdentity(absent, empty);
+    expect(html).toContain("No dimension values are inferred");
+    expect(html).toContain("this declaration publishes no review dimensions");
+    expect(html).not.toContain("provider-from-header");
+    expect(html).not.toContain("Legacy connector");
+    expect(html).not.toContain("Legacy flow");
   });
 });

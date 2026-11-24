@@ -1,5 +1,6 @@
 import type { CallRecord, ClauseSource, Delta, DeltaBucket, DeltaFamily, DeltaRow, HttpBodyClassification, HttpComparison, HttpDiff, JsonFieldDiff, Scorecard, ValueAbsorption } from "./api";
 import { deltaFamily } from "./api";
+import { capturedResponseFieldValue, present, responseFieldValue, unavailable, type EvidenceField } from "./fieldEvidence";
 
 /** Keys identify published responses; they do not compare captured values. */
 export function responseKey(correlation: string, sequence: number): string {
@@ -20,6 +21,11 @@ function validBody(body: HttpBodyClassification): boolean {
     if (!field || typeof field.json_path !== "string" || !field.json_path || paths.has(field.json_path)
       || typeof field.candidate_identity !== "string" || !field.candidate_identity.trim()
       || !Object.prototype.hasOwnProperty.call(field, "baseline") || !Object.prototype.hasOwnProperty.call(field, "candidate")) return false;
+    for (const side of ["baseline", "candidate"] as const) {
+      const presence = field[`${side}_presence`];
+      if (presence !== undefined && !["present", "missing", "unavailable"].includes(presence)) return false;
+      if (presence === "missing" && field[side] !== null) return false;
+    }
     paths.add(field.json_path);
   }
   const strings = (values: unknown) => Array.isArray(values) && values.every((value) => typeof value === "string");
@@ -160,10 +166,31 @@ export function callComparisonText(call: CallRecord): string {
   }
 }
 
+/** Runtime observations never follow from scorer categories or origin flags. */
+export function callRuntimeText(call: CallRecord): string {
+  const runtime = call.observed?.runtime;
+  if (!runtime) return "Runtime evidence is unavailable for this call; this response does not establish its outcome or value provenance.";
+  if (runtime.version !== 1) return `Runtime observation version ${runtime.version} is not supported by this dashboard.`;
+  if (runtime.cancelled) return "This replay call was cancelled; completed execution or substitution is not established.";
+  if (runtime.provenance === "execute_shadow") return "The real boundary executed during replay (execute-shadow provenance).";
+  if (runtime.outcome === "stopped") return "Replay stopped at this call without returning a substituted response.";
+  if (runtime.provenance === "served_recorded_error") return "This call served its recorded error instead of executing the real boundary.";
+  if (runtime.provenance === "recorded" && runtime.outcome === "substituted") return "Recorded response substituted. Its source is independent of the argument comparison.";
+  if (runtime.provenance === "recorded" && runtime.outcome === "synthesized") return "The replay site synthesized a response; it did not come from the recording.";
+  return "The published runtime outcome or provenance is unsupported; execution and substitution are not established.";
+}
+
+/** A transport fact, never a semantic provider identity. No path/query/credentials. */
+export function callTransportHost(call: CallRecord): string | null {
+  const args = call.observed?.args ?? call.recorded?.args;
+  if (!args || typeof args !== "object" || !("url" in args) || typeof args.url !== "string") return null;
+  try { const url = new URL(args.url); return ["https:", "http:"].includes(url.protocol) ? url.host : null; } catch { return null; }
+}
+
 export const SAME_AS_RECORDING = Symbol("same as recording");
 export type FieldSide = unknown | typeof SAME_AS_RECORDING;
 export type DeltaOutcome = "conflict" | "new" | "restored" | "same" | "clean";
-export type DeltaField = { path: string; recording: unknown; main: FieldSide; pr: FieldSide; sameAsMain: boolean; bucket: DeltaBucket };
+export type DeltaField = { path: string; recording: unknown; main: FieldSide; pr: FieldSide; sameAsMain: boolean; bucket: DeltaBucket; evidence?: EvidenceField };
 export type DeltaRequest = {
   correlation: string;
   sequence: number;
@@ -171,6 +198,7 @@ export type DeltaRequest = {
   lane: string;
   outcome: DeltaOutcome;
   status: [number, number | null, number];
+  statusEvidence?: EvidenceField;
   fields: DeltaField[];
   notes: string[];
 };
@@ -243,13 +271,25 @@ export function joinDeltaResponses(delta: Delta, prDiffs: HttpDiff[], mainDiffs:
     const key = responseKey(row.address.correlation, row.address.request_sequence ?? 0);
     rowsBy.set(key, [...(rowsBy.get(key) ?? []), row]);
   }
-  const mainBy = new Map(mainDiffs.map((diff) => [responseKey(diff.correlation_id, diff.request_sequence), diff]));
+  const index = (diffs: HttpDiff[]) => {
+    const by = new Map<string, { diff: HttpDiff; count: number }>();
+    for (const diff of diffs) {
+      const key = responseKey(diff.correlation_id, diff.request_sequence);
+      const entry = by.get(key);
+      if (entry) entry.count += 1;
+      else by.set(key, { diff, count: 1 });
+    }
+    return by;
+  };
+  const mainBy = index(mainDiffs);
+  const prBy = index(prDiffs);
   const mode = delta.http_comparison_mode ?? "legacy";
-  return prDiffs.map((diff): DeltaRequest => {
+  return [...prBy.values()].map(({ diff, count }): DeltaRequest => {
     const key = responseKey(diff.correlation_id, diff.request_sequence);
     const rows = rowsBy.get(key) ?? [];
-    const main = mainBy.get(key);
-    const p = responseFields(mode, prScorecard, diff);
+    const entry = mainBy.get(key);
+    const main = entry?.count === 1 ? entry.diff : undefined;
+    const p = responseFields(mode, prScorecard, count === 1 ? diff : undefined);
     const m = responseFields(mode, mainScorecard, main);
     const fields = rows.flatMap((row): DeltaField[] => {
       if (row.address.kind !== "body") return [];
@@ -257,9 +297,17 @@ export function joinDeltaResponses(delta: Delta, prDiffs: HttpDiff[], mainDiffs:
       const prField = p.fields.find((f) => f.json_path === path);
       const mainField = m.fields.find((f) => f.json_path === path);
       const side = (value: DeltaRow["m"], field: JsonFieldDiff | undefined): FieldSide => value === "tape" ? SAME_AS_RECORDING : field?.candidate;
-      return [{ path, recording: (prField ?? mainField)?.baseline, main: side(row.m, mainField), pr: side(row.y, prField), sameAsMain: row.bucket === "inherited" || row.bucket === "clean", bucket: row.bucket }];
+      const recording = responseFieldValue(prField ?? mainField, "baseline", prField ? diff : main);
+      const evidence: EvidenceField = {
+        path,
+        recording,
+        main: row.m === "absent" ? unavailable("The baseline did not reach this field.") : mainField ? responseFieldValue(mainField, "candidate", main) : row.m === "tape" ? capturedResponseFieldValue(path, "candidate", main) : responseFieldValue(undefined, "candidate"),
+        pr: row.y === "absent" ? unavailable("The candidate did not reach this field.") : prField ? responseFieldValue(prField, "candidate", diff) : row.y === "tape" && count === 1 ? capturedResponseFieldValue(path, "candidate", diff) : responseFieldValue(undefined, "candidate"),
+      };
+      return [{ path, recording: (prField ?? mainField)?.baseline, main: side(row.m, mainField), pr: side(row.y, prField), sameAsMain: row.bucket === "inherited" || row.bucket === "clean", bucket: row.bucket, evidence }];
     });
     const notes = [...new Set([p.note, m.note].filter((note): note is string => !!note))];
+    if (count > 1 || (entry?.count ?? 0) > 1) notes.push("Duplicate response correlation/sequence addresses make captured evidence ambiguous; those values are unavailable.");
     if (mode === "legacy") notes.unshift("Historical response comparison: raw field values are shown for the backend's delta addresses.");
     if (fields.some((field) => field.main === undefined || field.pr === undefined)) notes.push("Some judged field values were not published; their delta classifications remain shown.");
     return {
@@ -269,6 +317,7 @@ export function joinDeltaResponses(delta: Delta, prDiffs: HttpDiff[], mainDiffs:
       lane: laneBy.get(diff.correlation_id) ?? `no connector call · ${(diff.request_path.split("/").pop() ?? "").toLowerCase()}`,
       outcome: outcomeOf(new Set(rows.map((row) => deltaFamily(row.bucket)))),
       status: [diff.status_baseline, main?.status_candidate ?? null, diff.status_candidate],
+      statusEvidence: { path: "$status", recording: count === 1 ? present(diff.status_baseline) : unavailable("Duplicate captured response addresses."), main: main ? present(main.status_candidate) : unavailable("Baseline response status was not uniquely published."), pr: count === 1 ? present(diff.status_candidate) : unavailable("Duplicate captured response addresses.") },
       fields,
       notes,
     };

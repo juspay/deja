@@ -1,3 +1,4 @@
+import { useReviewNavigation } from "../lib/navigation";
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams, useSearchParams } from "react-router-dom";
@@ -34,6 +35,11 @@ import {
  * has moved away from the tape. The tape-relative verdict is shown beside the
  * delta verdict, never replaced by it.
  */
+
+function ReviewLink({ to, children, ...props }: React.ComponentProps<typeof Link>) {
+  const navigation = useReviewNavigation();
+  return <Link {...props} to={typeof to === "string" ? navigation.href(to) : to}>{children}</Link>;
+}
 
 export function sideLabel(s: DeltaSide): { text: string; cls: string } {
   if (s === "tape") return { text: "= tape", cls: "tape" };
@@ -166,7 +172,7 @@ function SideCard({ role, info, hint }: { role: string; info: DeltaSideInfo; hin
   return (
     <div className="delta-side">
       <span className="role">{role}</span>
-      <Link className="rid" to={withDebug(`/r/${info.run}`, debug)}>{info.run}</Link>
+      <ReviewLink className="rid" to={withDebug(`/r/${info.run}`, debug)}>{info.run}</ReviewLink>
       <span className="cand" title={cand.full}>{cand.label}</span>
       <span className="hint">{hint}</span>
     </div>
@@ -231,6 +237,7 @@ function AgainstPicker({
 }
 
 export default function DeltaPage() {
+  const navigation = useReviewNavigation();
   const { runId = "" } = useParams();
   const [params, setParams] = useSearchParams();
   const debug = useDebug();
@@ -267,8 +274,8 @@ export default function DeltaPage() {
   return (
     <>
       <div className="crumb">
-        <Link to={withDebug("/runs", debug)}>Runs</Link> <span>/</span>{" "}
-        <Link to={withDebug(`/r/${runId}`, debug)}>report</Link> <span>/</span>{" "}
+        <ReviewLink to={withDebug(navigation.runsHref, debug)}>Runs</ReviewLink> <span>/</span>{" "}
+        <ReviewLink to={withDebug(navigation.reportHref, debug)}>report</ReviewLink> <span>/</span>{" "}
         <span className="hint">delta</span>
       </div>
       <h1>Delta</h1>
