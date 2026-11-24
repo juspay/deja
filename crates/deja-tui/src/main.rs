@@ -1079,7 +1079,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Min(8),
             Constraint::Length(2),
         ])
-        .split(frame.size());
+        .split(frame.area());
 
     render_header(frame, chunks[0], app);
     render_tabs(frame, chunks[1], app);
@@ -1322,7 +1322,7 @@ fn render_semantic(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         "callsite",
     ]))
     .block(panel(&title))
-    .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+    .row_highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow));
     frame.render_stateful_widget(table, area, &mut app.semantic_table);
 }
 
@@ -1360,12 +1360,12 @@ fn render_graph(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         "seq", "node", "request", "span", "target", "level", "parent", "dur",
     ]))
     .block(panel(&title))
-    .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
+    .row_highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
     frame.render_stateful_widget(table, area, &mut app.graph_table);
 }
 
 fn render_graph_visual(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_rect(90, 80, frame.size());
+    let area = centered_rect(90, 80, frame.area());
     frame.render_widget(Clear, area);
 
     let title = "Graph Visual ──↑↓ navigate | enter detail | q/esc close──";
@@ -1465,7 +1465,7 @@ fn build_graph_line_spans(node: &GraphNode, base_style: Style) -> Vec<Span<'_>> 
 }
 
 fn render_graph_detail_popup(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_rect(80, 70, frame.size());
+    let area = centered_rect(80, 70, frame.area());
     frame.render_widget(Clear, area);
 
     let detail = app
@@ -1566,7 +1566,7 @@ fn render_requests(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         &title,
         app.request_focus == RequestFocus::Requests,
     ))
-    .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
     frame.render_stateful_widget(table, chunks[0], &mut app.request_table);
 
     let selected_request = app.current_request_id();
@@ -1587,7 +1587,7 @@ fn render_requests(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             "Nested Request",
             app.request_focus == RequestFocus::Tree,
         ))
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow));
+        .row_highlight_style(Style::default().fg(Color::Black).bg(Color::Yellow));
     frame.render_stateful_widget(tree, chunks[1], &mut app.tree_table);
 
     let detail = app
@@ -1848,7 +1848,7 @@ fn render_replay_timeline(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         "status",
     ]))
     .block(panel(&title))
-    .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
     frame.render_stateful_widget(table, area, &mut app.replay_table);
 }
 
@@ -1966,7 +1966,7 @@ fn render_http(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     )
     .header(header_row(["", "request", "status", "body diffs"]))
     .block(panel(&title))
-    .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
     frame.render_stateful_widget(table, chunks[0], &mut app.http_table);
 
     let detail = app
@@ -2100,7 +2100,7 @@ fn render_divergences(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     )
     .header(header_row(["request", "verdict", "what diverged"]))
     .block(focused_panel(&title, sel_focused))
-    .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD));
     frame.render_stateful_widget(table, zones[0], &mut app.divergence_table);
 
     // --- zone 1: the record↔replay diff body ---
@@ -2536,7 +2536,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_input(frame: &mut Frame<'_>, app: &App) {
-    let area = centered_rect(60, 20, frame.size());
+    let area = centered_rect(60, 20, frame.area());
     let title = match app.input_mode {
         InputMode::Search => "Search",
         InputMode::Boundary => "Boundary Filter",

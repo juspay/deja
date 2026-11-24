@@ -9,10 +9,10 @@ description = "Terminal artifact explorer for Deja semantic and execution graph 
 
 [dependencies]
 anyhow = "1"
-crossterm = "0.27"
+crossterm = "0.29"
 deja-core = { path = "../deja-core" }
 deja-runtime = { path = "../deja-runtime" }
-ratatui = "0.26"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
