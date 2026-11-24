@@ -3836,16 +3836,7 @@ fn review_identity_from_files(
             return publication;
         }
     };
-    let needs_graph = declaration
-        .connector
-        .iter()
-        .chain(&declaration.flow)
-        .any(|selector| {
-            matches!(
-                selector,
-                deja_compactor::settings::ReviewIdentitySelector::GraphField { .. }
-            )
-        });
+    let needs_graph = declaration.needs_graph();
     let graph = if needs_graph {
         match observed.map(read_jsonl_strict::<deja::DejaRecord>) {
             Some(Ok(records)) => records
@@ -3918,17 +3909,33 @@ async fn review_identity_for(
 #[cfg(test)]
 mod review_identity_publication_tests {
     use super::*;
-    use deja_compactor::settings::{ReviewIdentityDeclaration, ReviewIdentitySelector};
+    use deja_compactor::settings::{
+        ReviewIdentityDeclaration, ReviewIdentityDimension, ReviewIdentitySelector,
+    };
 
     fn declaration() -> ReviewIdentityDeclaration {
         ReviewIdentityDeclaration {
-            connector: vec![ReviewIdentitySelector::Argument {
-                boundary: "transport".into(),
-                pointer: "/connector".into(),
-            }],
-            flow: vec![ReviewIdentitySelector::GraphField {
-                field: "flow".into(),
-            }],
+            dimensions: std::collections::BTreeMap::from([
+                (
+                    "vendor".into(),
+                    ReviewIdentityDimension {
+                        label: Some("Vendor".into()),
+                        selectors: vec![ReviewIdentitySelector::Argument {
+                            boundary: "transport".into(),
+                            pointer: "/connector".into(),
+                        }],
+                    },
+                ),
+                (
+                    "operation".into(),
+                    ReviewIdentityDimension {
+                        label: None,
+                        selectors: vec![ReviewIdentitySelector::GraphField {
+                            field: "flow".into(),
+                        }],
+                    },
+                ),
+            ]),
         }
     }
 
@@ -3950,13 +3957,15 @@ mod review_identity_publication_tests {
         std::fs::write(&graph, "{torn graph").expect("valid display evidence fixture");
         let publication = review_identity_from_files(&ledger, Some(&graph), &declaration());
         assert_eq!(
-            publication.requests["request-one"]
-                .connector
+            publication.requests["request-one"].dimensions["vendor"]
                 .value
                 .as_deref(),
             Some("declared-provider")
         );
-        assert_eq!(publication.requests["request-one"].flow.status, "unknown");
+        assert_eq!(
+            publication.requests["request-one"].dimensions["operation"].status,
+            "unknown"
+        );
         assert!(publication.notes.iter().any(|note| note.contains("graph")));
         assert_eq!(
             publication

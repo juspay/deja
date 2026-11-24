@@ -20,6 +20,7 @@ pub enum EvidenceSide {
 pub struct IdentityPublication {
     pub version: u8,
     pub declaration: Option<DeclarationSource>,
+    pub dimensions: BTreeMap<String, DimensionDefinition>,
     pub requests: BTreeMap<String, ReviewIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
@@ -33,8 +34,13 @@ pub struct DeclarationSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewIdentity {
-    pub connector: Dimension,
-    pub flow: Dimension,
+    pub dimensions: BTreeMap<String, Dimension>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DimensionDefinition {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,23 +88,6 @@ fn scalar(value: &serde_json::Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty() && value.len() <= 256)
         .map(str::to_owned)
-}
-
-fn valid_selector(selector: &ReviewIdentitySelector) -> bool {
-    match selector {
-        ReviewIdentitySelector::Argument { boundary, pointer }
-        | ReviewIdentitySelector::Header {
-            boundary, pointer, ..
-        } => {
-            !boundary.trim().is_empty()
-                && (pointer.is_empty() || pointer.starts_with('/'))
-                && !pointer.as_bytes().iter().enumerate().any(|(i, byte)| {
-                    *byte == b'~' && !matches!(pointer.as_bytes().get(i + 1), Some(b'0' | b'1'))
-                })
-                && !matches!(selector, ReviewIdentitySelector::Header { name, .. } if name.trim().is_empty())
-        }
-        ReviewIdentitySelector::GraphField { field } => !field.trim().is_empty(),
-    }
 }
 
 fn selected_values(
@@ -194,8 +183,9 @@ pub fn project(
 ) -> IdentityPublication {
     let Some(declaration) = declaration else {
         return IdentityPublication {
-            version: 1,
+            version: 2,
             declaration: None,
+            dimensions: BTreeMap::new(),
             requests: BTreeMap::new(),
             notes: vec![],
         };
@@ -204,12 +194,9 @@ pub fn project(
         serde_json::to_vec(declaration).unwrap_or_default(),
     ));
     let mut notes = Vec::new();
-    for (dimension, selectors) in [
-        ("connector", &declaration.connector),
-        ("flow", &declaration.flow),
-    ] {
-        for (index, selector) in selectors.iter().enumerate() {
-            let invalid = !valid_selector(selector);
+    for (dimension, definition) in &declaration.dimensions {
+        for (index, selector) in definition.selectors.iter().enumerate() {
+            let invalid = !selector.is_valid();
             if invalid {
                 notes.push(format!(
                     "{dimension} selector {} is invalid and cannot establish identity.",
@@ -236,7 +223,7 @@ pub fn project(
         nodes.remove(id);
     }
     let graph = nodes;
-    let mut requests: BTreeMap<String, (BTreeSet<IdentityEvidence>, BTreeSet<IdentityEvidence>)> =
+    let mut requests: BTreeMap<String, BTreeMap<String, BTreeSet<IdentityEvidence>>> =
         BTreeMap::new();
     for call in calls {
         let Some(correlation) = call.correlation_id.as_ref() else {
@@ -249,12 +236,10 @@ pub fn project(
             continue;
         };
         let dimensions = requests.entry(correlation.clone()).or_default();
-        for (selectors, collected) in [
-            (&declaration.connector, &mut dimensions.0),
-            (&declaration.flow, &mut dimensions.1),
-        ] {
-            for (index, selector) in selectors.iter().enumerate() {
-                if !valid_selector(selector) {
+        for (id, definition) in &declaration.dimensions {
+            let collected = dimensions.entry(id.clone()).or_default();
+            for (index, selector) in definition.selectors.iter().enumerate() {
+                if !selector.is_valid() {
                     continue;
                 }
                 for (value, location, node) in selected_values(selector, call, captured, &graph) {
@@ -272,7 +257,19 @@ pub fn project(
         }
     }
     IdentityPublication {
-        version: 1,
+        version: 2,
+        dimensions: declaration
+            .dimensions
+            .iter()
+            .map(|(id, definition)| {
+                (
+                    id.clone(),
+                    DimensionDefinition {
+                        label: definition.label.clone(),
+                    },
+                )
+            })
+            .collect(),
         declaration: Some(DeclarationSource {
             digest,
             source: "current_deployment".to_owned(),
@@ -288,12 +285,14 @@ pub fn project(
         },
         requests: requests
             .into_iter()
-            .map(|(key, (connector, flow))| {
+            .map(|(key, dimensions)| {
                 (
                     key,
                     ReviewIdentity {
-                        connector: dimension(connector),
-                        flow: dimension(flow),
+                        dimensions: dimensions
+                            .into_iter()
+                            .map(|(id, evidence)| (id, dimension(evidence)))
+                            .collect(),
                     },
                 )
             })
@@ -304,65 +303,103 @@ pub fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deja_compactor::settings::ReviewIdentityDimension;
 
     fn call(args: serde_json::Value) -> CallRecord {
         serde_json::from_value(serde_json::json!({
             "boundary":"transport", "trait_name":"Client", "method_name":"send", "kind":"matched", "blocking":false,
-            "correlation_id":"r", "observed":{"args":args}, "recorded":{"args":{"connector":"old"}}
+            "correlation_id":"r", "observed":{"args":args}, "recorded":{"args":{"tenant":"old"}}
         })).expect("valid semantic identity fixture")
     }
 
+    fn declaration(value: serde_json::Value) -> ReviewIdentityDeclaration {
+        serde_json::from_value(value).expect("valid semantic identity declaration")
+    }
+
     #[test]
-    fn identities_require_declarations_and_never_guess_from_destination() {
-        let calls = [call(
-            serde_json::json!({"url":"https://hooks.zurich.example/send", "headers":[["x-provider","adyen"]]}),
+    fn arbitrary_nonpayment_dimensions_use_declared_evidence_without_inference() {
+        let mut calls = [call(
+            serde_json::json!({"url":"https://other.example/send", "headers":[["x-tenant","acme"]], "worker":"eu-west"}),
         )];
-        assert!(project(&calls, &[], None, EvidenceSide::Observed)
-            .declaration
-            .is_none());
-        let declaration = ReviewIdentityDeclaration {
-            connector: vec![ReviewIdentitySelector::Header {
-                boundary: "transport".into(),
-                pointer: "/headers".into(),
-                name: "x-provider".into(),
-            }],
-            flow: vec![],
-        };
-        let publication = project(&calls, &[], Some(&declaration), EvidenceSide::Observed);
-        assert_eq!(
-            publication.requests["r"].connector.value.as_deref(),
-            Some("adyen")
+        calls[0].observed.as_mut().expect("fixture").graph_node_id = Some(2);
+        let declaration = declaration(serde_json::json!({"dimensions": {
+            "organization": {"label":"Organization", "selectors":[{"kind":"header","boundary":"transport","pointer":"/headers","name":"x-tenant"}]},
+            "worker_region": {"selectors":[{"kind":"argument","boundary":"transport","pointer":"/worker"}]},
+            "job_kind": {"label":"Job kind", "selectors":[{"kind":"graph_field","field":"task"}]}
+        }}));
+        let publication = project(
+            &calls,
+            &[node(2, None, "r", "index_document")],
+            Some(&declaration),
+            EvidenceSide::Observed,
         );
+        assert_eq!(publication.version, 2);
+        assert_eq!(publication.dimensions.len(), 3);
         assert_eq!(
-            publication.requests["r"].connector.evidence[0].location,
+            publication.dimensions["organization"].label.as_deref(),
+            Some("Organization")
+        );
+        let dimensions = &publication.requests["r"].dimensions;
+        assert_eq!(dimensions["organization"].value.as_deref(), Some("acme"));
+        assert_eq!(
+            dimensions["organization"].evidence[0].location,
             "args/headers/0/1"
         );
-        assert_eq!(publication.requests["r"].flow.status, "unknown");
         assert_eq!(
-            publication
-                .declaration
-                .expect("valid semantic identity fixture")
-                .source,
+            dimensions["worker_region"].value.as_deref(),
+            Some("eu-west")
+        );
+        assert_eq!(
+            dimensions["job_kind"].value.as_deref(),
+            Some("index_document")
+        );
+        assert_eq!(dimensions["job_kind"].evidence[0].graph_node_id, Some(2));
+        assert_eq!(
+            publication.declaration.expect("fixture").source,
             "current_deployment"
         );
     }
 
     #[test]
+    fn no_declaration_publishes_no_dimensions_and_does_not_scan_evidence() {
+        let publication = project(
+            &[call(
+                serde_json::json!({"url":"https://guess.example", "tenant":"guess"}),
+            )],
+            &[node(2, None, "r", "one"), node(2, None, "r", "two")],
+            None,
+            EvidenceSide::Observed,
+        );
+        assert_eq!(publication.version, 2);
+        assert!(publication.declaration.is_none());
+        assert!(publication.requests.is_empty());
+        assert!(publication.dimensions.is_empty());
+        assert!(publication.notes.is_empty());
+    }
+
+    #[test]
     fn competing_declared_values_are_ambiguous_and_recorded_does_not_fill_candidate() {
         let calls = [
-            call(serde_json::json!({"connector":"one"})),
-            call(serde_json::json!({"connector":"two"})),
+            call(serde_json::json!({"tenant":"one"})),
+            call(serde_json::json!({"tenant":"two"})),
         ];
-        let declaration = ReviewIdentityDeclaration {
-            connector: vec![ReviewIdentitySelector::Argument {
-                boundary: "transport".into(),
-                pointer: "/connector".into(),
-            }],
-            flow: vec![],
-        };
+        let declaration = declaration(
+            serde_json::json!({"dimensions":{"organization":{"selectors":[{"kind":"argument","boundary":"transport","pointer":"/tenant"}]}}}),
+        );
         let result = project(&calls, &[], Some(&declaration), EvidenceSide::Observed);
-        assert_eq!(result.requests["r"].connector.status, "ambiguous");
-        assert!(result.requests["r"].connector.value.is_none());
+        assert_eq!(
+            result.requests["r"].dimensions["organization"].status,
+            "ambiguous"
+        );
+        assert!(result.requests["r"].dimensions["organization"]
+            .value
+            .is_none());
+        assert_eq!(
+            result.requests["r"].dimensions["organization"]
+                .evidence
+                .len(),
+            2
+        );
         let no_candidate_value = [call(serde_json::json!({}))];
         assert_eq!(
             project(
@@ -372,7 +409,7 @@ mod tests {
                 EvidenceSide::Observed
             )
             .requests["r"]
-                .connector
+                .dimensions["organization"]
                 .status,
             "unknown"
         );
@@ -384,31 +421,27 @@ mod tests {
                 EvidenceSide::Recorded
             )
             .requests["r"]
-                .connector
+                .dimensions["organization"]
                 .value
                 .as_deref(),
             Some("old")
         );
     }
-    fn node(id: u64, parent: Option<u64>, correlation: &str, flow: &str) -> ExecutionGraphNode {
-        serde_json::from_value(serde_json::json!({"node_id":id,"parent_id":parent,"sequence":id,"correlation_id":correlation,"span_name":"operation","target":"example","level":"INFO","fields":{"task":flow},"started_ns":0})).expect("valid semantic identity fixture")
+
+    fn node(id: u64, parent: Option<u64>, correlation: &str, task: &str) -> ExecutionGraphNode {
+        serde_json::from_value(serde_json::json!({"node_id":id,"parent_id":parent,"sequence":id,"correlation_id":correlation,"span_name":"operation","target":"example","level":"INFO","fields":{"task":task},"started_ns":0})).expect("valid semantic identity fixture")
     }
+
     #[test]
     fn graph_identity_uses_exact_node_ancestry_and_refuses_foreign_or_duplicate_nodes() {
         let mut call = call(serde_json::json!({}));
-        call.observed
-            .as_mut()
-            .expect("valid semantic identity fixture")
-            .graph_node_id = Some(2);
-        let declaration = ReviewIdentityDeclaration {
-            connector: vec![],
-            flow: vec![ReviewIdentitySelector::GraphField {
-                field: "task".into(),
-            }],
-        };
+        call.observed.as_mut().expect("fixture").graph_node_id = Some(2);
+        let declaration = declaration(
+            serde_json::json!({"dimensions":{"job_kind":{"selectors":[{"kind":"graph_field","field":"task"}]}}}),
+        );
         let graph = [
-            node(2, Some(1), "r", "authorize"),
-            node(1, None, "foreign", "foreign-task"),
+            node(2, Some(1), "r", "index"),
+            node(1, None, "foreign", "other-task"),
         ];
         let publication = project(
             &[call.clone()],
@@ -417,10 +450,17 @@ mod tests {
             EvidenceSide::Observed,
         );
         assert_eq!(
-            publication.requests["r"].flow.value.as_deref(),
-            Some("authorize")
+            publication.requests["r"].dimensions["job_kind"]
+                .value
+                .as_deref(),
+            Some("index")
         );
-        assert_eq!(publication.requests["r"].flow.evidence.len(), 1);
+        assert_eq!(
+            publication.requests["r"].dimensions["job_kind"]
+                .evidence
+                .len(),
+            1
+        );
         let contradictory = [node(2, None, "r", "one"), node(2, None, "r", "two")];
         let publication = project(
             &[call],
@@ -428,17 +468,26 @@ mod tests {
             Some(&declaration),
             EvidenceSide::Observed,
         );
-        assert_eq!(publication.requests["r"].flow.status, "unknown");
+        assert_eq!(
+            publication.requests["r"].dimensions["job_kind"].status,
+            "unknown"
+        );
         assert!(publication.notes[0].contains("ambiguous"));
     }
+
     #[test]
-    fn invalid_declaration_is_reported_without_a_host_fallback() {
+    fn invalid_programmatic_selector_is_reported_without_fallback() {
         let declaration = ReviewIdentityDeclaration {
-            connector: vec![ReviewIdentitySelector::Argument {
-                boundary: "transport".into(),
-                pointer: "not-a-pointer".into(),
-            }],
-            flow: vec![],
+            dimensions: BTreeMap::from([(
+                "organization".into(),
+                ReviewIdentityDimension {
+                    label: None,
+                    selectors: vec![ReviewIdentitySelector::Argument {
+                        boundary: "transport".into(),
+                        pointer: "not-a-pointer".into(),
+                    }],
+                },
+            )]),
         };
         let publication = project(
             &[call(serde_json::json!({"url":"https://provider.example"}))],
@@ -446,7 +495,36 @@ mod tests {
             Some(&declaration),
             EvidenceSide::Observed,
         );
-        assert_eq!(publication.requests["r"].connector.status, "unknown");
+        assert_eq!(
+            publication.requests["r"].dimensions["organization"].status,
+            "unknown"
+        );
         assert!(publication.notes[0].contains("invalid"));
+    }
+
+    #[test]
+    fn dimension_order_and_legacy_adapter_have_stable_canonical_digests() {
+        let legacy = declaration(
+            serde_json::json!({"connector":[{"kind":"argument","boundary":"transport","pointer":"/tenant"}],"flow":[]}),
+        );
+        let canonical = declaration(
+            serde_json::json!({"dimensions":{"flow":{"selectors":[]},"connector":{"selectors":[{"kind":"argument","boundary":"transport","pointer":"/tenant"}]}}}),
+        );
+        let first = project(&[], &[], Some(&legacy), EvidenceSide::Observed);
+        let second = project(&[], &[], Some(&canonical), EvidenceSide::Observed);
+        assert_eq!(
+            first.declaration.expect("fixture").digest,
+            second.declaration.expect("fixture").digest
+        );
+        assert_eq!(
+            first.dimensions.keys().collect::<Vec<_>>(),
+            vec!["connector", "flow"]
+        );
+        let mut reversed = canonical.clone();
+        reversed.dimensions = canonical.dimensions.into_iter().rev().collect();
+        assert_eq!(
+            serde_json::to_vec(&reversed).expect("fixture"),
+            serde_json::to_vec(&legacy).expect("fixture")
+        );
     }
 }

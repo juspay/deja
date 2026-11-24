@@ -239,16 +239,93 @@ pub struct SystemDeclaration {
     pub review_identity: Option<ReviewIdentityDeclaration>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ReviewIdentityDeclaration {
+    pub dimensions: BTreeMap<String, ReviewIdentityDimension>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewIdentityDimension {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     #[serde(default)]
-    pub connector: Vec<ReviewIdentitySelector>,
-    #[serde(default)]
-    pub flow: Vec<ReviewIdentitySelector>,
+    pub selectors: Vec<ReviewIdentitySelector>,
+}
+
+impl<'de> Deserialize<'de> for ReviewIdentityDeclaration {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Old names are accepted only here; every reader and serialized digest
+        // sees the canonical, system-independent dimension map.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            #[serde(default)]
+            dimensions: BTreeMap<String, ReviewIdentityDimension>,
+            connector: Option<Vec<ReviewIdentitySelector>>,
+            flow: Option<Vec<ReviewIdentitySelector>>,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        let mut dimensions = wire.dimensions;
+        for (id, legacy) in [("connector", wire.connector), ("flow", wire.flow)] {
+            if let Some(selectors) = legacy {
+                if dimensions.contains_key(id) {
+                    return Err(serde::de::Error::custom(format!(
+                        "review identity dimension {id} is declared in both legacy and generic configuration"
+                    )));
+                }
+                dimensions.insert(
+                    id.to_owned(),
+                    ReviewIdentityDimension {
+                        label: None,
+                        selectors,
+                    },
+                );
+            }
+        }
+        if dimensions.len() > 16 {
+            return Err(serde::de::Error::custom(
+                "review identity supports at most 16 dimensions",
+            ));
+        }
+        for (id, dimension) in &dimensions {
+            let valid_id = !id.is_empty()
+                && id.len() <= 64
+                && id.as_bytes()[0].is_ascii_alphabetic()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            let valid_label = dimension.label.as_ref().is_none_or(|label| {
+                !label.trim().is_empty()
+                    && label.len() <= 80
+                    && !label.chars().any(char::is_control)
+            });
+            if !valid_id
+                || !valid_label
+                || dimension.selectors.len() > 16
+                || dimension
+                    .selectors
+                    .iter()
+                    .any(|selector| !selector.is_valid())
+            {
+                return Err(serde::de::Error::custom(format!("review identity dimension {id} has an invalid ID, label or selector (maximum 16 selectors)")));
+            }
+        }
+        Ok(Self { dimensions })
+    }
+}
+
+impl ReviewIdentityDeclaration {
+    pub fn needs_graph(&self) -> bool {
+        self.dimensions
+            .values()
+            .flat_map(|dimension| &dimension.selectors)
+            .any(|selector| matches!(selector, ReviewIdentitySelector::GraphField { .. }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReviewIdentitySelector {
     Argument {
         boundary: String,
@@ -262,6 +339,30 @@ pub enum ReviewIdentitySelector {
     GraphField {
         field: String,
     },
+}
+
+impl ReviewIdentitySelector {
+    pub fn is_valid(&self) -> bool {
+        let text = |value: &str, bound: usize| {
+            !value.trim().is_empty() && value.len() <= bound && !value.chars().any(char::is_control)
+        };
+        match self {
+            Self::Argument { boundary, pointer }
+            | Self::Header {
+                boundary, pointer, ..
+            } => {
+                text(boundary, 128)
+                    && pointer.len() <= 1024
+                    && !pointer.chars().any(char::is_control)
+                    && (pointer.is_empty() || pointer.starts_with('/'))
+                    && !pointer.as_bytes().iter().enumerate().any(|(i, byte)| {
+                        *byte == b'~' && !matches!(pointer.as_bytes().get(i + 1), Some(b'0' | b'1'))
+                    })
+                    && !matches!(self, Self::Header { name, .. } if !text(name, 256))
+            }
+            Self::GraphField { field } => text(field, 128),
+        }
+    }
 }
 
 /// A list, from either a TOML array or a comma-separated string.
@@ -673,14 +774,19 @@ s3_bucket = "ucs-deja"
 #[cfg(test)]
 mod review_identity_declaration_tests {
     use super::*;
+
     #[test]
-    fn review_selectors_are_declared_data_without_system_or_provider_mapping() {
+    fn arbitrary_dimensions_are_declared_data_and_graph_dependency_is_dynamic() {
         let config = Config::builder()
             .add_source(File::from_str(
                 r#"
-            [systems.example.review_identity]
-            connector = [{kind="header", boundary="rpc", pointer="/headers", name="x-provider"}]
-            flow = [{kind="graph_field", field="operation_kind"}]
+            [systems.example.review_identity.dimensions.organization]
+            label = "Organization"
+            selectors = [{kind="header", boundary="rpc", pointer="/headers", name="x-tenant"}]
+            [systems.example.review_identity.dimensions.worker_region]
+            selectors = [{kind="argument", boundary="rpc", pointer="/worker"}]
+            [systems.example.review_identity.dimensions.job_kind]
+            selectors = [{kind="graph_field", field="operation_kind"}]
         "#,
                 FileFormat::Toml,
             ))
@@ -692,12 +798,80 @@ mod review_identity_declaration_tests {
         let declaration = settings.systems["example"]
             .review_identity
             .as_ref()
-            .expect("valid review identity configuration fixture");
+            .expect("fixture");
+        assert_eq!(declaration.dimensions.len(), 3);
         assert!(
-            matches!(&declaration.connector[0], ReviewIdentitySelector::Header { name, .. } if name == "x-provider")
+            matches!(&declaration.dimensions["organization"].selectors[0], ReviewIdentitySelector::Header { name, .. } if name == "x-tenant")
         );
-        assert!(
-            matches!(&declaration.flow[0], ReviewIdentitySelector::GraphField { field } if field == "operation_kind")
-        );
+        assert!(declaration.needs_graph());
+        let mut arguments_only = declaration.clone();
+        arguments_only.dimensions.remove("job_kind");
+        assert!(!arguments_only.needs_graph());
+    }
+
+    #[test]
+    fn legacy_names_deserialize_only_into_canonical_dimensions_and_collisions_fail() {
+        let legacy: ReviewIdentityDeclaration =
+            serde_json::from_value(serde_json::json!({"connector":[],"flow":[]}))
+                .expect("legacy fixture");
+        let serialized = serde_json::to_value(legacy).expect("fixture");
+        assert!(serialized.get("connector").is_none());
+        assert!(serialized["dimensions"].get("connector").is_some());
+        assert!(serialized["dimensions"].get("flow").is_some());
+        assert!(serde_json::from_value::<ReviewIdentityDeclaration>(
+            serde_json::json!({"connector":[],"dimensions":{"connector":{"selectors":[]}}})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<ReviewIdentityDeclaration>(
+            serde_json::json!({"flow":[],"dimensions":{"flow":{"selectors":[]}}})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<ReviewIdentityDeclaration>(
+            serde_json::json!({"connector":[],"dimensions":{"job_kind":{"selectors":[]}}})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn invalid_selectors_and_bounded_declarations_fail_closed() {
+        for selector in [
+            serde_json::json!({"kind":"argument","boundary":"rpc","pointer":"not-pointer"}),
+            serde_json::json!({"kind":"argument","boundary":"rpc","pointer":"/bad~2"}),
+            serde_json::json!({"kind":"header","boundary":"rpc","pointer":"/headers","name":""}),
+            serde_json::json!({"kind":"graph_field","field":""}),
+            serde_json::json!({"kind":"graph_field","field":"task","extra":"ignored?"}),
+        ] {
+            assert!(serde_json::from_value::<ReviewIdentityDeclaration>(
+                serde_json::json!({"dimensions":{"job_kind":{"selectors":[selector]}}})
+            )
+            .is_err());
+        }
+        for id in ["", "bad.id", "bad/id", "3job"] {
+            assert!(serde_json::from_value::<ReviewIdentityDeclaration>(
+                serde_json::json!({"dimensions":{id:{"selectors":[]}}})
+            )
+            .is_err());
+        }
+        assert!(serde_json::from_value::<ReviewIdentityDeclaration>(
+            serde_json::json!({"dimensions":{"job_kind":{"label":"x".repeat(81)}}})
+        )
+        .is_err());
+        let selectors = vec![serde_json::json!({"kind":"graph_field","field":"task"}); 17];
+        assert!(serde_json::from_value::<ReviewIdentityDeclaration>(
+            serde_json::json!({"dimensions":{"job_kind":{"selectors":selectors}}})
+        )
+        .is_err());
+        let dimensions: BTreeMap<_, _> = (0..17)
+            .map(|i| {
+                (
+                    format!("dimension_{i}"),
+                    serde_json::json!({"selectors":[]}),
+                )
+            })
+            .collect();
+        assert!(serde_json::from_value::<ReviewIdentityDeclaration>(
+            serde_json::json!({"dimensions":dimensions})
+        )
+        .is_err());
     }
 }
