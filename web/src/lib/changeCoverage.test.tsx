@@ -4,17 +4,60 @@ import { useQuery } from "@tanstack/react-query";
 import { describe, expect, it, vi } from "vitest";
 import type { ChangeCoverage, ChangedItem, ChangeCoverageResponse, RunRow } from "./api";
 import { ChangeCoveragePanel } from "../components/ChangeCoverage";
-import { coverageSourceHref, filterCoverageItems, summarizeChangeCoverage } from "./changeCoverage";
+import { coverageBucket, coverageSourceHref, filterCoverageItems, summarizeChangeCoverage } from "./changeCoverage";
 
 vi.mock("@tanstack/react-query", () => ({ useQuery: vi.fn() }));
 const sha = "a".repeat(40);
 const item = (reach: ChangedItem["reach"] = "exercised"): ChangedItem => ({ path: "crates/router/src/webhooks.rs", item: "incoming_webhook", lines: "10-20", reach, why: "span inside enclosing function" });
 const coverage = (over: Partial<ChangeCoverage> = {}): ChangeCoverage => ({ assessment_version: 3, request_scope: ["request-a", "request-b"], inputs_digest: "b".repeat(64), base: { source: "named_baseline", baseline_run: "baseline", declared_ref: "main", resolved_sha: "c".repeat(40), resolved_at: "now", resolution: "github_commit_lookup" }, system: "hyperswitch", repo: "example/system", base_ref: "main", merge_base: "c".repeat(40), head: sha, driven_requests: 2, items: [item()], never_ran: 0, unproven: 0, caveats: [], ...over });
 const run = { run_id: "candidate", candidate: { kind: "prebuilt_image", image: "example" }, params: { candidate_spec: { kind: "prebuilt_image", image: "example" }, github: { repo: "example/system", pr_number: 42, head_sha: sha }, delta_against: "baseline" }, scorecard: { summary: { total_correlations: 2 }, correlation_scope: ["request-b", "request-a"] } } as RunRow;
-const render = (data?: ChangeCoverageResponse, extra = {}) => {
+const render = (data?: ChangeCoverageResponse, extra = {}, replay = run) => {
   vi.mocked(useQuery).mockReturnValue({ data, isLoading: false, ...extra } as never);
-  return renderToStaticMarkup(<MemoryRouter><ChangeCoveragePanel run={run} /></MemoryRouter>);
+  return renderToStaticMarkup(<MemoryRouter><ChangeCoveragePanel run={replay} /></MemoryRouter>);
 };
+
+const scopeRun = (scope: unknown): RunRow => ({ ...run, scorecard: { ...run.scorecard!, correlation_scope: scope as string[] } });
+const countRun = (count: unknown): RunRow => ({ ...run, scorecard: { ...run.scorecard!, summary: { ...run.scorecard!.summary, total_correlations: count as number } } });
+type InvalidBinding = { assessment?: Partial<ChangeCoverage>; replay?: RunRow };
+const invalidBindings: [string, InvalidBinding][] = [
+  ["future assessment version", { assessment: { assessment_version: 99 } }],
+  ["missing assessment version", { assessment: { assessment_version: undefined } }],
+  ["missing evidence digest", { assessment: { inputs_digest: undefined } }],
+  ["malformed evidence digest", { assessment: { inputs_digest: "b".repeat(63) } }],
+  ["missing immutable base", { assessment: { base: undefined } }],
+  ...[
+    ["short resolved base SHA", { resolved_sha: "c".repeat(10) }],
+    ["empty declared base", { declared_ref: " " }],
+    ["empty base timestamp", { resolved_at: "" }],
+    ["unknown base source", { source: "future_mode" }],
+    ["unknown base resolution", { resolution: "future_resolution" }],
+    ["wrong named baseline", { baseline_run: "other" }],
+    ["missing named baseline", { baseline_run: undefined }],
+    ["configured fallback for named baseline", { source: "configured_ref", baseline_run: undefined }],
+  ].map(([name, base]) => [name, { assessment: { base: { ...coverage().base!, ...(base as object) } } }] as [string, InvalidBinding]),
+  ["short candidate coverage SHA", { assessment: { head: sha.slice(0, 10) } }],
+  ["different candidate coverage SHA", { assessment: { head: "d".repeat(40) } }],
+  ["different repository", { assessment: { repo: "different/system" } }],
+  ...["../..", "example/.", "https://github.com/example/system", "example/system/more"].map((repo) => [`matching malformed repository ${repo}`, { assessment: { repo }, replay: { ...run, params: { ...run.params, github: { ...run.params!.github!, repo } } } }] as [string, InvalidBinding]),
+  ["missing captured candidate SHA", { replay: { ...run, params: { ...run.params, github: { ...run.params!.github!, head_sha: undefined as unknown as string } } } }],
+  ["conflicting repo_sha candidate", { replay: { ...run, params: { ...run.params, candidate_spec: { kind: "repo_sha", repo: "example/system", sha: "d".repeat(40) } } } }],
+  ["conflicting repo_sha repository", { replay: { ...run, params: { ...run.params, candidate_spec: { kind: "repo_sha", repo: "different/system", sha } } } }],
+  ["incomplete repo_sha candidate", { replay: { ...run, params: { ...run.params, candidate_spec: { kind: "repo_sha", repo: "example/system", sha: sha.slice(0, 10) } } } }],
+  ["self baseline", { assessment: { base: { ...coverage().base!, baseline_run: "candidate" } }, replay: { ...run, params: { ...run.params, delta_against: "candidate" } } }],
+  ["named baseline without declared pair", { replay: { ...run, params: { ...run.params, delta_against: undefined } } }],
+  ["configured base with stray baseline", { assessment: { base: { ...coverage().base!, source: "configured_ref" } }, replay: { ...run, params: { ...run.params, delta_against: undefined } } }],
+  ...[undefined, null, [], ["request-a", "request-a"], ["request-a", ""], ["request-a", 2], "request-a", { length: 2 }, ["request-a", "outside-request"]].flatMap((scope, i) => [
+    [`invalid published scope ${i}`, { assessment: { request_scope: scope as string[] } }] as [string, InvalidBinding],
+    [`invalid admitted scope ${i}`, { replay: scopeRun(scope) }] as [string, InvalidBinding],
+  ]),
+  ...[undefined, 0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, 3, "2"].flatMap((count, i) => [
+    [`invalid coverage denominator ${i}`, { assessment: { driven_requests: count as number } }] as [string, InvalidBinding],
+    [`invalid scorecard denominator ${i}`, { replay: countRun(count) }] as [string, InvalidBinding],
+  ]),
+  ["matching totals with shorter published scope", { assessment: { request_scope: ["request-a"] } }],
+  ["matching totals with shorter admitted scope", { replay: scopeRun(["request-a"]) }],
+  ["missing scorecard summary", { replay: { ...run, scorecard: { ...run.scorecard!, summary: undefined } } as unknown as RunRow }],
+];
 
 describe("changed-code reach summary", () => {
   it("derives disjoint counts from items rather than trusting legacy aggregate totals", () => {
@@ -27,6 +70,62 @@ describe("changed-code reach summary", () => {
   it("accepts exact immutable source and equal admitted request sets regardless of ordering", () => {
     expect(summarizeChangeCoverage(coverage(), run).warnings).toEqual([]);
     expect(summarizeChangeCoverage(coverage(), run).provenanceComplete).toBe(true);
+  });
+  it.each(invalidBindings)("keeps reach unproven for %s in counts, filters and rendered rows", (_name, invalid) => {
+    const assessment = coverage({ items: [item("exercised"), { ...item("not_exercised"), item: "other_function", why: "no matching admitted activity" }], never_ran: 1, ...invalid.assessment });
+    const replay = invalid.replay ?? run;
+    const summary = summarizeChangeCoverage(assessment, replay);
+    expect(summary.reachApplicable).toBe(false);
+    expect(summary.provenanceComplete).toBe(false);
+    expect(summary.warnings.length).toBeGreaterThan(0);
+    expect(summary.counts).toEqual({ observed: 0, not_exercised: 0, unproven: 2 });
+    for (const filter of ["all", "needs_review", "unproven"] as const) expect(filterCoverageItems(assessment.items, filter, summary.reachApplicable)).toHaveLength(2);
+    for (const filter of ["observed", "not_exercised"] as const) expect(filterCoverageItems(assessment.items, filter, summary.reachApplicable)).toEqual([]);
+    for (const entry of assessment.items) expect(coverageBucket(entry, summary.reachApplicable)).toBe("unproven");
+    const html = render(assessment, {}, replay);
+    const [primary, detail] = html.split('<details class="change-coverage-details">');
+    expect(primary).toContain('<strong>0</strong><span>Execution observed</span>');
+    expect(primary).toContain('<strong>0</strong><span>Not exercised</span>');
+    expect(primary).toContain('<strong>2</strong><span>Execution unproven</span>');
+    expect(primary).toContain("this assessment could not be verified for this replay");
+    expect(primary).not.toContain("Published assessment");
+    expect(html).not.toContain('<details class="change-coverage-details" open');
+    expect(detail.match(/<tr class="reach-unproven"><td>Execution unproven<\/td>/g)).toHaveLength(2);
+    expect(detail).toContain("Published assessment: Execution observed");
+    expect(detail).toContain("Published assessment: Not exercised");
+    expect(detail).toContain("span inside enclosing function");
+    expect(detail).toContain("no matching admitted activity");
+    expect(assessment.items.map((entry) => entry.reach)).toEqual(["exercised", "not_exercised"]);
+  });
+  it("accepts a configured immutable base only without a named baseline pair", () => {
+    const assessment = coverage({ base: { ...coverage().base!, source: "configured_ref", baseline_run: undefined, declared_ref: "c".repeat(40), resolution: "declared_immutable_commit" }, items: [item("exercised"), item("not_exercised")], never_ran: 1 });
+    const standalone = { ...run, params: { ...run.params, delta_against: undefined } };
+    const summary = summarizeChangeCoverage(assessment, standalone);
+    expect(summary.reachApplicable).toBe(true);
+    expect(summary.counts).toEqual({ observed: 1, not_exercised: 1, unproven: 0 });
+    expect(summary.warnings).toEqual([]);
+    expect(render(assessment, {}, standalone)).not.toContain("Published assessment:");
+  });
+  it("keeps aggregate disagreements and substantive caveats advisory for valid bindings", () => {
+    const assessment = coverage({ items: [item("exercised"), item("not_exercised")], never_ran: 50, unproven: 50, caveats: ["source diff may be truncated"] });
+    const summary = summarizeChangeCoverage(assessment, run);
+    expect(summary.reachApplicable).toBe(true);
+    expect(summary.counts).toEqual({ observed: 1, not_exercised: 1, unproven: 0 });
+    expect(summary.warnings.join(" ")).toContain("Published aggregate reach counts disagree");
+    expect(summary.caveats).toEqual(assessment.caveats);
+    expect(filterCoverageItems(assessment.items, "observed", summary.reachApplicable)).toEqual([assessment.items[0]]);
+    const html = render(assessment);
+    expect(html).toContain('<strong>1</strong><span>Execution observed</span>');
+    expect(html).toContain("Provisional assessment");
+    expect(html).not.toContain("Published assessment:");
+  });
+  it("keeps safe source links separate from applicability of request evidence", () => {
+    const assessment = coverage({ request_scope: ["request-a", "outside-request"] });
+    const summary = summarizeChangeCoverage(assessment, run);
+    expect(summary.reachApplicable).toBe(false);
+    expect(summary.sourceMatches).toBe(true);
+    expect(render(assessment)).toContain(`href="https://github.com/example/system/blob/${sha}/crates/router/src/webhooks.rs#L10-L20"`);
+    expect(render(coverage({ head: "d".repeat(40) }))).not.toContain('href="https://github.com/');
   });
   it("does not let matching PR metadata override conflicting or incomplete repo_sha candidate identity", () => {
     for (const spec of [{ kind: "repo_sha", repo: "example/system", sha: "d".repeat(40) }, { kind: "repo_sha", repo: "different/system", sha }, { kind: "repo_sha", repo: "example/system", sha: sha.slice(0, 10) }]) {
@@ -113,8 +212,7 @@ describe("changed-code panel", () => {
   it("keeps uncertainty visible without expanding warning lists or item tables on the default view", () => {
     const html = render(coverage({ assessment_version: undefined, driven_requests: 18, items: [item("module_ran")] }));
     const defaultView = html.split('<details class="change-coverage-details">')[0];
-    expect(defaultView).toContain("Provisional assessment");
-    expect(defaultView).toContain("before relying on these counts");
+    expect(defaultView).toContain("Execution unproven · this assessment could not be verified for this replay");
     expect(defaultView).not.toContain("Historical or incomplete");
     expect(defaultView).not.toContain("incoming_webhook");
     expect(defaultView).not.toContain("<table");

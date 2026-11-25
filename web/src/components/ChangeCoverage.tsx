@@ -23,7 +23,7 @@ export function ChangeCoveragePanel({ run }: { run: RunRow }) {
   const assessment = isAssessment(coverage) ? coverage : null;
   const summary = assessment ? summarizeChangeCoverage(assessment, run) : null;
   const filter = selectedFilter ?? (summary && summary.counts.not_exercised + summary.counts.unproven === 0 ? "all" : "needs_review");
-  const items = assessment ? filterCoverageItems(assessment.items, filter) : [];
+  const items = assessment && summary ? filterCoverageItems(assessment.items, filter, summary.reachApplicable) : [];
   const cautions = summary ? [...summary.warnings, ...summary.caveats] : [];
   return <section className="change-coverage" aria-label="Changed-code execution" id="changed-code-execution">
     <h3>Did this replay exercise the changed code?</h3>
@@ -39,6 +39,7 @@ export function ChangeCoveragePanel({ run }: { run: RunRow }) {
         </div>
         <p className="hint">Rust item reach, not changed-line or branch coverage.</p>
         {!assessment.items.length ? <p className="change-coverage-warning">No supported changed-code items were assessed. This does not establish coverage of the PR.</p>
+          : !summary.reachApplicable ? <p className="change-coverage-warning">Execution unproven · this assessment could not be verified for this replay.</p>
           : cautions.length > 0 && <p className="change-coverage-warning">Provisional assessment · review {cautions.length} caution{cautions.length === 1 ? "" : "s"} before relying on these counts.</p>}
         <details className="change-coverage-details">
           <summary>Inspect changed items and execution evidence</summary>
@@ -51,9 +52,9 @@ export function ChangeCoveragePanel({ run }: { run: RunRow }) {
             <option value="observed">Execution observed</option><option value="not_exercised">Not exercised</option><option value="unproven">Execution unproven</option>
           </select></label>
           <div className="change-coverage-table"><table className="fieldtbl"><thead><tr><th>Execution evidence</th><th>Changed item / function</th><th>Source location</th><th>Why</th></tr></thead><tbody>
-            {items.map((item, i) => { const href = summary.sourceMatches ? coverageSourceHref(assessment, item) : null; return <tr key={`${item.path}:${item.lines}:${item.item}:${i}`} className={coverageBucket(item) !== "observed" ? "reach-unproven" : undefined}>
-              <td>{reachLabel[item.reach] ?? "Execution unproven"}</td><td><code>{item.item}</code>{(item.connector || item.flow) && <div className="hint">{[item.connector, item.flow].filter(Boolean).join(" · ")}</div>}</td>
-              <td>{href ? <a href={href} target="_blank" rel="noreferrer"><code>{item.path}:{item.lines}</code></a> : <code>{item.path}:{item.lines}</code>}</td><td>{item.why}</td>
+            {items.map((item, i) => { const href = summary.sourceMatches ? coverageSourceHref(assessment, item) : null; return <tr key={`${item.path}:${item.lines}:${item.item}:${i}`} className={coverageBucket(item, summary.reachApplicable) !== "observed" ? "reach-unproven" : undefined}>
+              <td>{summary.reachApplicable ? reachLabel[item.reach] ?? "Execution unproven" : "Execution unproven"}</td><td><code>{item.item}</code>{(item.connector || item.flow) && <div className="hint">{[item.connector, item.flow].filter(Boolean).join(" · ")}</div>}</td>
+              <td>{href ? <a href={href} target="_blank" rel="noreferrer"><code>{item.path}:{item.lines}</code></a> : <code>{item.path}:{item.lines}</code>}</td><td>{!summary.reachApplicable && <div className="hint">Published assessment: {reachLabel[item.reach] ?? "Execution unproven"}</div>}{item.why}</td>
             </tr>; })}
             {!items.length && <tr><td colSpan={4}>No items in this filter. Choose “All changed items” to inspect the assessment.</td></tr>}
           </tbody></table></div>
