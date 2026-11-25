@@ -659,7 +659,7 @@ export function Lanes({ d }: { d: Delta }) {
  * The panel on a pull request's report: everything above, on the run's own
  * baseline. Pending while a side is still being scored, polled only then.
  */
-export function DeltaPanel({ runId, against }: { runId: string; against: string }) {
+export function DeltaPanel({ runId, against, changeCoverage }: { runId: string; against: string; changeCoverage?: React.ReactNode }) {
   const delta = useQuery({
     queryKey: ["delta", runId, against],
     queryFn: () => api.delta(runId, against),
@@ -706,6 +706,7 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
             : {unavailable.why}
           </div>
         ))}
+      {!d && changeCoverage}
       {d && (
         <>
           <Facts d={d} prRun={prRun.data} mainRun={mainRun.data} />
@@ -718,6 +719,7 @@ export function DeltaPanel({ runId, against }: { runId: string; against: string 
           ) : (
             <Headline d={d} />
           )}
+          {changeCoverage}
           <AcknowledgeLine runId={runId} d={d} />
           {mainRead.state === "failed" && (
             <p className="err">
