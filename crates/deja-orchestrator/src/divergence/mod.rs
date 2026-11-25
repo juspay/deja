@@ -47,6 +47,7 @@ use crate::HarnessRoot;
 pub mod acknowledgement;
 pub mod behaviour_tree;
 pub mod delta;
+pub mod inspection;
 pub mod ledger;
 mod noise;
 pub mod span_shape;
@@ -5914,10 +5915,80 @@ fn reconciled_with_kernel(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldPresence {
+    Present,
+    Missing,
+    Unavailable,
+}
+
+/// Additive inspection metadata. These fields never enter comparison identity,
+/// canonicalization, delta classification, or acknowledgement scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpBodyResidual {
     #[serde(flatten)]
     pub diff: JsonFieldDiff,
     pub candidate_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_presence: Option<FieldPresence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_presence: Option<FieldPresence>,
+}
+
+/// Canonical array residual indices are not positions in the captured body.
+/// Only exact object paths, including object documents encoded as strings, can
+/// prove presence here. Unsupported/old evidence remains explicitly unknown.
+fn residual_field_value<'a>(
+    root: &'a serde_json::Value,
+    path: &str,
+) -> Result<std::borrow::Cow<'a, serde_json::Value>, FieldPresence> {
+    use std::borrow::Cow;
+
+    let segments = deja_kernel::parse_json_path(path).ok_or(FieldPresence::Unavailable)?;
+    let mut value = Cow::Borrowed(root);
+    for segment in segments {
+        let deja_kernel::JsonPathSegment::Member(member) = segment else {
+            return Err(FieldPresence::Unavailable);
+        };
+        if let serde_json::Value::String(text) = value.as_ref() {
+            if let Some(document) = deja::identity::embedded_document(text) {
+                value = Cow::Owned(document);
+            }
+        }
+        value = match value {
+            // Ordinary captured JSON stays borrowed, regardless of body size or
+            // path depth. Only decoded documents need owned storage.
+            Cow::Borrowed(value) => Cow::Borrowed(
+                value
+                    .as_object()
+                    .ok_or(FieldPresence::Unavailable)?
+                    .get(&member)
+                    .ok_or(FieldPresence::Missing)?,
+            ),
+            // Move the selected child out of an owned decoded document; cloning
+            // it would copy every remaining subtree on each path segment.
+            Cow::Owned(serde_json::Value::Object(mut object)) => {
+                Cow::Owned(object.remove(&member).ok_or(FieldPresence::Missing)?)
+            }
+            Cow::Owned(_) => return Err(FieldPresence::Unavailable),
+        };
+    }
+    Ok(value)
+}
+
+fn residual_field_presence(
+    root: Option<&serde_json::Value>,
+    path: &str,
+    expected: &serde_json::Value,
+) -> FieldPresence {
+    let Some(root) = root else {
+        return FieldPresence::Unavailable;
+    };
+    match residual_field_value(root, path) {
+        Ok(value) if value.as_ref() == expected => FieldPresence::Present,
+        Err(FieldPresence::Missing) if expected.is_null() => FieldPresence::Missing,
+        _ => FieldPresence::Unavailable,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6075,6 +6146,8 @@ fn classify_http_body_diff(
                     .iter()
                     .map(|row| HttpBodyResidual {
                         diff: row.clone(),
+                        baseline_presence: Some(FieldPresence::Unavailable),
+                        candidate_presence: Some(FieldPresence::Unavailable),
                         candidate_identity: format!(
                             "written:v1:{:016x}",
                             written_hash(&row.candidate, true)
@@ -6163,6 +6236,16 @@ fn classify_http_body_diff(
             classification.blocking.push(HttpBodyResidual {
                 diff: body.clone(),
                 candidate_identity,
+                baseline_presence: Some(residual_field_presence(
+                    diff.baseline_body.as_ref(),
+                    &body.json_path,
+                    &body.baseline,
+                )),
+                candidate_presence: Some(residual_field_presence(
+                    diff.candidate_body.as_ref(),
+                    &body.json_path,
+                    &body.candidate,
+                )),
             });
         }
     }
@@ -9769,6 +9852,7 @@ mod tests {
             graph_node_id: None,
             synthesized: false,
             outcome: deja::SubstituteOutcome::default(),
+            runtime_metadata_present: false,
             real_impl_will_fail: false,
             recorded_result: None,
             observed_result: None,
@@ -11385,6 +11469,164 @@ mod tests {
         assert!(
             c.blocking_leaf_count > 0,
             "and the difference still blocks — a disagreement must not decide it away"
+        );
+    }
+
+    #[test]
+    fn response_presence_requires_exact_captured_parent_evidence() {
+        use FieldPresence::*;
+        let value = serde_json::json!({"explicit":null,"encoded":"{\"field\":null}","a.b":null,"items":[null]});
+        for path in ["$.explicit", "$[\"a.b\"]", "$.encoded.field"] {
+            assert_eq!(
+                residual_field_presence(Some(&value), path, &serde_json::Value::Null),
+                Present
+            );
+        }
+        assert_eq!(
+            residual_field_presence(Some(&value), "$.absent", &serde_json::Value::Null),
+            Missing
+        );
+        assert_eq!(
+            residual_field_presence(None, "$.explicit", &serde_json::Value::Null),
+            Unavailable
+        );
+        assert_eq!(
+            residual_field_presence(Some(&value), "$.items[0]", &serde_json::Value::Null),
+            Unavailable
+        );
+        assert_eq!(
+            residual_field_presence(Some(&value), "$.explicit", &serde_json::json!(1)),
+            Unavailable
+        );
+        let historical: HttpBodyResidual = serde_json::from_value(serde_json::json!({"json_path":"$.field","baseline":null,"candidate":1,"candidate_identity":"unchanged"})).unwrap();
+        assert!(historical.baseline_presence.is_none() && historical.candidate_presence.is_none());
+    }
+
+    #[test]
+    fn response_presence_borrows_wide_and_deep_ordinary_bodies() {
+        use std::borrow::Cow;
+
+        let fields: serde_json::Map<String, serde_json::Value> = (0..8_000)
+            .map(|i| {
+                (
+                    format!("field_{i}"),
+                    serde_json::json!({"nested":{"value":i}}),
+                )
+            })
+            .collect();
+        let body = serde_json::json!({"response":fields});
+        let root = residual_field_value(&body, "$").unwrap();
+        assert!(matches!(root, Cow::Borrowed(value) if std::ptr::eq(value, &body)));
+        for i in 0..8_000 {
+            let field = format!("field_{i}");
+            let path = format!("$.response.{field}.nested.value");
+            let value = residual_field_value(&body, &path).unwrap();
+            assert!(
+                matches!(value, Cow::Borrowed(value) if std::ptr::eq(value, &body["response"][&field]["nested"]["value"])),
+                "ordinary JSON must retain the captured value's address, without a body or subtree clone"
+            );
+        }
+    }
+
+    #[test]
+    fn response_presence_moves_decoded_documents_and_preserves_unknowns() {
+        use FieldPresence::*;
+        let nested =
+            serde_json::json!({"inner":serde_json::json!({"child":{"value":null}}).to_string()});
+        let body = serde_json::json!({"encoded":nested.to_string(),"malformed":"{not json}","array":"[null]"});
+        let value = residual_field_value(&body, "$.encoded.inner.child.value").unwrap();
+        assert!(matches!(
+            value,
+            std::borrow::Cow::Owned(serde_json::Value::Null)
+        ));
+        for (path, expected, presence) in [
+            (
+                "$.encoded.inner.child.value",
+                serde_json::Value::Null,
+                Present,
+            ),
+            (
+                "$.encoded.inner.child.absent",
+                serde_json::Value::Null,
+                Missing,
+            ),
+            (
+                "$.encoded.inner.child.absent",
+                serde_json::json!(1),
+                Unavailable,
+            ),
+            (
+                "$.encoded.inner.child.value.absent",
+                serde_json::Value::Null,
+                Unavailable,
+            ),
+            ("$.malformed.value", serde_json::Value::Null, Unavailable),
+            ("$.array[0]", serde_json::Value::Null, Unavailable),
+            ("$.array.value", serde_json::Value::Null, Unavailable),
+            ("$[", serde_json::Value::Null, Unavailable),
+        ] {
+            assert_eq!(
+                residual_field_presence(Some(&body), path, &expected),
+                presence,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn field_presence_metadata_cannot_change_tree_identity_delta_or_ack_scope() {
+        let diff = body_pair(serde_json::json!({}), serde_json::json!({"optional":1}));
+        let artifacts = art(Vec::new(), Vec::new(), vec![diff.clone()]);
+        let published = detect(&artifacts);
+        let residual = &published.http_comparison.as_ref().unwrap().responses[0]
+            .body
+            .blocking[0];
+        assert_eq!(residual.baseline_presence, Some(FieldPresence::Missing));
+        assert_eq!(residual.candidate_presence, Some(FieldPresence::Present));
+        let mut historical = published.clone();
+        for response in &mut historical.http_comparison.as_mut().unwrap().responses {
+            for residual in &mut response.body.blocking {
+                residual.baseline_presence = None;
+                residual.candidate_presence = None;
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&published.verdict).unwrap(),
+            serde_json::to_value(&historical.verdict).unwrap()
+        );
+        let new = behaviour_tree::build_with_scorecard(
+            &artifacts.run_id,
+            &[],
+            std::slice::from_ref(&diff),
+            Some(&published),
+        )
+        .unwrap();
+        let old = behaviour_tree::build_with_scorecard(
+            &artifacts.run_id,
+            &[],
+            &[diff],
+            Some(&historical),
+        )
+        .unwrap();
+        assert_eq!(
+            new.to_jsonl(),
+            old.to_jsonl(),
+            "inspection metadata never enters canonical tree identities or addresses"
+        );
+        let delta = delta::three_way(&old, &new).unwrap();
+        assert!(delta.verdict.pass);
+        let historical_delta = delta::three_way(&old, &old).unwrap();
+        assert_eq!(
+            delta
+                .rows
+                .iter()
+                .map(acknowledgement::Key::of_row)
+                .collect::<Vec<_>>(),
+            historical_delta
+                .rows
+                .iter()
+                .map(acknowledgement::Key::of_row)
+                .collect::<Vec<_>>()
         );
     }
 

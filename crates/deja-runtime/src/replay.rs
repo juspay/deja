@@ -2169,6 +2169,10 @@ pub struct ObservedCall {
     /// execute-shadow dispatch that ran the real boundary.
     #[serde(default)]
     pub provenance: crate::Provenance,
+    /// Whether runtime provenance/outcome were actually published, rather than
+    /// filled by historical deserialization defaults. Kept on reserialization.
+    #[serde(default)]
+    pub runtime_metadata_present: bool,
     /// Set when the call could not be conclusively classified because the
     /// recorded baseline needed to compare against was missing (a seed gap) —
     /// surfaced as [`InconclusiveSeedGap`](crate::DivergenceKind::InconclusiveSeedGap)
@@ -2289,13 +2293,15 @@ struct ObservedCallWire {
     #[serde(default)]
     observed_result: Option<serde_json::Value>,
     #[serde(default)]
-    provenance: crate::Provenance,
+    provenance: Option<crate::Provenance>,
+    #[serde(default)]
+    runtime_metadata_present: Option<bool>,
     #[serde(default)]
     seed_gap: bool,
     #[serde(default)]
     absorbed: bool,
     #[serde(default)]
-    outcome: crate::SubstituteOutcome,
+    outcome: Option<crate::SubstituteOutcome>,
     #[serde(default)]
     arg_divergent: bool,
     #[serde(default)]
@@ -2308,6 +2314,10 @@ struct ObservedCallWire {
 
 impl From<ObservedCallWire> for ObservedCall {
     fn from(wire: ObservedCallWire) -> Self {
+        let runtime_metadata_present = wire.runtime_metadata_present != Some(false)
+            && wire.role.as_deref() != Some("ingress")
+            && wire.provenance.is_some()
+            && (wire.outcome.is_some() || wire.provenance == Some(crate::Provenance::Shadow));
         let bucket_id = wire.bucket_id.or_else(|| wire.task_bucket.clone());
         let task_bucket = wire.task_bucket.or_else(|| bucket_id.clone());
         Self {
@@ -2337,10 +2347,11 @@ impl From<ObservedCallWire> for ObservedCall {
             real_impl_will_fail: wire.real_impl_will_fail,
             recorded_result: wire.recorded_result,
             observed_result: wire.observed_result,
-            provenance: wire.provenance,
+            provenance: wire.provenance.unwrap_or_default(),
+            runtime_metadata_present,
             seed_gap: wire.seed_gap,
             absorbed: wire.absorbed,
-            outcome: wire.outcome,
+            outcome: wire.outcome.unwrap_or_default(),
             arg_divergent: wire.arg_divergent,
             served_event_global_sequence: wire.served_event_global_sequence,
             lookup_ordinal: wire.lookup_ordinal,
@@ -3720,6 +3731,7 @@ impl Resolution {
             recorded_result: self.recorded_result,
             observed_result,
             provenance,
+            runtime_metadata_present: provenance != crate::Provenance::Recorded,
             seed_gap: false,
             absorbed: false,
             outcome: crate::SubstituteOutcome::default(),
@@ -3741,6 +3753,7 @@ impl ObservedCall {
     pub(crate) fn stamp_outcome(&mut self, outcome: crate::SubstituteOutcome) {
         let synthesized = outcome == crate::SubstituteOutcome::Synthesized;
         self.outcome = outcome;
+        self.runtime_metadata_present = true;
         self.absorbed = synthesized;
         self.synthesized = synthesized;
     }
@@ -3933,6 +3946,7 @@ impl DejaHook for LookupTableHook {
             recorded_result: None,
             observed_result: Some(event.result.to_value()),
             provenance: crate::Provenance::Recorded,
+            runtime_metadata_present: false,
             seed_gap: false,
             // The ingress finalizer marker, not a lookup — there was no miss to
             // absorb and no substitution to describe.
@@ -12192,5 +12206,46 @@ mod shared_results {
         shared.entries[3].result_index = 9;
         let err = shared.into_table().unwrap_err().to_string();
         assert!(err.contains("result 9 of 2"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod runtime_publication_tests {
+    use super::ObservedCall;
+    fn wire() -> serde_json::Value {
+        serde_json::json!({"boundary":"service", "trait_name":"Client", "method_name":"read", "args":{}, "resolved":true})
+    }
+    #[test]
+    fn historical_defaults_do_not_become_published_runtime_facts_after_round_trip() {
+        let old: ObservedCall =
+            serde_json::from_value(wire()).expect("historical observation fixture");
+        assert!(!old.runtime_metadata_present);
+        assert_eq!(old.provenance, crate::Provenance::Recorded);
+        let round_trip: ObservedCall = serde_json::from_value(
+            serde_json::to_value(old).expect("serialize historical observation"),
+        )
+        .expect("read historical round trip");
+        assert!(!round_trip.runtime_metadata_present);
+    }
+    #[test]
+    fn explicit_runtime_facts_are_preserved_without_inventing_an_ingress_substitution() {
+        let mut raw = wire();
+        raw["provenance"] = "recorded".into();
+        raw["outcome"] = "substituted".into();
+        let published: ObservedCall =
+            serde_json::from_value(raw.clone()).expect("published runtime fixture");
+        assert!(published.runtime_metadata_present);
+        let mut unsupported_claim = wire();
+        unsupported_claim["runtime_metadata_present"] = true.into();
+        assert!(
+            !serde_json::from_value::<ObservedCall>(unsupported_claim)
+                .expect("incomplete runtime claim fixture")
+                .runtime_metadata_present
+        );
+        raw["role"] = "ingress".into();
+        raw["runtime_metadata_present"] = true.into();
+        let ingress: ObservedCall =
+            serde_json::from_value(raw).expect("ingress observation fixture");
+        assert!(!ingress.runtime_metadata_present);
     }
 }

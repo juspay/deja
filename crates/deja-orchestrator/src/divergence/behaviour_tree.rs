@@ -1374,6 +1374,8 @@ mod tests {
                                 candidate: serde_json::json!([2, 3]),
                             },
                             candidate_identity: format!("residual-{}", d.request_sequence),
+                            baseline_presence: None,
+                            candidate_presence: None,
                         }],
                         ..Default::default()
                     },
