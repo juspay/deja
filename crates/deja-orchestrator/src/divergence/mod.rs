@@ -5938,42 +5938,56 @@ pub struct HttpBodyResidual {
 /// Canonical array residual indices are not positions in the captured body.
 /// Only exact object paths, including object documents encoded as strings, can
 /// prove presence here. Unsupported/old evidence remains explicitly unknown.
+fn residual_field_value<'a>(
+    root: &'a serde_json::Value,
+    path: &str,
+) -> Result<std::borrow::Cow<'a, serde_json::Value>, FieldPresence> {
+    use std::borrow::Cow;
+
+    let segments = deja_kernel::parse_json_path(path).ok_or(FieldPresence::Unavailable)?;
+    let mut value = Cow::Borrowed(root);
+    for segment in segments {
+        let deja_kernel::JsonPathSegment::Member(member) = segment else {
+            return Err(FieldPresence::Unavailable);
+        };
+        if let serde_json::Value::String(text) = value.as_ref() {
+            if let Some(document) = deja::identity::embedded_document(text) {
+                value = Cow::Owned(document);
+            }
+        }
+        value = match value {
+            // Ordinary captured JSON stays borrowed, regardless of body size or
+            // path depth. Only decoded documents need owned storage.
+            Cow::Borrowed(value) => Cow::Borrowed(
+                value
+                    .as_object()
+                    .ok_or(FieldPresence::Unavailable)?
+                    .get(&member)
+                    .ok_or(FieldPresence::Missing)?,
+            ),
+            // Move the selected child out of an owned decoded document; cloning
+            // it would copy every remaining subtree on each path segment.
+            Cow::Owned(serde_json::Value::Object(mut object)) => {
+                Cow::Owned(object.remove(&member).ok_or(FieldPresence::Missing)?)
+            }
+            Cow::Owned(_) => return Err(FieldPresence::Unavailable),
+        };
+    }
+    Ok(value)
+}
+
 fn residual_field_presence(
     root: Option<&serde_json::Value>,
     path: &str,
     expected: &serde_json::Value,
 ) -> FieldPresence {
-    let Some(mut value) = root.cloned() else {
+    let Some(root) = root else {
         return FieldPresence::Unavailable;
     };
-    let Some(segments) = deja_kernel::parse_json_path(path) else {
-        return FieldPresence::Unavailable;
-    };
-    for segment in segments {
-        let deja_kernel::JsonPathSegment::Member(member) = segment else {
-            return FieldPresence::Unavailable;
-        };
-        if let serde_json::Value::String(text) = &value {
-            if let Some(document) = deja::identity::embedded_document(text) {
-                value = document;
-            }
-        }
-        let Some(object) = value.as_object() else {
-            return FieldPresence::Unavailable;
-        };
-        let Some(child) = object.get(&member) else {
-            return if expected.is_null() {
-                FieldPresence::Missing
-            } else {
-                FieldPresence::Unavailable
-            };
-        };
-        value = child.clone();
-    }
-    if &value == expected {
-        FieldPresence::Present
-    } else {
-        FieldPresence::Unavailable
+    match residual_field_value(root, path) {
+        Ok(value) if value.as_ref() == expected => FieldPresence::Present,
+        Err(FieldPresence::Missing) if expected.is_null() => FieldPresence::Missing,
+        _ => FieldPresence::Unavailable,
     }
 }
 
@@ -11486,6 +11500,77 @@ mod tests {
         );
         let historical: HttpBodyResidual = serde_json::from_value(serde_json::json!({"json_path":"$.field","baseline":null,"candidate":1,"candidate_identity":"unchanged"})).unwrap();
         assert!(historical.baseline_presence.is_none() && historical.candidate_presence.is_none());
+    }
+
+    #[test]
+    fn response_presence_borrows_wide_and_deep_ordinary_bodies() {
+        use std::borrow::Cow;
+
+        let fields: serde_json::Map<String, serde_json::Value> = (0..8_000)
+            .map(|i| {
+                (
+                    format!("field_{i}"),
+                    serde_json::json!({"nested":{"value":i}}),
+                )
+            })
+            .collect();
+        let body = serde_json::json!({"response":fields});
+        let root = residual_field_value(&body, "$").unwrap();
+        assert!(matches!(root, Cow::Borrowed(value) if std::ptr::eq(value, &body)));
+        for i in 0..8_000 {
+            let field = format!("field_{i}");
+            let path = format!("$.response.{field}.nested.value");
+            let value = residual_field_value(&body, &path).unwrap();
+            assert!(
+                matches!(value, Cow::Borrowed(value) if std::ptr::eq(value, &body["response"][&field]["nested"]["value"])),
+                "ordinary JSON must retain the captured value's address, without a body or subtree clone"
+            );
+        }
+    }
+
+    #[test]
+    fn response_presence_moves_decoded_documents_and_preserves_unknowns() {
+        use FieldPresence::*;
+        let nested =
+            serde_json::json!({"inner":serde_json::json!({"child":{"value":null}}).to_string()});
+        let body = serde_json::json!({"encoded":nested.to_string(),"malformed":"{not json}","array":"[null]"});
+        let value = residual_field_value(&body, "$.encoded.inner.child.value").unwrap();
+        assert!(matches!(
+            value,
+            std::borrow::Cow::Owned(serde_json::Value::Null)
+        ));
+        for (path, expected, presence) in [
+            (
+                "$.encoded.inner.child.value",
+                serde_json::Value::Null,
+                Present,
+            ),
+            (
+                "$.encoded.inner.child.absent",
+                serde_json::Value::Null,
+                Missing,
+            ),
+            (
+                "$.encoded.inner.child.absent",
+                serde_json::json!(1),
+                Unavailable,
+            ),
+            (
+                "$.encoded.inner.child.value.absent",
+                serde_json::Value::Null,
+                Unavailable,
+            ),
+            ("$.malformed.value", serde_json::Value::Null, Unavailable),
+            ("$.array[0]", serde_json::Value::Null, Unavailable),
+            ("$.array.value", serde_json::Value::Null, Unavailable),
+            ("$[", serde_json::Value::Null, Unavailable),
+        ] {
+            assert_eq!(
+                residual_field_presence(Some(&body), path, &expected),
+                presence,
+                "{path}"
+            );
+        }
     }
 
     #[test]
