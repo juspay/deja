@@ -1,11 +1,15 @@
 import type { CallRecord, HttpDiff, Scorecard } from "../lib/api";
-import { acceptedBodyReasons, callComparisonText, httpJudgment } from "../lib/comparison";
+import { acceptedBodyReasons, callComparisonText, callRuntimeText, callTransportHost, httpJudgment } from "../lib/comparison";
 import { transportFailure } from "../lib/spine";
 import { JsonDiff } from "./JsonDiff";
 import { ValuePair } from "./JsonView";
 
 export function CallComparison({ call }: { call: CallRecord }) {
-  return <p className="hint">{callComparisonText(call)}</p>;
+  const host = callTransportHost(call);
+  return <><p className="hint">{callComparisonText(call)}</p>
+    <p className="hint">{callRuntimeText(call)}</p>
+    {host && <p className="hint">Transport destination: <code>{host}</code> · captured URL host, separate from declared review dimensions</p>}
+  </>;
 }
 
 export function CorrelationOutcome({ row }: { row: NonNullable<Scorecard["per_correlation"]>[number] }) {

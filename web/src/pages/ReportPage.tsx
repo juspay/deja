@@ -1,6 +1,8 @@
 import React from "react";
+import { useReviewNavigation } from "../lib/navigation";
+import { ReviewContextPanel } from "../components/ReviewContext";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useLocation, useParams, useSearchParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, ArtifactRow, CallRecord, HttpDiff, RunRow, Scorecard, StageRow, runParams, ChangeReach } from "../lib/api";
 import { candidateRef, resultOf, RunResult } from "../lib/result";
 import { useDebug, withDebug } from "../lib/debug";
@@ -408,6 +410,7 @@ const REACH_LABEL: Record<ChangeReach, string> = {
  * that traffic reached. A caveat here never changes the verdict above it.
  */
 function ChangeReachPanel({ run }: { run: RunRow }) {
+  const navigation = useReviewNavigation();
   const q = useQuery({
     queryKey: ["change-coverage", run.run_id],
     queryFn: () => api.changeCoverage(run.run_id),
@@ -435,8 +438,8 @@ function ChangeReachPanel({ run }: { run: RunRow }) {
       <div className={`trustrow ${worst}`}>
         <span className="tkey">change</span>
         <span className="tval">
-          <b>{d.items.length}</b> changed item{d.items.length === 1 ? "" : "s"} between{" "}
-          <code>{d.base_ref}</code> (<code>{d.merge_base.slice(0, 10)}</code>) and{" "}
+          <b>{d.items.length}</b> changed item{d.items.length === 1 ? "" : "s"} from the source comparison's common ancestor{" "}
+          <code>{d.merge_base.slice(0, 10)}</code> to candidate{" "}
           <code>{d.head.slice(0, 10)}</code> · {d.driven_requests} requests driven
           {d.caveats.length === 0 && !countsDisagree && d.items.length > 0 && d.items.every((item) => item.reach === "exercised") && (
             <> — the coverage assessment reports every changed item exercised; inspect its evidence below</>
@@ -446,6 +449,17 @@ function ChangeReachPanel({ run }: { run: RunRow }) {
       {countsDisagree && (
         <p className="err">Coverage reports {d.driven_requests} driven requests, while this scorecard reports {driven}. These totals disagree; coverage is not proof that the changed behavior was tested.</p>
       )}
+      {d.base ? <details className="evraw">
+        <summary>Coverage source and request scope</summary>
+        <p className="hint">Repository <code>{d.repo}</code>. Requested base <code>{d.base.declared_ref}</code> resolved to <code>{d.base.resolved_sha}</code> at {d.base.resolved_at}.
+          {d.base.source === "named_baseline" && d.base.baseline_run
+            ? <> Source is pinned to the <Link to={navigation.href(`/r/${d.base.baseline_run}`)}>named baseline run</Link>.</>
+            : <> Source is the configured comparison ref resolved at assessment time.</>}
+          {" "}The common ancestor used by GitHub's comparison is shown above; it may differ from the requested base commit.
+        </p>
+        <p className="hint">Execution evidence is restricted to the admitted request scope. Source identity is declared metadata; candidate image contents are not attested.</p>
+        {d.inputs_digest && <p className="hint">Evidence input digest <code>{d.inputs_digest}</code></p>}
+      </details> : <p className="hint">Historical assessment: immutable base and input provenance were not published.</p>}
       {d.caveats.map((c, i) => (
         <div className="trustrow warn" key={i}>
           <span className="tkey">caveat</span>
@@ -684,9 +698,7 @@ export function RecordingFidelity({ run, result, paired }: { run: RunRow; result
 export default function ReportPage() {
   const { runId = "" } = useParams();
   const debug = useDebug();
-  const location = useLocation();
-  const runsUrl = location.state?.runsUrl;
-  const returnTo = typeof runsUrl === "string" && (runsUrl === "/runs" || runsUrl.startsWith("/runs?")) ? runsUrl : "/runs";
+  const navigation = useReviewNavigation();
   const [, setParams] = useSearchParams();
 
   const run = useQuery({
@@ -751,11 +763,13 @@ export default function ReportPage() {
   return (
     <>
       <div className="crumb">
-        <Link to={withDebug(returnTo, debug)}>Runs</Link> <span>/</span>{" "}
+        <Link to={withDebug(navigation.runsHref, debug)}>Runs</Link> <span>/</span>{" "}
         <span className="hint">report</span>
       </div>
 
+      {navigation.previousReportHref && <p className="hint"><Link to={navigation.previousReportHref}>← Return to previous report and selected evidence</Link></p>}
       <RunHeader run={r} />
+      <ReviewContextPanel run={r} />
       {runParams(r)?.purpose === "baseline" && <BaselineNote run={r.run_id} label={runParams(r)?.label} />}
       {isReplay && scored && runParams(r)?.delta_against && (
         <DeltaPanel runId={r.run_id} against={runParams(r)?.delta_against ?? ""} />
@@ -764,7 +778,7 @@ export default function ReportPage() {
       {isReplay && scored && !runParams(r)?.delta_against && (
         <p className="hint delta-link">
           This verdict is against the tape.{" "}
-          <Link to={withDebug(`/r/${r.run_id}/delta`, debug)}>
+          <Link to={navigation.href(withDebug(`/r/${r.run_id}/delta`, debug))}>
             Compare against another run of the same tape →
           </Link>
         </p>

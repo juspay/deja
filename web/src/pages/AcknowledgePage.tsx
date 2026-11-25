@@ -1,11 +1,15 @@
 import React from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useParams } from "react-router-dom";
-import { Acknowledgement, CallRecord, DeltaRow, api, deltaFamily, deltaUnavailable, runParams } from "../lib/api";
+import { Acknowledgement, Delta, api, deltaFamily, deltaUnavailable, runParams } from "../lib/api";
 import { useDebug, withDebug } from "../lib/debug";
-import { Group, callAtAddress, callEvidenceHref, effectiveOf, groupCharged, requestsOf, useAckActions, useAcknowledgements } from "../lib/acknowledge";
+import { Group, callEvidenceHref, effectiveOf, groupCharged, requestsOf, useAckActions, useAcknowledgements } from "../lib/acknowledge";
 import { needsSignIn, useHasRole, useMe } from "../lib/me";
-import { JsonView } from "../components/JsonView";
+import { FieldInspector } from "../components/FieldInspector";
+import { callFieldEvidence } from "../lib/fieldEvidence";
+import { joinDeltaResponses } from "../lib/comparison";
+import { useReviewNavigation } from "../lib/navigation";
+import { ReviewIdentityEvidence } from "../components/ReviewIdentity";
 
 /**
  * `/r/:runId/acknowledge`: the divergences a pull request is charged with,
@@ -25,6 +29,7 @@ function when(ts: string | null): string {
 export default function AcknowledgePage() {
   const { runId = "" } = useParams();
   const debug = useDebug();
+  const nav = useReviewNavigation();
   const run = useQuery({ queryKey: ["run", runId], queryFn: () => api.run(runId) });
   const against = run.data ? (runParams(run.data)?.delta_against ?? "") : "";
   const delta = useQuery({
@@ -54,8 +59,8 @@ export default function AcknowledgePage() {
   const d = delta.data && !("unavailable" in delta.data) ? delta.data : null;
   const crumbs = (
     <div className="crumb">
-      <Link to={withDebug("/runs", debug)}>Runs</Link> <span>/</span>{" "}
-      <Link to={withDebug(`/r/${runId}`, debug)}>report</Link> <span>/</span> <span className="hint">acknowledge</span>
+      <Link to={withDebug(nav.runsHref, debug)}>Runs</Link> <span>/</span>{" "}
+      <Link to={withDebug(nav.reportHref, debug)}>report</Link> <span>/</span> <span className="hint">acknowledge</span>
     </div>
   );
   const unavailable = deltaUnavailable(delta.data);
@@ -126,7 +131,7 @@ export default function AcknowledgePage() {
         <h1>Acknowledge divergences · PR #{gh.pr_number}</h1>
         {label && <span className="chip muted" title={label}>{label.replace(/^PR #\d+\s*·\s*/, "")}</span>}
         <div className="right">
-          <Link className="btn" to={withDebug(`/r/${runId}`, debug)}>Back to the report</Link>
+          <Link className="btn" to={withDebug(nav.reportHref, debug)}>Back to the report</Link>
           <a className="btn" href={`https://github.com/${gh.repo}/pull/${gh.pr_number}`} target="_blank" rel="noreferrer">Open the PR</a>
         </div>
       </div>
@@ -138,6 +143,7 @@ export default function AcknowledgePage() {
       </div>
       {informational > 0 && <p className="hint">{informational} informational PR observation{informational === 1 ? "" : "s"} remain in the report and require no acknowledgment.</p>}
       <p className="hint">This decision changes Deja's effective delta. GitHub check requirements are configured separately.</p>
+      <ReviewIdentityEvidence identities={d.review_identities} correlations={groups.flatMap((group) => group.rows.map((row) => row.address.correlation))} candidateRun={d.y_run} baselineRun={d.m_run} />
       {!me && !signedInRequired && <p className="hint">Set your name in the top right to mark or acknowledge.</p>}
       {signedInRequired && <p className="hint">Sign in to mark or acknowledge; reading needs no account.</p>}
       {whoami.data?.authenticated && !maintainer && todo.some((g) => g.ack?.state === "proposed") && (
@@ -164,7 +170,7 @@ export default function AcknowledgePage() {
               <thead>
                 <tr>
                   <th className="sel"></th>
-                  <th>reported lane</th>
+                  <th>grouping hint · flow</th>
                   <th>what diverges</th>
                   <th className="num">requests</th>
                   <th>status</th>
@@ -212,7 +218,7 @@ export default function AcknowledgePage() {
               </tbody>
             </table>
           )}
-          {shown && tab !== "history" && <Example g={shown} runId={runId} against={against} />}
+          {shown && tab !== "history" && <Example g={shown} runId={runId} against={against} d={d} />}
           {tab === "todo" && (confirmable.length > 0 || markable.length > 0) && (
             <div className="ack-actions">
               {selectedProposed.length > 0 && (
@@ -292,46 +298,41 @@ export default function AcknowledgePage() {
   );
 }
 
-/** Captured evidence is inspection, not another classification of the delta. */
-function CapturedValue({ call, recorded = false }: { call: CallRecord | null; recorded?: boolean }) {
-  if (!call) return <span className="hint">Exact call evidence unavailable.</span>;
-  const subject = call.comparison?.version === 1 ? call.comparison.subject : null;
-  if (subject !== "arguments" && subject !== "result") return <span className="hint">Comparison subject was not published; inspect the call in the report.</span>;
-  const side = recorded ? call.recorded : call.observed;
-  const key = subject === "arguments" ? "args" : "result";
-  if (!side || !Object.prototype.hasOwnProperty.call(side, key)) return <span className="hint">Captured {subject} not published.</span>;
-  return <><span className="hint">{subject} · captured value</span><JsonView value={side[key]} /></>;
-}
-
 /** One addressed observation, with exact links rather than hash placeholders. */
-function Example({ g, runId, against }: { g: Group; runId: string; against: string }) {
+function Example({ g, runId, against, d }: { g: Group; runId: string; against: string; d: Delta }) {
   const debug = useDebug();
-  const r: DeltaRow = g.rows[0];
+  const nav = useReviewNavigation();
+  const [selected, setSelected] = React.useState(0);
+  const r = g.rows[Math.min(selected, g.rows.length - 1)];
   const candidate = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId), enabled: r.address.kind === "call" });
   const baseline = useQuery({ queryKey: ["calls", against], queryFn: () => api.calls(against), enabled: r.address.kind === "call" && !!against });
-  const candidateCall = callAtAddress(r.address, candidate.data ?? []);
-  const baselineCall = callAtAddress(r.address, baseline.data ?? []);
+  const candidateDiffs = useQuery({ queryKey: ["httpdiffs", runId], queryFn: () => api.httpDiffs(runId), enabled: r.address.kind !== "call" });
+  const baselineDiffs = useQuery({ queryKey: ["httpdiffs", against], queryFn: () => api.httpDiffs(against), enabled: r.address.kind !== "call" });
+  const candidateRun = useQuery({ queryKey: ["run", runId], queryFn: () => api.run(runId), enabled: r.address.kind !== "call" });
+  const baselineRun = useQuery({ queryKey: ["run", against], queryFn: () => api.run(against), enabled: r.address.kind !== "call" });
+  const address = r.address;
+  const response = address.kind === "call" ? undefined : joinDeltaResponses(d, candidateDiffs.data ?? [], baselineDiffs.data ?? [], candidateRun.data?.scorecard, baselineRun.data?.scorecard)
+    .find((request) => request.correlation === address.correlation && request.sequence === (address.request_sequence ?? 0));
+  const responseField = address.kind === "body" ? response?.fields.find((field) => field.path === address.json_path)?.evidence : response?.statusEvidence;
+  const evidence = address.kind === "call" ? callFieldEvidence(r, candidate.data ?? [], baseline.data ?? []) : {
+    fields: responseField ? [responseField] : [], note: "Published response comparison evidence at this exact response sequence and field address. Unavailable values do not imply missing fields or agreement.",
+  };
   const candidateHref = callEvidenceHref(runId, r.address, candidate.data ?? []);
   const baselineHref = callEvidenceHref(against, r.address, baseline.data ?? []);
   return (
     <div className="ack-example">
       <div className="t">example of {g.rows.length} blocking observations across {requestsOf([g])} requests · <span className="mono">{r.address.correlation}</span></div>
+      {g.rows.length > 1 && <label>Observation <select value={Math.min(selected, g.rows.length - 1)} onChange={(event) => setSelected(Number(event.target.value))}>{g.rows.map((row, index) => <option key={index} value={index}>{index + 1} · {row.address.correlation}</option>)}</select></label>}
+      <FieldInspector {...evidence} title="Review one field on all three sides" />
       {r.address.kind === "call" ? <>
         {candidate.isLoading || baseline.isLoading ? <p className="hint">Loading captured call evidence…</p> : <>
           {(candidate.error || baseline.error) && <p className="hint">Some captured evidence could not be read. The published delta is unchanged.</p>}
-          <details>
-            <summary>Inspect captured values for this observation</summary>
-            <p className="hint">Raw captured values support inspection. The scorer's published comparison determines the delta; these values are not compared again here.</p>
-            <div className="r"><b>recording</b><span><CapturedValue call={candidateCall ?? baselineCall} recorded /></span></div>
-            <div className="r"><b>baseline</b><span>{r.m === "absent" ? "call not reached" : <CapturedValue call={baselineCall} />}</span></div>
-            <div className="r"><b>this PR</b><span>{r.y === "absent" ? "call not reached" : <CapturedValue call={candidateCall} />}</span></div>
-          </details>
         </>}
-        {baselineHref && <p><Link to={withDebug(baselineHref, debug)}>Inspect exact baseline call →</Link></p>}
-        {candidateHref && <p><Link to={withDebug(candidateHref, debug)}>Inspect exact candidate call →</Link></p>}
+        {baselineHref && <p><Link to={withDebug(nav.href(baselineHref), debug)}>Inspect exact baseline call →</Link></p>}
+        {candidateHref && <p><Link to={withDebug(nav.href(candidateHref), debug)}>Inspect exact candidate call →</Link></p>}
         {(!baselineHref || !candidateHref) && <p className="hint">An exact graph link is unavailable for one or both sides; the request link below opens the full evidence.</p>}
       </> : <p className="hint">{r.address.kind === "body" ? `Response field ${r.address.json_path}` : "Response status"}. Inspect the published response comparison in the report.</p>}
-      <Link to={withDebug(`/r/${runId}?case=${encodeURIComponent(r.address.correlation)}`, debug)}>Open request evidence →</Link>
+      <Link to={withDebug(nav.href(`/r/${runId}?case=${encodeURIComponent(r.address.correlation)}`), debug)}>Open request evidence →</Link>
     </div>
   );
 }

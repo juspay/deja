@@ -1472,3 +1472,31 @@ h1 .beta { font-size: 11px; }
 .boundary-observations code, .boundary-observations .hint { overflow-wrap: anywhere; }
 .boundary-observations td:nth-child(2) { max-width: 24rem; }
 .boundary-observations td:nth-child(4) { max-width: 22rem; }
+
+/* Review context stays compact until the reader opens the attempt history. */
+.review-context { border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); padding: var(--s4); margin-bottom: var(--s4); min-width: 0; overflow-x: auto; }
+.review-context-heading { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+.review-context-heading h2 { font-size: var(--fs-15); margin: 0; flex: 1 1 220px; }
+.review-context .hint { margin: var(--s2) 0; overflow-wrap: anywhere; }
+.review-context details { margin-top: var(--s3); }
+.review-attempts { width: 100%; min-width: 620px; table-layout: fixed; margin: var(--s3) 0; font-size: var(--fs-12); }
+.review-attempts td { vertical-align: top; overflow-wrap: anywhere; }
+.review-attempts th:nth-child(1) { width: 28%; }
+.review-attempts th:nth-child(2) { width: 25%; }
+.review-attempts th:nth-child(3) { width: 25%; }
+.review-attempts tr[aria-current="true"] td { background: rgba(88,166,255,0.08); }
+.run-pair-links { display: flex; gap: var(--s3); flex-wrap: wrap; font-size: var(--fs-12); }
+
+/* A selected field gets equal space on all three sides; raw documents remain
+   an optional inspection rather than competing with the comparison. */
+.field-inspector { margin: var(--s3) 0; border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--r-sm); padding: var(--s3); background: var(--surface-inset); min-width: 0; overflow-x: auto; }
+.field-inspector h4 { font-size: var(--fs-13); margin: 0 0 var(--s2); }
+.field-inspector select { max-width: 100%; margin: 0 0 var(--s3); font-family: var(--font-mono); font-size: var(--fs-12); }
+.field-inspector .delta-vals th:nth-child(n) { width: 33.333%; }
+.field-inspector .delta-vals td { vertical-align: top; }
+.field-inspector .delta-vals .hint { font-family: var(--font-ui); }
+.field-inspector .jsonblock { max-height: 22rem; overflow: auto; }
+@media (max-width: 700px) {
+  .field-inspector .delta-vals { min-width: 480px; }
+  .review-context { padding: var(--s3); }
+}

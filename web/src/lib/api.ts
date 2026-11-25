@@ -134,7 +134,16 @@ export type RunPage = {
   next_cursor: string | null;
 };
 
-export type RunPageQuery = { system?: string; q?: string; cursor?: string; limit?: number };
+export type RunPageQuery = { system?: string; q?: string; cursor?: string; limit?: number; repo?: string; pr?: number; head?: string };
+
+export type ReviewContext = {
+  github: GithubRef | null;
+  source_revision: { sha: string; evidence: string } | null;
+  source_unavailable: string | null;
+  current_head: { status: "verified"; sha: string; checked_at: string } | { status: "unavailable"; reason: string; checked_at: string } | null;
+  heads: { head_sha: string; runs: number; latest_at: string }[];
+  heads_unavailable?: string | null;
+};
 
 export type SessionManifest = {
   status: string;
@@ -294,7 +303,22 @@ export type CorrelationSpanShape = {
 };
 
 // One side (recorded or observed) of a reconciled boundary call.
+export type CallRuntime = {
+  version: number;
+  cancelled?: boolean;
+  provenance: "recorded" | "execute_shadow" | "served_recorded_error" | (string & {});
+  outcome?: "substituted" | "synthesized" | "stopped" | (string & {});
+};
+export type IdentityDimension = { status: "known" | "unknown" | "ambiguous"; value?: string; evidence: { selector: number; value: string; boundary: string; operation: string; recorded_event?: number; graph_node_id?: number; location: string }[] };
+export type IdentityDefinition = { label?: string };
+/** Version 1 connector/flow fields are read only for historical publications. */
+export type ReviewIdentity = { dimensions?: Record<string, IdentityDimension>; connector?: IdentityDimension; flow?: IdentityDimension };
+export type IdentityPublication = { version: number; declaration: { digest: string; source: "current_deployment" | (string & {}) } | null; dimensions?: Record<string, IdentityDefinition>; requests: Record<string, ReviewIdentity>; notes?: string[] };
+export type ReviewIdentities = { candidate: IdentityPublication; baseline: IdentityPublication };
+
 export type CallSide = {
+  inspection?: { version: number; arguments?: Record<string, unknown>; result?: Record<string, unknown> };
+  runtime?: CallRuntime;
   args?: unknown;
   result?: unknown;
   is_error?: boolean;
@@ -348,7 +372,7 @@ export type ValueComparison = {
   candidate_alternatives?: string[];
 };
 export type HttpBodyClassification = {
-  blocking: (JsonFieldDiff & { candidate_identity: string })[];
+  blocking: (JsonFieldDiff & { candidate_identity: string; baseline_presence?: "present" | "missing" | "unavailable"; candidate_presence?: "present" | "missing" | "unavailable" })[];
   blocking_leaf_count: number;
   schema_derived_paths: string[];
   order_only_paths: string[];
@@ -389,6 +413,17 @@ export type ChangedItem = {
 };
 
 export type ChangeCoverage = {
+  assessment_version?: number;
+  request_scope?: string[];
+  inputs_digest?: string;
+  base?: {
+    source: "named_baseline" | "configured_ref";
+    declared_ref: string;
+    resolved_sha: string;
+    resolved_at: string;
+    resolution: "declared_immutable_commit" | "github_commit_lookup";
+    baseline_run?: string;
+  };
   system: string;
   repo: string;
   base_ref: string;
@@ -574,6 +609,7 @@ export const api = {
     }
     return request<RunPage>(`/api/v1/runs/page?${params}`);
   },
+  reviewContext: (id: string) => request<ReviewContext>(`/api/v1/runs/${id}/review-context`),
   run: (id: string) => request<RunRow>(`/api/v1/runs/${id}`),
   stages: (id: string) => request<StageRow[]>(`/api/v1/runs/${id}/stages`),
   logs: (id: string, afterSeq = -1) =>
@@ -1055,6 +1091,8 @@ export type DeltaSideInfo = {
 };
 
 export type Delta = {
+  /** Review-only, current declaration evidence. Never changes scoring or acknowledgment scope. */
+  review_identities?: ReviewIdentities;
   m_run: string;
   y_run: string;
   canon_version: number;
